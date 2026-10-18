@@ -113,7 +113,6 @@ def cmd_run(
 ) -> int:
     from kwsearch.discover import registered_names
     from kwsearch.query import expand_queries
-
     have = set(registered_names())
     variants = expand_queries(keyword, cfg.expand)
     plan: list[list[str]] = []
@@ -595,8 +594,7 @@ def cmd_discover(
     from kwsearch.discover import get_channel, get_parser
     from kwsearch.discover.base import build_context, check_assertions, page_signature
     from kwsearch.expand import domain_distribution, expand_channel
-    from kwsearch.query import expand_queries
-
+    from kwsearch.query import expand_queries, probe_profile
     try:
         ch = cfg.channel(channel_id)
     except KeyError:
@@ -645,6 +643,17 @@ def cmd_discover(
             if expand > 0:
                 spec["max_queries"] = expand
             variants = expand_queries(keyword, spec)
+            auto_probe = bool(spec.get("profiles")) and str(spec.get("profile", "auto")) == "auto"
+
+            def _probe_hook(cands):
+                # 与 pipeline 同一套探测：基词结果出来后判类型，再补变体
+                rest = expand_queries(keyword, spec, probe=cands)[1:]
+                if rest:
+                    print(f"⿻ 探测：基词结果判为 {probe_profile(cands)}，加 {len(rest)} 个变体")
+                else:
+                    print(f"⿻ 探测：基词结果判为 {probe_profile(cands)}，只打基词")
+                return rest
+
             pattern = None
             if not no_filter:
                 # 过滤只对 serp 类生效：只有通用搜索引擎会"放宽"查询。
@@ -659,6 +668,7 @@ def cmd_discover(
                 fn, ctx, variants,
                 zero_gain_streak=int(spec.get("zero_gain_streak", 2)),
                 require=pattern,
+                plan_hook=_probe_hook if auto_probe else None,
             )
             results = []          # 扩展模式下不再有"每页"概念，明细全在 stats 里
         else:

@@ -69,11 +69,17 @@ def expand_channel(
     zero_gain_streak: int = 2,
     require: Pattern[str] | None = None,
     sleep: Callable[[float], None] = time.sleep,
+    plan_hook: Callable[[list[Candidate]], Sequence[QueryVariant]] | None = None,
 ) -> tuple[list[Candidate], ExpansionStats]:
     """逐变体调用通道，返回 (去重后的候选, 统计)。
 
     require：正则。只保留 标题+摘要 命中的候选，用来压"红黑树 → 红黑彩票"这类歧义噪声。
              命中判断在去重之后、入库之前，被过滤的计入 filtered，不算 zero-gain。
+
+    plan_hook：变体可以"边打边定"。基词打完后调用一次，传入基词的去重结果，
+             返回后续变体（典型用法：用结果域名构成探测查询类型，技术词才加
+             后缀 —— 见 query.probe_profile）。返回空列表 = 只打基词。
+             刻意只在 i==0 后调用一次：探测证据来自基词，与后续变体无关。
     """
     stats = ExpansionStats()
     out: list[Candidate] = []
@@ -81,8 +87,9 @@ def expand_channel(
     t0 = time.perf_counter()
     streak = 0
     offset = ctx.channel.paging.start
+    plan: list[QueryVariant] = list(variants)
 
-    for i, v in enumerate(variants):
+    for i, v in enumerate(plan):
         if i and ctx.channel.throttle_min_interval_s > 0:
             sleep(ctx.channel.throttle_min_interval_s)
 
@@ -126,6 +133,10 @@ def expand_channel(
             stat.new += 1
 
         stats.per_query.append(stat)
+        if i == 0 and plan_hook is not None:
+            # 基词已见分晓：让调用方看一眼结果，决定还要不要打后续查询。
+            # 被去重/过滤剩下的 out 才是探测证据 —— 拿原始 cands 会把风控页当信号。
+            plan.extend(plan_hook(out))
         streak = 0 if stat.new > 0 else streak + 1
         if streak >= zero_gain_streak:
             stats.stopped_reason = f"连续 {streak} 个变体零新增，提前收手"
