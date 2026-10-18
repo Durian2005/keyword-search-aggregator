@@ -29,7 +29,7 @@ from __future__ import annotations
 import re
 import time
 from dataclasses import dataclass, field
-from typing import Callable
+from typing import Callable, Sequence
 
 from kwsearch.aggregate import host_of, relate
 from kwsearch.aggregate.cluster import (
@@ -52,7 +52,7 @@ from kwsearch.expand import expand_channel
 from kwsearch.fetch import FetchError
 from kwsearch.fetch.page import HostThrottle
 from kwsearch.models import Candidate, Doc, Mention
-from kwsearch.query import QueryVariant, expand_queries
+from kwsearch.query import QueryVariant, expand_queries, probe_profile
 from kwsearch.sanitize import Sanitizer
 from kwsearch.storage import Repository, init_db
 
@@ -182,6 +182,17 @@ def _term_pattern(keyword: str) -> "re.Pattern[str] | None":
     return re.compile("|".join(re.escape(n) for n in needles), re.I)
 
 
+def _needles_hit(keyword: str, c: Candidate) -> bool:
+    """与 serp 过滤（needles_of 词元口径）一致的"相关证据"判定。
+
+    relate 的 token 口径是中文整串，对复合词（央行降准 → 标题只写
+    "央行宣布降准"）恒判 0 命中；零命中丢弃必须用同一套词元口径复核，
+    否则"require 放行、入库前再杀"自相矛盾。
+    """
+    text = f"{c.title} {c.snippet}".casefold()
+    return any(n.casefold() in text for n in needles_of(keyword))
+
+
 def _screen_single_page(
     cands: list[Candidate], keyword: str, require: str | None,
 ) -> tuple[list[Candidate], int]:
@@ -213,6 +224,7 @@ def _run_serp(
     pattern,                       # re.Pattern | None
     zero_gain_streak: int,
     sleep: Callable[[float], None],
+    plan_hook: Callable[[list[Candidate]], Sequence[QueryVariant]] | None = None,
 ) -> tuple[ChannelRun, list[Candidate], list[dict]]:
     """通用搜索通道：基词 + 变体矩阵，靠换说法扩量（它的翻页已废）。"""
     fn = get_channel(ch.parser)
@@ -222,6 +234,7 @@ def _run_serp(
         zero_gain_streak=zero_gain_streak,
         require=pattern,
         sleep=sleep,
+        plan_hook=plan_hook,
     )
     logs = [
         {
@@ -508,14 +521,36 @@ def run_task(
     spec = dict(cfg.expand or {})
     if expand and expand > 0:
         spec["max_queries"] = expand
+    # profile=auto 时初始只生成基词：后续变体等第一个 serp 通道的基词结果
+    # 出来、probe_profile 判完类型再补（plan_hook）。没有证据就不打无效后缀
+    # —— 2026-10-18 "央行降准"实测：技术词后缀对时政词全是白打。
     variants = expand_queries(keyword, spec)
     zero_gain = int(spec.get("zero_gain_streak", 2))
+    auto_probe = bool(spec.get("profiles")) and str(spec.get("profile", "auto")) == "auto"
+
+    probed: list[QueryVariant] | None = None
+
+    def _plan_hook(cands: list[Candidate]) -> list[QueryVariant]:
+        """基词结果出来后判一次类型；结论全任务共用，不逐通道重复探测。"""
+        nonlocal probed
+        if probed is not None:
+            return probed[1:]
+        kind = probe_profile(cands) if cands else "generic"
+        probed = expand_queries(keyword, spec, probe=cands)
+        if len(probed) > 1:
+            say(f"  ⿻ 探测：基词结果判为 {kind}，加 {len(probed) - 1} 个变体")
+        else:
+            say(f"  ⿻ 探测：基词结果判为 {kind}，只打基词")
+        return probed[1:]
 
     result = RunResult(task_id=task_id, keyword=keyword, mode=mode)
     seen: dict[str, Candidate] = {}
     degraded = False
 
-    say(f"[{task_id}] {keyword!r}  mode={mode}  变体 {len(variants)} 个  上限 {cap} 条")
+    if auto_probe:
+        say(f"[{task_id}] {keyword!r}  mode={mode}  变体 基词先行，探测后定  上限 {cap} 条")
+    else:
+        say(f"[{task_id}] {keyword!r}  mode={mode}  变体 {len(variants)} 个  上限 {cap} 条")
 
     for ch in cfg.enabled_channels():
         if time.perf_counter() > deadline:
@@ -555,10 +590,13 @@ def run_task(
 
         ctx = build_context(cfg, ch.id)
         try:
-            if ch.type == "serp" and len(variants) > 1:
+            # auto_probe 时初始变体只有基词，但 serp 也必须走 _run_serp：
+            # plan_hook 要在 expand_channel 内部（拿到过滤后的基词结果）补变体。
+            if ch.type == "serp" and (len(variants) > 1 or auto_probe):
                 run, cands, logs = _run_serp(
                     ch, ctx, keyword, variants,
                     pattern=pattern, zero_gain_streak=zero_gain, sleep=sleep,
+                    plan_hook=_plan_hook if auto_probe else None,
                 )
             else:
                 run, cands, logs = _run_paged(
@@ -717,7 +755,12 @@ def run_task(
                 ch_type = cfg.channel(c.channel).type
             except KeyError:
                 ch_type = ""
-            if ch_type != "structured_api":
+            # relate 的命中口径是"按空白切、中文整串"：对"央行降准"这类复合词，
+            # 标题里几乎不会连着出现（实际标题是"央行宣布降准"），hit_title 恒 0。
+            # 零命中丢弃若也用这套口径，会把 serp 过滤（needles_of 词元口径）
+            # 刚放行的条目整批杀掉 —— 2026-10-18 实测 10/10 全灭、任务 failed。
+            # 过滤口径必须全链路一致：require 放行的，这里不能再杀。
+            if ch_type != "structured_api" and not _needles_hit(keyword, c):
                 result.dropped_zero += 1
                 continue
 

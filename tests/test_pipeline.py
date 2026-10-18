@@ -69,10 +69,23 @@ def fake_zero(keyword: str, offset: int, ctx) -> ChannelResult:  # noqa: ANN001
     ], "fake_zero", keyword)
 
 
+def fake_compound(keyword: str, offset: int, ctx) -> ChannelResult:  # noqa: ANN001
+    """复合词场景：标题只出现词元（降准），不出现整串（央行降准）。
+
+    2026-10-18 实测回归：零命中丢弃若用 relate 的整串口径，
+    serp 过滤（needles 词元口径）刚放行的条目会被整批杀掉。
+    """
+    return _mk([
+        ("https://c.example.com/1", "央行宣布降准0.5个百分点", "货币政策工具", "c.example.com"),
+        ("https://c.example.com/2", "今日股市收盘行情", "与关键词无关", "c.example.com"),
+    ], "fake_compound", keyword)
+
+
 discover._REGISTRY["fake_serp"] = fake_serp
 discover._REGISTRY["fake_zero"] = fake_zero
 discover._REGISTRY["fake_blocked"] = fake_blocked
 discover._REGISTRY["fake_paged"] = fake_paged
+discover._REGISTRY["fake_compound"] = fake_compound
 
 
 # --------------------------------------------------------------- 配置
@@ -146,6 +159,16 @@ _ZERO_CH = """
     parser: fake_zero
     url_template: "https://fake.test/z?q={q}&page={offset}"
     paging: {mode: offset, param: page, start: 1, step: 1, max_pages: 1}
+    throttle: {min_interval_s: 0}
+    assertions: {min_items: 1, required_fields: [url, title]}
+"""
+
+_COMPOUND_CH = """
+  - id: fake_compound
+    type: site_search
+    parser: fake_compound
+    url_template: "https://fake.test/c?q={q}"
+    paging: {mode: none}
     throttle: {min_interval_s: 0}
     assertions: {min_items: 1, required_fields: [url, title]}
 """
@@ -298,6 +321,15 @@ class TestZeroHit(RunCase):
         self.assertEqual(r.dropped_zero, 1)
         title = self.rows("SELECT title FROM doc")[0]["title"]
         self.assertIn("红黑树", title)
+
+    def test_compound_keyword_not_killed_by_zero_hit(self) -> None:
+        # "央行降准"整串几乎不会连着出现在标题里（实际是"央行宣布降准"），
+        # 零命中丢弃必须用 needles 词元口径复核，否则 serp 过滤放行的全被杀
+        r = self.run_kw(self.cfg(_COMPOUND_CH), keyword="央行降准")
+        self.assertEqual(r.kept, 1)
+        self.assertEqual(r.dropped_zero, 1)
+        title = self.rows("SELECT title FROM doc")[0]["title"]
+        self.assertIn("降准", title)
 
 
 class TestLimits(RunCase):
