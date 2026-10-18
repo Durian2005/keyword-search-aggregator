@@ -1,0 +1,359 @@
+# ============================================================================
+#  kwsearch · 通道配置（声明式）
+# ----------------------------------------------------------------------------
+#  新增一个发现通道 = 在本文件加一段 + 在 kwsearch/discover/ 注册一个 parser，
+#  主流程零改动。
+#
+#  这份文件同时承担"实测记录"的职责 —— 每条通道下面都跟着探测结论和日期，
+#  免得过两个月再回来猜"当时为什么这么配"。日期一律 UTC+8。
+#
+#  字段说明：
+#    id            唯一标识，会落进 doc.channel，中途改名会导致历史数据对不上
+#    type          serp（通用搜索）| site_search（站内搜索）| structured_api（公开 API）
+#    enabled       是否启用
+#    requires      none | key（需要 API key / 账号，缺了就自动跳过并告警，不报错）
+#    parser        kwsearch/discover/ 里的注册名
+#    url_template  支持 {q}（URL 编码后的关键词）、{offset}（分页偏移）
+#    headers       该通道必需的请求头
+#    paging        mode: offset（翻页）| none（一次拿完）
+#                  param/start/step/max_pages 决定翻页方式
+#    throttle      min_interval_s —— 同一通道两次请求的最小间隔。硬约束，不是建议。
+#    assertions    结构断言：解析结果不满足就记 alert，绝不静默丢
+# ============================================================================
+
+version: 1
+
+defaults:
+  timeout: 20
+  retry:
+    max_attempts: 3
+    backoff_base: 1.5            # 秒，指数退避 1.5 -> 3 -> 6
+    retry_on_status: [429, 500, 502, 503, 504]   # 403/401 不重试，只会加重风控
+  user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+  accept_language: "zh-CN,zh;q=0.9"
+
+channels:
+
+  # --------------------------------------------------------------------------
+  # Bing 网页搜索 —— 当前唯一的通用搜索通道，M1 主力
+  # 实测 2026-10-18：cn.bing.com / 200 / ~104,000B / 10 条每页
+  #   ⚠️ 分页【完全失效】，别再看 count / first 了：
+  #      first=1 / 11 / 21、去掉 count、加 FORM=PERE、换 www.bing.com + mkt=en-US、
+  #      保持同一 session Cookie、甚至照抄页面自带的"下一页"链接（带 FPIG 令牌），
+  #      返回的都是同一批 10 条结果，重合度 10/10。
+  #      中文词（红黑树）、英文词（python asyncio）都一样 → 不是词的问题，是匿名访问被锁在第一页。
+  #   ⇒ paging.max_pages 必须为 1。扩量只能靠 query 变体矩阵（M2），别指望翻页。
+  #   ⚠️ count=20 同样无效，恒为 10 条/页
+  #   ⚠️ 结果块选择器 <li class="b_algo">，标题在 h2 > a（高亮标签是 <strong> 不是 <em>）
+  #      跳转链可能被包成 bing 的 ck/a 中转，真实域名要看 <cite>（面包屑形式）
+  #   ⚠️ 页面里没有"相关搜索"区块（HTML 里搜不到 b_rs 的真实容器）→ 没有免费的查询扩展
+  # robots：www.bing.com/robots.txt 允许 /search?（2026-10-18 复核）
+  # --------------------------------------------------------------------------
+  - id: bing_html
+    name: Bing 网页
+    type: serp
+    enabled: true
+    requires: none
+    parser: bing_html
+    url_template: "https://cn.bing.com/search?q={q}&count=20&first={offset}"
+    paging:
+      mode: offset
+      param: first
+      start: 1
+      step: 10
+      max_pages: 1               # 分页已失效（见上），多配页数只会重复请求同一页
+    throttle:
+      min_interval_s: 2
+    assertions:
+      min_items: 5
+      required_fields: [url, title]
+    robots_checked: "2026-10-18"
+    robots_note: "允许 /search?；每词只取第一页 10 条，不翻页"
+
+  # --------------------------------------------------------------------------
+  # Bing RSS —— 唯一自带 pubDate 的通道，做时间线最省事
+  # 实测 2026-10-18：200 / 4,544B / 0.4s / 10 条
+  #   字段只有 4 个：title / link / description / pubDate
+  #   ⚠️ count=30 无效（仍 10 条）
+  #   ⚠️ first=11 分页【无效】：第二页首条与第一页完全相同
+  #   ⚠️ site: 运算符【不生效】：查 site:zhihu.com 返回了 csdn/runoob/github.io 等
+  #       甚至 baike.baidu.com → 不能拿它做"限定站点内搜索"
+  # 结论：只能当"10 条快照"用，扩量要靠 query 变体矩阵，不能靠翻页。
+  #       默认关闭，当时间线通道备用。
+  # --------------------------------------------------------------------------
+  - id: bing_rss
+    name: Bing RSS
+    type: serp
+    enabled: false
+    requires: none
+    parser: bing_rss
+    url_template: "https://www.bing.com/search?q={q}&format=rss"
+    paging:
+      mode: none
+    throttle:
+      min_interval_s: 2
+    assertions:
+      min_items: 3
+      required_fields: [url, title]
+    robots_checked: "2026-10-18"
+    robots_note: "同上；分页与 site: 均无效，仅作 10 条快照"
+
+  # --------------------------------------------------------------------------
+  # B站视频搜索 —— 中文垂类最深，且【分页真实有效】（20 条/页，最多 50 页）
+  # 实测 2026-10-18：200 / code=0 / numResults=1000（是上限，不是真实命中）/ 20 条每页
+  #   ⚠️ Referer 必须是 https://search.bilibili.com/ ！
+  #      用 https://www.bilibili.com/ 会直接 412；换到搜索页 Referer 立刻 200。
+  #   ⚠️ 限流是**滚动配额**，不是固定间隔能绕开的：间隔 3s / 5s / 8s 实测都会随机 -412，
+  #      page 1~4 里常常只有 2 页能拿到。策略是"打到被拦就停"，绝不重试硬顶。
+  #   ⚠️ code=-412 限流、-352 风控，都按 blocked 处理，不做任何规避（不补 wbi 签名）
+  #   字段：arcurl / bvid / title（含 <em> 高亮）/ pubdate（unix 秒）/ author / play
+  # --------------------------------------------------------------------------
+  - id: bilibili_search
+    name: B站搜索
+    type: site_search
+    enabled: true
+    requires: none
+    parser: bilibili_search
+    url_template: "https://api.bilibili.com/x/web-interface/search/type?search_type=video&keyword={q}&page={offset}"
+    headers:
+      Referer: "https://search.bilibili.com/"
+      Accept: "application/json, text/plain, */*"
+    paging:
+      mode: offset
+      param: page
+      start: 1
+      step: 1
+      max_pages: 3               # 20×3=60 条上限；再多只会更快撞 -412
+    throttle:
+      min_interval_s: 5
+    assertions:
+      min_items: 5
+      required_fields: [url, title]
+    robots_checked: "2026-10-18"
+    robots_note: "公开搜索接口，无需登录；Referer 必须是 search.bilibili.com；频繁会被 412"
+
+  # --------------------------------------------------------------------------
+  # GDELT DOC 2.0 —— 全球新闻，零风控，是"全网"里最能写进报告的一路
+  # 也是本项目**单次量最大**的通道：maxrecords=75，一次请求 75 条
+  # 实测 2026-10-18：首次 200 / 之后 429
+  #   429 原文："Please limit requests to one every 5 seconds"
+  #   单次耗时 13.4s（偏慢），返回体 ~444B（错误）/ 正常时按 maxrecords 计
+  # ⚠️ min_interval_s 必须 ≥5，配置里给 6 留余量
+  # ⚠️ 超限时可能返回 200 + 纯文本（不一定是 429）→ 解析层已按 rate_limit 兜住
+  # ⚠️ seendate 是 20261018T120000Z（UTC 无分隔符），要自己拆成本地 ISO
+  # ⚠️ 中文召回一般，主要覆盖外媒与英文新闻；中文靠 bing_html + bilibili 补
+  # --------------------------------------------------------------------------
+  - id: gdelt
+    name: GDELT 全球新闻
+    type: structured_api
+    enabled: true
+    requires: none
+    parser: gdelt
+    url_template: "https://api.gdeltproject.org/api/v2/doc/doc?query={q}&mode=artlist&maxrecords=75&format=json&timespan={timespan}"
+    params:
+      timespan: "30d"
+    paging:
+      mode: none
+    throttle:
+      min_interval_s: 6
+    assertions:
+      min_items: 1          # 冷门词可能 0 条，这不算失败
+      required_fields: [url, title]
+    robots_checked: "2026-10-18"
+    robots_note: "公开 API，官方明确要求 ≤1 req/5s；超限返回 429 纯文本"
+
+  # --------------------------------------------------------------------------
+  # SearXNG —— 已评估、本机不可用，保留适配器位
+  # 实测 2026-10-18：本机无 Docker（无 Docker Desktop 安装目录，PATH 无 docker），
+  #                  WSL 被安全策略拦截无法启用
+  # ⚠️ 更关键：即便自建，本机网络到不了 Google/DDG（DDG lite 实测 CONNECT 502），
+  #    而 SearXNG 的主要价值就是转这两个源 → 剩下只是"统一限流层"，收益不抵成本
+  # 将来条件满足（装了 Docker + 网络可达）把 enabled 改 true 即可，parser 名不变
+  # --------------------------------------------------------------------------
+  - id: searxng
+    name: SearXNG 自建
+    type: serp
+    enabled: false
+    requires: none
+    parser: searxng
+    url_template: "http://127.0.0.1:8080/search?q={q}&format=json&pageno={offset}"
+    paging:
+      mode: offset
+      param: pageno
+      start: 1
+      step: 1
+      max_pages: 3
+    throttle:
+      min_interval_s: 2
+    assertions:
+      min_items: 3
+      required_fields: [url, title]
+    robots_checked: "n/a"
+    robots_note: "自建实例，robots 由上游引擎各自决定"
+
+  # --------------------------------------------------------------------------
+  # 360 / 搜狗 —— 200 能拿到页面，但结果解析尚未验证，先关着
+  # 实测 2026-10-18：so.com / 200 / 718,359B；sogou / 200 / 593,237B
+  #   均未见验证码字样，但结果块选择器（.res-list / .vrwrap）未做稳定性验证
+  #   且两家跳转链都是自家中转，真实 URL 需要额外还原 → 排到 M3 之后
+  # --------------------------------------------------------------------------
+  - id: so360
+    name: 360 搜索
+    type: serp
+    enabled: false
+    requires: none
+    parser: so360
+    url_template: "https://www.so.com/s?q={q}&pn={offset}"
+    paging:
+      mode: offset
+      param: pn
+      start: 1
+      step: 1
+      max_pages: 2
+    throttle:
+      min_interval_s: 3
+    assertions:
+      min_items: 5
+      required_fields: [url, title]
+    robots_checked: "2026-10-18"
+    robots_note: "页面可达，解析未验证"
+
+  - id: sogou
+    name: 搜狗
+    type: serp
+    enabled: false
+    requires: none
+    parser: sogou
+    url_template: "https://www.sogou.com/web?query={q}&page={offset}"
+    paging:
+      mode: offset
+      param: page
+      start: 1
+      step: 1
+      max_pages: 2
+    throttle:
+      min_interval_s: 3
+    assertions:
+      min_items: 5
+      required_fields: [url, title]
+    robots_checked: "2026-10-18"
+    robots_note: "页面可达，解析未验证；跳转链需还原"
+
+# ============================================================================
+#  查询变体（一个词打几次）
+# ----------------------------------------------------------------------------
+#  为什么必须有这一段：Bing 匿名访问翻页失效（见 bing_html 段），一个词只有 10 条。
+#  唯一能扩量的手段就是换说法再搜。但"加后缀"不都有效，所以这里按实测增益排序，
+#  配合 zero_gain_streak 提前收手。
+#
+#  实测 2026-10-18 · 关键词"红黑树"（间隔 2s，共 13 次请求）：
+#     基词                 +10     左旋 右旋      +10     实现        +10
+#     red black tree      +9（人工补的英文术语）   java        +8     原理  +5
+#     图解 / 时间复杂度 / 与 AVL 的区别 / 教程 / 面试 / 优缺点 / 应用场景 / 是什么  → 全部 +0
+#  ⚠️ 这些增益数字是单次观测，不要当定律：
+#     同一查询在不同时间是稳定的（连续 3 次指纹一致），但"低频组合词"会被 Bing 放宽，
+#     同一词隔一段时间可能从"10 条相关"变成"10 条噪声"。真正的防线是 require_keyword + 早停。
+#  ⇒ 泛化后缀（教程/面试/是什么）在这个引擎上等于白打，别放前面；放着只是为别的词留个机会。
+#
+#  跨语言扩展不做自动翻译：翻错了会灌进大量无关结果。英文术语走 extra_queries 人工补。
+# ============================================================================
+expand:
+  enabled: true
+  max_queries: 8                 # 含基词在内的总上限。8 次 × 2s ≈ 16s，quick 模式能接受
+  separator: " "
+  zero_gain_streak: 2            # 连续几个变体零新增就停（省请求，也省风控风险）
+  # 只保留 标题+摘要 里出现基词的候选。**仅对 serp 类通道生效**。
+  # 为什么需要："红黑树 左旋 右旋"这类低频组合词会被 Bing 丢掉高频词、退化成搜"红黑"，
+  #   返回红黑人口库 / 同名歌曲 / 彩票站 —— 不按基词过滤，噪声能占三成。
+  # 为什么不套在 API 通道上：GDELT 是服务端短语检索，返回的标题常是土耳其语等机器翻译
+  #   （实测 "artificial intelligence" 75 条里一条中文/英文标题都没有），
+  #   再按"标题含基词"筛一遍等于全灭；B站是站内检索，同理。
+  # 代价：标题里只写 "Red Black Tree" 而不含中文名的页会被过滤 —— 所以可以关（--no-filter）。
+  require_keyword: true
+  suffixes:
+    - "左旋 右旋"                # 具体技术动作，实测 +10
+    - "实现"                     # +10
+    - "java"                     # 技术栈，+8
+    - "原理"                     # +5
+    - "图解"                     # +0（保留，换词可能有效）
+    - "时间复杂度"               # +0
+    - "与 AVL 的区别"            # +0
+  extra_queries: []              # 人工补充整条查询，如 ["red black tree"]
+
+# ============================================================================
+#  采集行为
+# ============================================================================
+crawl:
+  concurrency: 4                 # 全局并发上限（不分通道）
+  per_domain_qps: 1              # 单域名每秒请求数上限
+  max_depth: 2                   # 只有 deep 模式的种子域遍历才用到
+  max_pages_per_domain: 200
+  robots_obey: true              # 关掉要在这里写明理由，别默默关
+  respect_meta_noindex: true
+
+# ============================================================================
+#  抽取行为
+# ============================================================================
+extract:
+  # ---- S3d 正文抓取 --------------------------------------------------------
+  # 入库前对"最可能入库的那批"打开链接抓正文，摘要换成文章自己的开头。
+  # 关掉（false）就退回 S4 行为：摘要用搜索结果页原文，body_chars=0。
+  fetch_body: true
+  # 一次任务最多抓几条正文。**请求量就是这个数**，不要开大：
+  # 40 条 = 40 次第三方站点请求 + 每域一次 robots.txt，按 1 QPS 单域限速约 1~2 分钟。
+  max_fetch: 40
+
+  summary_chars: 500             # 只存摘要，不存全文
+  store_full_body: false         # true 时全文写 bodies/（已被 .gitignore 挡住）
+  max_page_bytes: 8388608        # 8MB。超过只记 too_large 不解析：正文页不该有这么大
+  min_body_chars: 200            # 正文短于此值 + 命中风控词 → 判 challenge，不入库
+  js_required_ratio: 0.3         # HTML 文本/总字节 低于此比例 → 记为"疑似 JS 站"，M3 再决定是否上渲染
+  # 响应头和 <meta charset> 都没给出编码时的猜测顺序。utf-8 必须排在 gb18030 之前：
+  # gb18030 几乎能吃下任意字节序列，放前面会把 UTF-8 页面"成功"解成乱码还不报错。
+  encoding_fallbacks: [utf-8, gb18030]
+  date_sources: [jsonld, meta, regex, serp, fallback]   # 时间抽取优先级，顺序有意义
+  challenge_keywords: ["安全验证", "滑动验证", "请输入验证码", "访问过于频繁", "请稍后再试", "robot check", "unusual traffic"]
+
+# ============================================================================
+#  S5 近重复聚簇（转载归并）
+# ============================================================================
+cluster:
+  enabled: true
+  # 汉明距离阈值。**不要照抄教程里的 3**：实测「同文 + 追加 180 字免责声明」
+  # 的距离是 8，而门户转载最标准的做法就是加那段声明，阈值 3 会全部漏掉。
+  # 上限依据：同模板不同事件的通报 15~20，无关文章 23~35 —— 10 是两者之间。
+  # 详细实测表见 aggregate/cluster.py 顶部。
+  hamming: 10
+  # 正文短于此值不参与聚类。200 字以下算出的指纹没有区分度，
+  # 硬聚会把"同主题的不同短文"并成一篇。
+  min_body_chars: 200
+
+# ============================================================================
+#  过滤与脱敏（红线落地的地方，别删）
+# ============================================================================
+filter:
+  # 命中即脱敏，绝不原样入库：这是"公开信息聚合"和"人肉搜索"的分界线
+  pii_patterns:
+    phone_cn: "\\b1[3-9]\\d{9}\\b"
+    id_card_cn: "\\b\\d{17}[\\dXx]\\b"
+    email: "\\b[\\w.+-]+@[\\w-]+\\.[\\w.]+\\b"
+  drop_domains: []               # 明确要拉黑的站
+  drop_url_patterns: ["\\.(zip|exe|apk|dmg|iso)$", "/download/"]
+  max_per_domain: 30             # 单域最多留多少条，防止某个大站垄断报告
+  # 标题和摘要里都没出现关键词的条目直接丢。
+  # 实测 2026-10-18「红黑树」：B站 20 条里最后一条是"【蓝桥杯】算法入门精品课"，
+  # 标题摘要都不含该词 —— 那是站点搜索给冷门词的兜底推荐，不是搜索结果。
+  # 分数上它只剩名次加成（0.2），排在最末，但留在库里会让"总量"虚高。
+  # ⚠️ structured_api 类型豁免：GDELT 的标题常是机器翻译的多语种，
+  #    "artificial intelligence" 实测 75 条里没有一条中英文标题含原词，
+  #    按这条规则会把整条通道清空。
+  drop_zero_hit: true
+
+# ============================================================================
+#  规模上限（防止一个词跑穿磁盘）
+# ============================================================================
+limits:
+  max_docs: 1000
+  max_bytes: 209715200           # 200MB
+  max_minutes: 60
+  # 触顶不是崩溃：优雅停下，task.truncated=1，报告里写明"已达上限，结果不完整"
