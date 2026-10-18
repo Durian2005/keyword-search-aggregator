@@ -1,0 +1,28 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# ---- 数据（体积大、持续变化，绝不入库）----
+*.db
+*.db-wal
+*.db-shm
+*.sqlite*
+
+# ---- 运行产物 ----
+report/
+logs/
+# 正文全文落盘目录（默认只存摘要，全文按需开启）
+bodies/
+# Scrapling crawldir 断点续爬目录
+crawl_data/
+
+# ---- 本机私有 ----
+.workbuddy/
+.env
+*.local.yaml
+
+# ---- 编辑器 ----
+.vscode/
+.idea/
