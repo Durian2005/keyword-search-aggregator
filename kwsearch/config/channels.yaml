@@ -156,6 +156,14 @@ channels:
       mode: none
     throttle:
       min_interval_s: 6
+    # 通道级抓取覆盖（discover/base.build_context 合并，通道优先于 defaults）。
+    # 实测 2026-10-18：GDELT 单次 13~20s，全局 20s×3 次重试把 --no-body
+    # 快速任务拖到 56s。GDELT 正常时 <5s 返回，超时 10s + 2 次足够，
+    # 最坏 10+1.5+10 ≈ 21.5s，不再吃掉整个任务的预算。
+    fetch:
+      timeout: 10
+      retry:
+        max_attempts: 2
     assertions:
       min_items: 1          # 冷门词可能 0 条，这不算失败
       required_fields: [url, title]
@@ -270,14 +278,24 @@ expand:
   #   再按"标题含基词"筛一遍等于全灭；B站是站内检索，同理。
   # 代价：标题里只写 "Red Black Tree" 而不含中文名的页会被过滤 —— 所以可以关（--no-filter）。
   require_keyword: true
-  suffixes:
-    - "左旋 右旋"                # 具体技术动作，实测 +10
-    - "实现"                     # +10
-    - "java"                     # 技术栈，+8
-    - "原理"                     # +5
-    - "图解"                     # +0（保留，换词可能有效）
-    - "时间复杂度"               # +0
-    - "与 AVL 的区别"            # +0
+  # 变体按查询类型选后缀（2026-10-18 "央行降准" 实测的教训：技术词后缀对
+  # 时政词完全无效，两个变体全被降级，白打 2 次请求还产出荒谬告警）。
+  # profile: auto —— 先只用基词打第一个 serp 通道，用结果的域名构成探测类型
+  #   （query.probe_profile）：GitHub/CSDN/博客园 扎堆 → tech，加后缀扩量；
+  #   新闻站扎堆 / 人名信号 / 判不出来 → 只打基词。没有证据就不打无效后缀。
+  # 人名（person）永远只打基词：任何"人名 + 第二个词"的组合都会触发 Bing
+  #   静默降级（见 discover/quality.py），收窄只能靠结果内归因。
+  profile: auto
+  profiles:
+    tech:                        # 技术词：具体动作 / 技术栈，实测有增益
+      - "左旋 右旋"              # +10
+      - "实现"                  # +10
+      - "java"                  # +8
+      - "原理"                  # +5
+      - "图解"                  # +0（保留，换词可能有效）
+    person: []                   # 人名：只打基词，归因在结果内做
+    news: []                     # 时政/事件词：变体实测零增益
+    generic: []                  # 兜底（探测不出类型时走这里）
   extra_queries: []              # 人工补充整条查询，如 ["red black tree"]
 
 # ============================================================================

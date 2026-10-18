@@ -52,13 +52,20 @@ class ChannelContext:
 def build_context(cfg: AppConfig, channel_id: str, *,
                   fetcher: BaseFetcher | None = None) -> ChannelContext:
     ch = cfg.channel(channel_id)
+    # 抓取参数：通道级 fetch 覆盖优先于全局 defaults（深合并 retry 子键）。
+    # GDELT 单次要 13s，全局 20s×3 次重试曾把 --no-body 快速任务拖到 56s；
+    # 而全局收紧超时又会饿死慢站 —— 所以超时归通道管。
+    over = dict(ch.fetch_over or {})
+    retry_raw = dict(cfg.defaults.get("retry") or {})
+    retry_raw.update(dict(over.get("retry") or {}))
+    timeout = int(over.get("timeout", cfg.defaults.get("timeout", 20)))
     return ChannelContext(
         channel=ch,
         defaults=dict(cfg.defaults),
         extract=dict(cfg.extract),
         fetcher=fetcher or build_fetcher(),
-        policy=RetryPolicy.from_mapping(cfg.defaults.get("retry")),
-        timeout=int(cfg.defaults.get("timeout", 20)),
+        policy=RetryPolicy.from_mapping(retry_raw),
+        timeout=timeout,
     )
 
 

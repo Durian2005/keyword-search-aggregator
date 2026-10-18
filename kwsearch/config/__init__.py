@@ -62,6 +62,10 @@ class ChannelConfig:
     paging: PagingConfig = field(default_factory=PagingConfig)
     throttle_min_interval_s: float = 1.0
     assertions: AssertionConfig = field(default_factory=AssertionConfig)
+    # 通道级抓取覆盖（timeout / retry）。空 dict = 完全沿用 defaults。
+    # 存在的意义：GDELT 单次要 13s，全局 20s×3 次的"快速任务"被拖到 1 分钟；
+    #   而全局收紧又会饿死慢站。超时是通道属性，不是全局属性。
+    fetch_over: dict[str, Any] = field(default_factory=dict)
     robots_checked: str = ""
     robots_note: str = ""
 
@@ -139,6 +143,9 @@ def _build_channel(raw: dict[str, Any], idx: int) -> ChannelConfig:
     )
 
     throttle = raw.get("throttle") or {}
+    fetch_over = raw.get("fetch") or {}
+    if not isinstance(fetch_over, dict):
+        raise ConfigError(f"[{raw['id']}] fetch 必须是映射（timeout / retry）")
     return ChannelConfig(
         id=raw["id"],
         name=raw.get("name", raw["id"]),
@@ -152,6 +159,7 @@ def _build_channel(raw: dict[str, Any], idx: int) -> ChannelConfig:
         paging=paging,
         throttle_min_interval_s=float(throttle.get("min_interval_s", 1.0)),
         assertions=assertions,
+        fetch_over=dict(fetch_over),
         robots_checked=str(raw.get("robots_checked", "")),
         robots_note=str(raw.get("robots_note", "")),
     )
