@@ -10,13 +10,13 @@ venv/
 *.db-shm
 *.sqlite*
 
-# ---- 运行产物 ----
-report/
-logs/
+# ---- 运行产物（只忽略仓库根目录下的，避免误伤 kwsearch/report 等源码目录）----
+/report/
+/logs/
 # 正文全文落盘目录（默认只存摘要，全文按需开启）
-bodies/
+/bodies/
 # Scrapling crawldir 断点续爬目录
-crawl_data/
+/crawl_data/
 
 # ---- 本机私有 ----
 .workbuddy/
