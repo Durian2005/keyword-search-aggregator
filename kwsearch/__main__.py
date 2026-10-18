@@ -25,6 +25,7 @@ from pathlib import Path
 
 from kwsearch import __version__
 from kwsearch.config import AppConfig, ConfigError, load_config
+from kwsearch.person import PersonQuery, parse_person
 
 DB_DEFAULT = "kwsearch.db"
 
@@ -110,6 +111,7 @@ def cmd_run(
     out_dir: str = "report",
     want_report: bool = True,
     fetch_body: bool | None = None,
+    person: PersonQuery | None = None,
 ) -> int:
     from kwsearch.discover import registered_names
     from kwsearch.query import expand_queries
@@ -160,6 +162,7 @@ def cmd_run(
             cfg, keyword, mode=mode, timespan=timespan, db_path=db_path,
             max_docs=max_docs, expand=expand, require=require,
             no_filter=no_filter, progress=print, fetch_body=fetch_body,
+            person=person,
         )
     except KeyboardInterrupt:
         # 中断也要能解释：已入库的部分留在库里，报告可以正常生成
@@ -192,6 +195,10 @@ def _run_summary(result) -> str:  # noqa: ANN001
           f" · 配额丢 {result.dropped_cap} · 脱敏 {result.pii_masked}"
           f" · 告警 {result.alerts} · {result.elapsed_ms} ms"
     )
+    if result.person_cards:
+        from kwsearch.person import TIER_CN
+        tiers = "、".join(f"{TIER_CN[t]} {n}" for t, n in result.person_tiers.items() if n)
+        head += f"\n候选人 {result.person_cards} 张：{tiers}"
     return head + "\n\n" + _table(rows, ["通道", "类型", "请求", "解析", "去重", "状态", "停止原因"])
 
 
@@ -824,6 +831,15 @@ def main(argv: list[str] | None = None) -> int:
                     help="不抓正文（摘要用搜索结果原文，快但信息量小）")
     pr.add_argument("--out", default="report", help="报告输出目录（默认 report/）")
     pr.add_argument("--no-report", action="store_true", help="只入库，不生成报告")
+    # ---- 人名模式（见 person.py）：查询侧只打裸姓名，收窄在结果侧做 ----
+    pr.add_argument("--person", action="store_true",
+                    help="人名模式：只打裸姓名，按机构/方向锚点在结果内归因，产出候选人卡片")
+    pr.add_argument("--org", action="append", default=[], metavar="机构",
+                    help="强锚点，可重复或逗号分隔，如 --org 某某大学")
+    pr.add_argument("--field", action="append", default=[], metavar="方向",
+                    help="弱锚点（研究方向/业务领域），可重复，如 --field 网络安全")
+    pr.add_argument("--role", action="append", default=[], metavar="身份",
+                    help="弱锚点（身份/职称），可重复，如 --role 教授 --role 博导")
 
     pp = sub.add_parser("probe", help="单 URL 探针：状态/耗时/大小/预览，通道上线前先跑它")
     pp.add_argument("url")
@@ -913,6 +929,8 @@ def main(argv: list[str] | None = None) -> int:
                 require=args.require, no_filter=args.no_filter,
                 out_dir=args.out, want_report=not args.no_report,
                 fetch_body=False if args.no_body else None,
+                person=(parse_person(args.keyword, args.org, args.field, args.role)
+                        if args.person else None),
             )
         if args.cmd == "db":
             return cmd_db(cfg, args.action, args.db)

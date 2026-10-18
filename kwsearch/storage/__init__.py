@@ -308,6 +308,34 @@ class Repository:
         self.conn.commit()
         return n
 
+    # --------------------------------------------------------- 人名模式卡片
+
+    def replace_person_cards(self, task_id: str, cards: Iterable[Any]) -> int:
+        """重写一个任务的候选人卡片，返回写入张数。
+
+        与簇一样先删后插：卡片是派生结果，重跑后"某某大学"那张卡的内容
+        可能完全不同，增量更新只会留下上一轮的幽灵证据。
+        """
+        self.conn.execute("DELETE FROM person_card WHERE task_id=?", (task_id,))
+        n = 0
+        for c in cards:
+            evidence = [
+                {"title": e.title, "url": e.url, "matched": list(e.matched)}
+                for e in getattr(c, "evidence", []) or []
+            ]
+            self.conn.execute(
+                "INSERT INTO person_card(task_id, label, tier, score, org_hits,"
+                " weak_hits, docs, negatives, evidence_json)"
+                " VALUES (?,?,?,?,?,?,?,?,?)",
+                (task_id, c.label, c.tier, int(c.score or 0), int(c.org_hits or 0),
+                 int(c.weak_hits or 0), int(c.docs or 0),
+                 ",".join(getattr(c, "negatives", ()) or ()) or None,
+                 json.dumps(evidence, ensure_ascii=False)),
+            )
+            n += 1
+        self.conn.commit()
+        return n
+
     def upsert_mention(self, m: Mention) -> None:
         """同一任务内一篇文档只留一行，分数取最大值（多通道发现同一页时）。"""
         self.conn.execute(
@@ -482,6 +510,20 @@ class Repository:
             " WHERE m.task_id=? AND d.published_at IS NOT NULL", (task_id,)).fetchone()[0]
         new_docs = self.conn.execute("SELECT COUNT(*) FROM doc").fetchone()[0]
 
+        # 人名模式的候选人卡片（普通任务里为空表，报告据此决定要不要出这一块）
+        person_cards = [dict(r) for r in self.conn.execute(
+            "SELECT label, tier, score, org_hits, weak_hits, docs, negatives,"
+            "       evidence_json FROM person_card WHERE task_id=?"
+            " ORDER BY CASE tier WHEN 'confirmed' THEN 0 WHEN 'likely' THEN 1"
+            "   WHEN 'suspect' THEN 2 ELSE 3 END, docs DESC, score DESC",
+            (task_id,))]
+        for c in person_cards:
+            try:
+                c["evidence"] = json.loads(c.pop("evidence_json") or "[]")
+            except (ValueError, TypeError):
+                c["evidence"] = []
+            c["negatives"] = [x for x in (c.get("negatives") or "").split(",") if x]
+
         stats_json: dict[str, Any] = {}
         if task["stats_json"]:
             try:
@@ -525,6 +567,7 @@ class Repository:
             "alerts": alerts,
             "queries": queries,
             "clusters": clusters,
+            "person_cards": person_cards,
         }
 
 

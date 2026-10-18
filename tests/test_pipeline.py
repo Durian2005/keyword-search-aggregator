@@ -16,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from kwsearch import discover  # noqa: E402
 from kwsearch.config import load_config  # noqa: E402
 from kwsearch.models import Candidate, ChannelResult  # noqa: E402
+from kwsearch.person import parse_person  # noqa: E402
 from kwsearch.pipeline import run_task  # noqa: E402
 from kwsearch.storage import Repository, connect  # noqa: E402
 
@@ -86,6 +87,21 @@ discover._REGISTRY["fake_zero"] = fake_zero
 discover._REGISTRY["fake_blocked"] = fake_blocked
 discover._REGISTRY["fake_paged"] = fake_paged
 discover._REGISTRY["fake_compound"] = fake_compound
+
+
+def fake_person(keyword: str, offset: int, ctx) -> ChannelResult:  # noqa: ANN001
+    """人名模式：三条命中不同锚点的结果 + 一条同名不同人（歌手）。"""
+    return _mk([
+        ("https://u1.example.edu.cn/1", "张军-甲大学计算机学院 教授 网络安全方向",
+         "张军，甲大学教授，研究方向为网络安全", "u1.example.edu.cn"),
+        ("https://u2.example.edu.cn/2", "甲大学计算机学院 师资队伍",
+         "张军 教授 网络安全 博士生导师", "u2.example.edu.cn"),
+        ("https://ent.example.com/3", "张军（歌手）_百科",
+         "流行歌手，代表作……", "ent.example.com"),
+    ], "fake_person", keyword)
+
+
+discover._REGISTRY["fake_person"] = fake_person
 
 
 # --------------------------------------------------------------- 配置
@@ -169,6 +185,16 @@ _COMPOUND_CH = """
     parser: fake_compound
     url_template: "https://fake.test/c?q={q}"
     paging: {mode: none}
+    throttle: {min_interval_s: 0}
+    assertions: {min_items: 1, required_fields: [url, title]}
+"""
+
+_PERSON_CH = """
+  - id: fake_person
+    type: serp
+    parser: fake_person
+    url_template: "https://fake.test/p?q={q}&first={offset}"
+    paging: {mode: offset, param: first, start: 1, step: 10, max_pages: 1}
     throttle: {min_interval_s: 0}
     assertions: {min_items: 1, required_fields: [url, title]}
 """
@@ -330,6 +356,40 @@ class TestZeroHit(RunCase):
         self.assertEqual(r.dropped_zero, 1)
         title = self.rows("SELECT title FROM doc")[0]["title"]
         self.assertIn("降准", title)
+
+
+class TestPersonMode(RunCase):
+    """人名模式：裸姓名一次 + 结果内归因 + 候选人卡片。"""
+
+    def test_cards_grouped_by_org(self) -> None:
+        p = parse_person("张军", ["甲大学计算机学院"], ["网络安全"])
+        r = self.run_kw(self.cfg(_PERSON_CH), keyword="张军", person=p)
+        self.assertEqual(r.kept, 3)
+        # 甲大学一张卡 + 未匹配机构（歌手）一张卡
+        self.assertEqual(r.person_cards, 2)
+        self.assertEqual(r.person_tiers.get("confirmed"), 1)
+        rows = self.rows("SELECT label, tier, docs FROM person_card ORDER BY docs DESC")
+        by_label = {x["label"]: x for x in rows}
+        self.assertEqual(by_label["甲大学计算机学院"]["tier"], "confirmed")
+        self.assertEqual(by_label["未匹配机构"]["docs"], 1)
+
+    def test_only_bare_name_queried(self) -> None:
+        # 配置里有 suffix "原理"，但人名模式必须清掉 —— 任何"姓名+第二个词"
+        # 都会触发 Bing 静默降级（见 discover/quality.py）
+        p = parse_person("张军", ["甲大学计算机学院"])
+        self.run_kw(self.cfg(_PERSON_CH), keyword="张军", person=p)
+        qs = self.rows("SELECT query_text FROM query WHERE channel='fake_person'")
+        self.assertEqual([q["query_text"] for q in qs], ["张军"])
+
+    def test_no_anchor_alerts(self) -> None:
+        p = parse_person("张军")          # 没有机构/方向锚点
+        r = self.run_kw(self.cfg(_PERSON_CH), keyword="张军", person=p)
+        kinds = [x["kind"] for x in
+                 self.rows("SELECT kind FROM alert WHERE task_id=?", r.task_id)]
+        self.assertIn("person_no_anchor", kinds)
+        # 无锚点也要出卡片，但只能是"未匹配机构"
+        labels = [x["label"] for x in self.rows("SELECT label FROM person_card")]
+        self.assertEqual(labels, ["未匹配机构"])
 
 
 class TestLimits(RunCase):

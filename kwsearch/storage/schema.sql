@@ -139,6 +139,25 @@ CREATE TABLE IF NOT EXISTS cluster_member (
 CREATE INDEX IF NOT EXISTS idx_cmember_url ON cluster_member(task_id, url_canon);
 
 -- ----------------------------------------------------------------------------
+-- 人名模式：候选人卡片（见 person.py）。
+-- 按命中的机构分组 —— **不同机构绝不合并**，这是红线；
+-- 无机构命中的候选统一记 label='未匹配机构'，报告里折叠为"同名未归因"。
+-- 卡片是任务维度的派生结果，重跑就整体重写（簇号同理）。
+-- ----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS person_card (
+    task_id       TEXT NOT NULL,
+    label         TEXT NOT NULL,               -- 机构原文 / 未匹配机构
+    tier          TEXT NOT NULL,               -- confirmed|likely|suspect|unrelated
+    score         INTEGER NOT NULL DEFAULT 0,
+    org_hits      INTEGER NOT NULL DEFAULT 0,
+    weak_hits     INTEGER NOT NULL DEFAULT 0,
+    docs          INTEGER NOT NULL DEFAULT 0,
+    negatives     TEXT,                        -- 逗号分隔：演艺/招聘/法律
+    evidence_json TEXT,                        -- [{title,url,matched}]
+    PRIMARY KEY (task_id, label)
+);
+
+-- ----------------------------------------------------------------------------
 -- 待抓队列：跨通道统一调度。
 -- Scrapling 的 crawldir 只管它自己的队列，发现层产出的候选还得我们自己排。
 -- ----------------------------------------------------------------------------

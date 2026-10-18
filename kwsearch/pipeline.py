@@ -52,6 +52,14 @@ from kwsearch.expand import expand_channel
 from kwsearch.fetch import FetchError
 from kwsearch.fetch.page import HostThrottle
 from kwsearch.models import Candidate, Doc, Mention
+from kwsearch.person import (
+    TIER_CN,
+    Judgment,
+    PersonQuery,
+    build_cards,
+    judge,
+    summarize,
+)
 from kwsearch.query import QueryVariant, expand_queries, probe_profile
 from kwsearch.sanitize import Sanitizer
 from kwsearch.storage import Repository, init_db
@@ -143,6 +151,9 @@ class RunResult:
     cluster_groups: int = 0        # 独立内容组数（= 簇数 + 没有指纹的那些）
     cluster_merged: int = 0        # 被并掉的条数
     cluster_unfingerprinted: int = 0   # 没有指纹：正文过短 / 低置信 / 老数据没算
+    # 人名模式（见 person.py）：卡片数与各档分布
+    person_cards: int = 0
+    person_tiers: dict[str, int] = field(default_factory=dict)
     per_channel: list[ChannelRun] = field(default_factory=list)
 
     @property
@@ -503,6 +514,7 @@ def run_task(
     sleep: Callable[[float], None] = time.sleep,
     fetcher=None,  # noqa: ANN001 —— 单测注入假实现；生产不传，由 build_fetcher 挑
     fetch_body: bool | None = None,
+    person: PersonQuery | None = None,
 ) -> RunResult:
     """跑一次关键词任务。所有参数显式传入，不读全局状态。"""
     say = progress or (lambda _m: None)
@@ -521,12 +533,20 @@ def run_task(
     spec = dict(cfg.expand or {})
     if expand and expand > 0:
         spec["max_queries"] = expand
+    # 人名模式：查询侧只打裸姓名（"姓名 + 第二个词"必然触发 Bing 静默降级），
+    # 收窄全部放到结果侧（person.judge）。所以强制 person 档、清掉后缀。
+    if person is not None:
+        if spec.get("profiles"):
+            spec["profile"] = "person"
+        spec["suffixes"] = []
+        spec["extra_queries"] = []
     # profile=auto 时初始只生成基词：后续变体等第一个 serp 通道的基词结果
     # 出来、probe_profile 判完类型再补（plan_hook）。没有证据就不打无效后缀
     # —— 2026-10-18 "央行降准"实测：技术词后缀对时政词全是白打。
     variants = expand_queries(keyword, spec)
     zero_gain = int(spec.get("zero_gain_streak", 2))
-    auto_probe = bool(spec.get("profiles")) and str(spec.get("profile", "auto")) == "auto"
+    auto_probe = (person is None and bool(spec.get("profiles"))
+                  and str(spec.get("profile", "auto")) == "auto")
 
     probed: list[QueryVariant] | None = None
 
@@ -741,6 +761,7 @@ def run_task(
 
     per_domain: dict[str, int] = {}
     cap_per_domain = sanitizer.max_per_domain
+    person_items: list[tuple[Candidate, Judgment]] = []
     kept_urls: list[str] = []
     for score, c, mention in scored:
         if result.kept >= cap:
@@ -817,6 +838,9 @@ def run_task(
             result.docs_new += 1
         repo.upsert_mention(mention)
         kept_urls.append(doc.url_canon)
+        if person is not None:
+            # 用洗过、且可能被正文替换过的标题/摘要做归因 —— 证据行要能直接给人看
+            person_items.append((c, judge(doc.title, doc.summary, person)))
         per_domain[domain] = per_domain.get(domain, 0) + 1
         result.kept += 1
 
@@ -838,6 +862,21 @@ def run_task(
             repo.add_alert(task_id, None, "no_fingerprint",
                            f"{result.cluster_unfingerprinted} 条没有正文指纹"
                            f"（正文过短或未取到），未参与转载归并")
+
+    # --------------------------------------------------------- 人名模式归因
+    if person is not None:
+        cards = build_cards(person, person_items)
+        repo.replace_person_cards(task_id, cards)
+        result.person_cards = len(cards)
+        result.person_tiers = summarize(cards)
+        if not person.has_anchors:
+            # 没有锚点不等于没有结果，但等于"无法归因" —— 必须在报告里说清楚
+            repo.add_alert(task_id, None, "person_no_anchor",
+                           "人名模式未提供机构/方向锚点，全部结果只能归入"
+                           "「同名未归因」，不能当作候选人")
+        tiers_txt = "、".join(
+            f"{TIER_CN[t]} {n}" for t, n in result.person_tiers.items() if n) or "无"
+        say(f"  人 候选人 {len(cards)} 张：{tiers_txt}")
 
     # ------------------------------------------------------------ 收尾
     result.elapsed_ms = int((time.perf_counter() - t_start) * 1000)
@@ -866,6 +905,8 @@ def run_task(
         "cluster_groups": result.cluster_groups,
         "cluster_merged": result.cluster_merged,
         "cluster_unfingerprinted": result.cluster_unfingerprinted,
+        "person_cards": result.person_cards,
+        "person_tiers": result.person_tiers,
         "elapsed_ms": result.elapsed_ms,
     }
     repo.finish_task(task_id, result.status, result.truncated, stats_payload)
