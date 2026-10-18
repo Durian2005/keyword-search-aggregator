@@ -128,6 +128,60 @@ class TestRenderHtml(unittest.TestCase):
         self.assertIn("tag warn", out)
 
 
+class TestPersonSection(unittest.TestCase):
+    """人名模式：候选人区块。没有卡片时整块不能出现。"""
+
+    def _data(self, cards: list) -> dict:
+        d = _base_data()
+        d["person_cards"] = cards
+        return d
+
+    def _card(self, label: str, tier: str, docs: int = 2, **kw) -> dict:
+        base = {
+            "label": label, "tier": tier, "score": 7, "org_hits": 1, "weak_hits": 2,
+            "docs": docs, "negatives": [],
+            "evidence": [{"title": f"{label} 的页面", "url": "https://a.example.com/1",
+                          "matched": [label]}],
+        }
+        base.update(kw)
+        return base
+
+    def test_section_rendered_with_tiers(self) -> None:
+        out = render_html(self._data([
+            self._card("甲大学计算机学院", "confirmed"),
+            self._card("乙大学", "suspect"),
+        ]))
+        self.assertIn("候选人", out)
+        self.assertIn("确认", out)
+        self.assertIn("疑似", out)
+        self.assertIn("甲大学计算机学院", out)
+        self.assertIn("不同机构绝不合并", out)
+
+    def test_unmatched_folded_not_a_candidate(self) -> None:
+        out = render_html(self._data([
+            self._card("甲大学", "likely", docs=3),
+            self._card("未匹配机构", "unrelated", docs=9),
+        ]))
+        self.assertIn("未匹配机构", out)
+        self.assertIn("同名结果", out)
+        self.assertNotIn('<b>未匹配机构</b>', out)     # 折叠，不当候选人展示
+
+    def test_no_named_card_shows_explanation(self) -> None:
+        out = render_html(self._data([self._card("未匹配机构", "unrelated", docs=4)]))
+        self.assertIn("没有任何结果命中你给的机构锚点", out)
+
+    def test_section_absent_without_cards(self) -> None:
+        out = render_html(_base_data())
+        self.assertNotIn('id="people"', out)
+
+    def test_negatives_shown_as_doubt(self) -> None:
+        out = render_html(self._data([
+            self._card("甲大学", "likely", negatives=["演艺", "招聘"]),
+        ]))
+        self.assertIn("同名疑点", out)
+        self.assertIn("演艺", out)
+
+
 class TestSafeDirname(unittest.TestCase):
     def test_strips_illegal_chars(self) -> None:
         # / : * ? " < > | 共 8 个字符各替换成一个下划线

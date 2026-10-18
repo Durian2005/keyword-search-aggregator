@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from kwsearch import __version__
+from kwsearch.person import TIER_CN, UNMATCHED_LABEL
 from kwsearch.storage import Repository
 
 DOC_RENDER_LIMIT = 500
@@ -231,6 +232,23 @@ td.dim{color:var(--muted)}
 /* 标签绝对定位在柱子下方：放进 flex 流里会因为列宽只有几像素而撑变布局 */
 .days .d span{position:absolute;top:100%;left:50%;transform:translateX(-50%);
               margin-top:5px;font-size:9.5px;color:#9aa2ad;white-space:nowrap}
+
+/* ── 候选人（人名模式） ─────────────────────────────── */
+.pcard{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);
+       padding:14px 18px;margin-top:10px}
+.phead{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+.phead b{font-size:15px;letter-spacing:-.01em}
+.pmeta{margin-left:auto;font-size:12px;color:var(--muted);font-family:var(--mono)}
+.tier{font-size:11px;padding:2px 8px;border-radius:999px;background:var(--chip);
+      color:var(--ink-2);white-space:nowrap}
+.tier.ok{background:#e7f6ec;color:#17663a}
+.tier.warn{background:var(--warn-soft);color:#7c3d06}
+.pev{list-style:none;margin:10px 0 0;padding:0}
+.pev li{padding:7px 0;border-top:1px solid var(--line-2);font-size:13px;
+        display:flex;gap:10px;align-items:baseline}
+.pev li:first-child{border-top:none}
+.pev a{flex:1 1 auto;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--ink-2)}
+.pm{font-size:11.5px;color:var(--muted);white-space:nowrap}
 
 /* ── 文档列表 ───────────────────────────────────────── */
 .docs{padding:4px 0}
@@ -657,6 +675,66 @@ def _doc_card(
 </article>"""
 
 
+_TIER_CLASS = {"confirmed": "ok", "likely": "", "suspect": "warn", "unrelated": ""}
+
+
+def _evidence_rows(card: Mapping[str, Any]) -> str:
+    rows = []
+    for e in card.get("evidence") or []:
+        url = _safe_url(e.get("url"))
+        title = _esc(e.get("title") or "(无标题)")
+        title_html = (f'<a href="{url}" target="_blank" rel="noopener noreferrer">{title}</a>'
+                      if url else title)
+        matched = " · ".join(_esc(m) for m in (e.get("matched") or []))
+        rows.append(f'<li>{title_html}<span class="pm">{matched or "—"}</span></li>')
+    return "".join(rows)
+
+
+def _candidates(cards: Sequence[Mapping[str, Any]]) -> str:
+    """人名模式：候选人卡片。
+
+    只有命中机构的才当候选人展示；没有机构命中的折叠成"同名未归因"——
+    它们不是没价值，而是**无法归因**，混进候选人列表就等于瞎猜。
+    """
+    if not cards:
+        return ""
+    named = [c for c in cards if c.get("label") != UNMATCHED_LABEL]
+    others = [c for c in cards if c.get("label") == UNMATCHED_LABEL]
+
+    body: list[str] = []
+    if not named:
+        body.append(
+            '<div class="empty">没有任何结果命中你给的机构锚点。'
+            "这不等于“没有这个人”，只说明这一轮的结果里没有能归因的证据 —— "
+            "换更常用的机构全称、或补一个方向锚点再跑一次。</div>")
+    for c in named:
+        tier = str(c.get("tier") or "unrelated")
+        negs = "、".join(str(x) for x in (c.get("negatives") or []))
+        body.append(f"""<div class="pcard">
+  <div class="phead">
+    <span class="tier {_TIER_CLASS.get(tier, '')}">{_esc(TIER_CN.get(tier, tier))}</span>
+    <b>{_esc(c.get("label"))}</b>
+    {f'<span class="tier warn">同名疑点：{_esc(negs)}</span>' if negs else ''}
+    <span class="pmeta">{_num(c.get("docs"))} 条证据 · 锚点 {_num(c.get("org_hits"))}+{_num(c.get("weak_hits"))}</span>
+  </div>
+  <ul class="pev">{_evidence_rows(c)}</ul>
+</div>""")
+
+    for c in others:
+        body.append(
+            f'<details><summary>另有 {_num(c.get("docs"))} 条同名结果'
+            f"（标题与摘要里没有任何机构锚点，归入“未匹配机构”）</summary>"
+            f'<ul class="pev">{_evidence_rows(c)}</ul></details>')
+
+    return f"""
+<section class="sec" id="people">
+<h2>候选人<span class="sub">按命中的机构分组 · 不同机构绝不合并</span></h2>
+<p class="hint">“确认”= 机构与方向/身份互相印证；“很可能”= 只有机构对上；
+“疑似”= 只有方向对上。没有机构命中一律归入“未匹配机构”，不计入候选人。</p>
+{"".join(body)}
+</section>"""
+
+
 def _docs(
     items: Sequence[Mapping[str, Any]],
     totals: Mapping[str, Any],
@@ -795,6 +873,7 @@ def render_html(data: Mapping[str, Any]) -> str:
     docs = data.get("docs") or []
     alerts = data.get("alerts") or []
     clusters = data.get("clusters") or []
+    person_cards = data.get("person_cards") or []
 
     tstats = task.get("stats") or {}
     max_per_domain = int(tstats.get("max_per_domain") or 0)
@@ -816,6 +895,7 @@ def render_html(data: Mapping[str, Any]) -> str:
 {_queries(queries)}
 {_domains(domains, max_per_domain)}
 {_timeline(timeline)}
+{_candidates(person_cards)}
 {_docs(docs, totals, clusters)}
 {_alerts(alerts)}
 </div>
