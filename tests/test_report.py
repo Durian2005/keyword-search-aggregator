@@ -182,6 +182,37 @@ class TestPersonSection(unittest.TestCase):
         self.assertIn("演艺", out)
 
 
+class TestClusterFunnel(unittest.TestCase):
+    """归并对账那几行：数字要分得清"有救的"和"没救的"。
+
+    "无指纹未判 5 条"这种话等于没说 —— 用户既不知道该不该处理，
+    也不知道处理完有没有用。三种原因必须分开写。
+    """
+
+    def _data(self, **totals) -> dict:
+        data = _base_data()
+        data["totals"] = {**data["totals"], "docs": 3, "clusters": 1, "groups": 2,
+                          "merged": 0, "fingerprinted": 2, **totals}
+        return data
+
+    def test_pending_fingerprint_says_how_to_fix(self) -> None:
+        out = render_html(self._data(unfingerprinted=1, pending_fingerprint=1))
+        self.assertIn("待补算指纹", out)
+        self.assertIn("重跑该词自动补", out)
+
+    def test_short_and_no_body_are_separate(self) -> None:
+        out = render_html(self._data(unfingerprinted=2, short_body=1, no_body=1))
+        self.assertIn("正文过短", out)
+        self.assertIn("无正文", out)
+        self.assertNotIn("待补算指纹", out)
+
+    def test_nothing_comparable_does_not_claim_no_reprint(self) -> None:
+        """一条都没比过时，不能说"未发现同文转载"——那是在替没看过的文档背书。"""
+        out = render_html(self._data(unfingerprinted=3, no_body=3, fingerprinted=0))
+        self.assertIn("本轮没有可参与比对的正文", out)
+        self.assertNotIn("未发现同文转载", out)
+
+
 class TestSafeDirname(unittest.TestCase):
     def test_strips_illegal_chars(self) -> None:
         # / : * ? " < > | 共 8 个字符各替换成一个下划线

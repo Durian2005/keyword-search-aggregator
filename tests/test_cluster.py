@@ -149,7 +149,68 @@ class TestClusterDocs(unittest.TestCase):
         self.assertEqual(c.rep_url, "https://long.test/2")
         self.assertEqual(c.rep, c.members[0])
 
-    def test_no_transitive_chaining(self) -> None:
+    def test_rep_is_original_not_the_reprint_with_disclaimer(self) -> None:
+        """转载版挂着免责声明 → 原始长度更长，但内容一样多 → 代表必须是原文。
+
+        这是"代表取正文最长"这条老规则的漏洞：多出来的那 130 字是模板，
+        按字数选等于奖励转载。
+        """
+        body = len(normalize_text(ART))
+        items = [
+            ClusterInput(url_canon="https://origin.test/1", simhash=simhash64(ART),
+                         body_chars=body, body_core=body, published_at="2026-03-01"),
+            ClusterInput(url_canon="https://mirror.test/2",
+                         simhash=simhash64(ART + TEMPLATE),
+                         body_chars=body + 130, body_core=body,
+                         published_at="2026-03-05"),
+        ]
+        rep = cluster_docs(items)
+        self.assertEqual(len(rep.clusters), 1)
+        self.assertEqual(rep.clusters[0].rep_url, "https://origin.test/1")
+
+    def test_rep_without_core_falls_back_to_length(self) -> None:
+        """老数据没有 body_core（补列后为 NULL → 0）时退回原始长度，行为不变。"""
+        short = ART[:260]
+        items = [
+            ClusterInput(url_canon="https://short.test/1", simhash=simhash64(short),
+                         body_chars=len(normalize_text(short))),
+            ClusterInput(url_canon="https://long.test/2", simhash=simhash64(ART),
+                         body_chars=len(normalize_text(ART))),
+        ]
+        self.assertEqual(cluster_docs(items).clusters[0].rep_url, "https://long.test/2")
+
+    def test_rep_prefers_earlier_time_when_lengths_tie(self) -> None:
+        """内容量、原始长度都一样时，发布更早的当代表（转载一般晚于原文）。"""
+        n = len(normalize_text(ART))
+        sh = simhash64(ART)
+        items = [
+            ClusterInput(url_canon="https://late.test/1", simhash=sh,
+                         body_chars=n, body_core=n, published_at="2026-05-01"),
+            ClusterInput(url_canon="https://early.test/2", simhash=sh,
+                         body_chars=n, body_core=n, published_at="2026-03-01"),
+        ]
+        self.assertEqual(cluster_docs(items).clusters[0].rep_url,
+                         "https://early.test/2")
+
+    def test_untrusted_time_does_not_decide_rep(self) -> None:
+        """时间不可信（站点构建时间）时不许拿它比先后。
+
+        VitePress/Hugo 的页脚"最近更新"是全站同一个值，谁最近重建过谁就"更早"，
+        跟原文是谁毫无关系 —— 只能退回 URL 兜底。
+        """
+        n = len(normalize_text(ART))
+        sh = simhash64(ART)
+        items = [
+            ClusterInput(url_canon="https://a.test/1", simhash=sh,
+                         body_chars=n, body_core=n, published_at="2026-05-01"),
+            # 站点构建时间把它标成 3 月，但它不是原文
+            ClusterInput(url_canon="https://b.test/2", simhash=sh,
+                         body_chars=n, body_core=n, published_at="2026-03-01",
+                         time_trusted=False),
+        ]
+        self.assertEqual(cluster_docs(items).clusters[0].rep_url, "https://a.test/1")
+
+
         """A~B、B~C 不能推出 A~C。
 
         构造法：让 B 成为 A 与 C 的中点（各差 6 位），阈值 10 时 A 和 C 相距 12。
@@ -286,9 +347,9 @@ class TestClusterStorage(unittest.TestCase):
 
         repo = self.repo()
         repo.upsert_doc(Doc(url_canon="https://s.test/legacy", domain="s.test",
-                            title="t", summary="s", body_chars=900))
+                            title="t", summary="s", body_chars=900, body_core=900))
         repo.upsert_doc(Doc(url_canon="https://s.test/new", domain="s.test",
-                            title="t", summary="s", body_chars=900,
+                            title="t", summary="s", body_chars=900, body_core=900,
                             simhash=simhash64(ART)))
         urls = ["https://s.test/legacy", "https://s.test/new"]
         self.assertEqual(len(repo.bodies_done(urls)), 2)                       # 默认口径
@@ -301,10 +362,57 @@ class TestClusterStorage(unittest.TestCase):
 
         repo = self.repo()
         repo.upsert_doc(Doc(url_canon="https://s.test/short", domain="s.test",
-                            title="t", summary="s", body_chars=120))
+                            title="t", summary="s", body_chars=120, body_core=120))
         self.assertEqual(
             repo.bodies_done(["https://s.test/short"], need_simhash_above=200),
             {"https://s.test/short"})
+
+    def test_old_row_without_core_is_refetched(self) -> None:
+        """有指纹但没有 body_core 的行算"没做完"，重跑时补抓一次。
+
+        不补这一抓，代表永远按原始长度选 —— 带免责声明的转载版会继续冒充"原文"。
+        代价是每条老数据多抓一次，抓完 body_core 落库就不再重抓。
+        """
+        from kwsearch.models import Doc
+
+        repo = self.repo()
+        repo.upsert_doc(Doc(url_canon="https://s.test/old", domain="s.test",
+                            title="t", summary="s", body_chars=900,
+                            simhash=simhash64(ART)))
+        self.assertEqual(len(repo.bodies_done(["https://s.test/old"])), 1)
+        self.assertEqual(repo.bodies_done(["https://s.test/old"], need_simhash_above=200),
+                         set())
+
+    def test_core_persisted_and_read_back(self) -> None:
+        """body_core 要能被聚簇读到：它是代表排序的唯一依据。"""
+        from kwsearch.models import Doc
+
+        repo = self.repo()
+        repo.upsert_doc(Doc(url_canon="https://s.test/core", domain="s.test",
+                            title="t", summary="s", body_chars=1200, body_core=950))
+        row = repo.doc_fingerprints(["https://s.test/core"])[0]
+        self.assertEqual((row["body_chars"], row["body_core"]), (1200, 950))
+
+    def test_repository_migrates_old_db(self) -> None:
+        """老库（没有 body_core 列）用 connect 打开也必须能读。
+
+        report / db 子命令走的是 connect 而不是 init_db，只在那里补列的话，
+        老库上第一句 SELECT body_core 就会 "no such column"。
+        """
+        from kwsearch.storage import Repository, connect
+
+        self.conn.execute("ALTER TABLE doc DROP COLUMN body_core")
+        self.conn.commit()
+        cols = {r[1] for r in self.conn.execute("PRAGMA table_info(doc)")}
+        self.assertNotIn("body_core", cols)
+
+        conn = connect(str(self.dir / "c.db"))
+        try:
+            Repository(conn)                      # 构造即补列
+        finally:
+            conn.close()
+        cols = {r[1] for r in self.conn.execute("PRAGMA table_info(doc)")}
+        self.assertIn("body_core", cols)
 
 
 # --------------------------------------------------------------- pipeline 接线
@@ -328,7 +436,7 @@ THIRD = """红黑树的删除操作比插入复杂得多。删除一个节点后
 
 _PAGE = """<html><head><title>{title} - 站点</title></head><body>
 <div class="article">
-<p>{p1}</p><p>{p2}</p><p>{p3}</p>
+<p>{p1}</p><p>{p2}</p><p>{p3}</p>{tail}
 </div></body></html>"""
 
 
@@ -431,7 +539,7 @@ class TestPipelineWiring(unittest.TestCase):
     def tearDown(self) -> None:
         self.tmp.cleanup()
 
-    def run_pipe(self, enabled: str = "true"):  # noqa: ANN201
+    def run_pipe(self, enabled: str = "true", *, tail: str = ""):  # noqa: ANN201
         from kwsearch.config import load_config
         from kwsearch.pipeline import run_task
 
@@ -440,9 +548,11 @@ class TestPipelineWiring(unittest.TestCase):
         a1, a2, a3 = _paras(ART)
         o1, o2, o3 = _paras(THIRD)
         pages = {
-            "https://a.test/1": _PAGE.format(title="红黑树 原理详解", p1=a1, p2=a2, p3=a3),
-            "https://b.test/2": _PAGE.format(title="【转载】红黑树原理详解", p1=a1, p2=a2, p3=a3),
-            "https://c.test/3": _PAGE.format(title="红黑树与 AVL 树的区别", p1=o1, p2=o2, p3=o3),
+            "https://a.test/1": _PAGE.format(title="红黑树 原理详解", p1=a1, p2=a2, p3=a3, tail=""),
+            "https://b.test/2": _PAGE.format(title="【转载】红黑树原理详解", p1=a1, p2=a2,
+                                             p3=a3, tail=tail),
+            "https://c.test/3": _PAGE.format(title="红黑树与 AVL 树的区别", p1=o1, p2=o2,
+                                             p3=o3, tail=""),
         }
         return run_task(load_config(p), "红黑树", db_path=self.db,
                         progress=None, fetcher=_FakeFetcher(pages))
@@ -474,6 +584,20 @@ class TestPipelineWiring(unittest.TestCase):
         r2 = self.run_pipe()
         self.assertEqual((r2.cluster_groups, r2.cluster_merged), (2, 1))
         self.assertEqual(len(self.clusters()), 2)      # 没有重复写入
+
+    def test_reprint_with_disclaimer_does_not_become_rep(self) -> None:
+        """端到端：转载页挂了一段免责声明 → 正文比原文长，但代表仍是原文。
+
+        这是"代表取正文最长"的真 bug：多出来的那 100 多字是模板，
+        按字数选等于奖励转载，报告里的"原文链接"会指向二手站。
+        """
+        tail = ('<p>【免责声明】本文仅代表作者本人观点，与本网站无关。'
+                '本站对文中陈述、观点判断保持中立。如有侵权请联系我们删除。'
+                '扫描下方二维码关注公众号获取更多干货。</p>')
+        r = self.run_pipe(tail=tail)
+        self.assertEqual(r.kept, 3)
+        self.assertEqual(r.cluster_merged, 1)
+        self.assertEqual(self.clusters()[0], (2, "https://a.test/1"))
 
     def test_disabled_leaves_no_clusters(self) -> None:
         r = self.run_pipe("false")
@@ -536,6 +660,71 @@ class TestReportFolding(unittest.TestCase):
         totals = Repository(self.conn).stats(tid)["totals"]
         self.assertEqual((totals["docs"], totals["groups"], totals["merged"]), (3, 2, 1))
         self.assertEqual(totals["clusters"], 2)
+
+
+class TestUnjudgedBreakdown(unittest.TestCase):
+    """没参与归并的条目要分清"有救的"和"没救的"。
+
+    原来三种情形合称"无指纹未判"：用户既不知道要不要处理，也不知道处理完有没有用。
+    区分之后：待补算 = 重跑该词会自动补；正文过短 = 本来就不该参与，不是缺数据。
+    """
+
+    def setUp(self) -> None:
+        from kwsearch.storage import init_db
+
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db = str(Path(self.tmp.name) / "u.db")
+        self.conn = init_db(self.db)
+
+    def tearDown(self) -> None:
+        self.conn.close()
+        self.tmp.cleanup()
+
+    def _seed(self) -> str:
+        from kwsearch.models import Doc, Mention
+        from kwsearch.storage import Repository
+
+        repo = Repository(self.conn)
+        tid = repo.start_task("红黑树")
+        rows = [
+            # (url, body_chars, simhash)：四种状态各一条
+            ("https://a.test/ok", 800, simhash64(ART)),
+            ("https://b.test/pending", 800, None),
+            ("https://c.test/short", 120, None),
+            ("https://d.test/nobody", 0, None),
+        ]
+        for u, chars, h in rows:
+            repo.upsert_doc(Doc(url_canon=u, url_raw=u, domain=u.split("/")[2],
+                                title="红黑树", summary="摘要" * 20,
+                                body_chars=chars, simhash=h))
+            repo.upsert_mention(Mention(task_id=tid, url_canon=u, score=1.0))
+        # 只有"有指纹"的那条会进簇（单条成簇）。这样 unfingerprinted 正好等于
+        # 待补算 + 过短 + 无正文，账目能对上 —— 对不上就说明分档有漏。
+        rep = cluster_docs([ClusterInput(url_canon="https://a.test/ok",
+                                         simhash=simhash64(ART), body_chars=800)])
+        repo.replace_clusters(tid, rep.clusters)
+        repo.finish_task(tid, "ok", False, {})
+        return tid
+
+    def test_three_reasons_split(self) -> None:
+        from kwsearch.storage import Repository
+
+        totals = Repository(self.conn).stats(self._seed(), min_body_chars=200)["totals"]
+        self.assertEqual(totals["pending_fingerprint"], 1)   # 有正文没指纹 → 重跑能补
+        self.assertEqual(totals["short_body"], 1)            # 正文不够长 → 本来就不判
+        self.assertEqual(totals["no_body"], 1)               # 没抓到正文
+        self.assertEqual(totals["unfingerprinted"], 3)
+        self.assertEqual(
+            totals["pending_fingerprint"] + totals["short_body"] + totals["no_body"],
+            totals["unfingerprinted"])
+
+    def test_threshold_follows_config(self) -> None:
+        """阈值调大，原本"够长"的那条就归到"过短"里去。"""
+        from kwsearch.storage import Repository
+
+        tid = self._seed()
+        totals = Repository(self.conn).stats(tid, min_body_chars=1000)["totals"]
+        self.assertEqual((totals["pending_fingerprint"], totals["short_body"]), (0, 2))
 
 
 if __name__ == "__main__":

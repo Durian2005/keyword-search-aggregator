@@ -172,7 +172,9 @@ def cmd_run(
     print(_run_summary(result))
 
     if want_report and result.kept:
-        return _write_report(db_path, result.task_id, out_dir)
+        cc = dict(getattr(cfg, "cluster", None) or {})
+        return _write_report(db_path, result.task_id, out_dir,
+                             min_body_chars=int(cc.get("min_body_chars") or 200))
     return 0 if result.kept else 1
 
 
@@ -202,13 +204,14 @@ def _run_summary(result) -> str:  # noqa: ANN001
     return head + "\n\n" + _table(rows, ["通道", "类型", "请求", "解析", "去重", "状态", "停止原因"])
 
 
-def _write_report(db_path: str, task_id: str, out_dir: str) -> int:
+def _write_report(db_path: str, task_id: str, out_dir: str,
+                  *, min_body_chars: int = 200) -> int:
     from kwsearch.report import render
     from kwsearch.storage import connect
 
     conn = connect(db_path)
     try:
-        path = render(conn, task_id, out_dir)
+        path = render(conn, task_id, out_dir, min_body_chars=min_body_chars)
     except KeyError as e:
         print(f"✗ {e}", file=sys.stderr)
         return 2
@@ -245,7 +248,9 @@ def cmd_report(cfg: AppConfig, task_id: str | None, out_dir: str, db_path: str) 
             task_id = str(rows[0]["task_id"])
             print(f"未指定 task_id，按最近一次 {task_id} 生成。\n")
         try:
-            path = render(conn, task_id, out_dir)
+            cc = dict(getattr(cfg, "cluster", None) or {})
+            path = render(conn, task_id, out_dir,
+                          min_body_chars=int(cc.get("min_body_chars") or 200))
         except KeyError as e:
             print(f"✗ {e}", file=sys.stderr)
             return 2

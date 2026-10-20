@@ -188,6 +188,86 @@ def summary_start(paras: list[str]) -> int:
 
 
 # ---------------------------------------------------------------------------
+#  转载模板剥离
+# ---------------------------------------------------------------------------
+# 转载站往首尾加的那几段话：免责声明、来源署名、编辑署名、公众号引导。
+# 只在**首尾**、**够短**的段落上认 —— 正文中间提到"版权""删除"一律不算。
+#
+# 特征词刻意写窄：单独一个"删除"会命中"红黑树支持插入和删除"，
+# 单独一个"编辑"会命中"编辑器"。模板话术是用整句出现的，就按整句认。
+_BOILER_HINT_RE = re.compile(
+    r"免责声明|版权声明|版权所有|侵删|请联系(?:我们)?(?:删除|处理)"
+    r"|本文(?:仅代表|来源|转载|转自|系|由)|原文(?:链接|地址|出处)"
+    r"|责任编辑|责编[:：]|编辑[:：]|来源[:：]|作者[:：]"
+    r"|公众号|扫码|二维码|关注我们|长按识别"
+    r"|未经授权|如需转载|转载请注明|转载自|有删改|文中观点"
+)
+_BOILER_MAX_LINE = 200      # 段落超过这个长度就不判模板（那是正文）
+_BOILER_MAX_TAIL = 6        # 尾部最多剥 6 段
+_BOILER_MAX_HEAD = 3        # 头部最多剥 3 段
+_BOILER_MAX_CHARS = 800     # 首尾合计最多剥这么多字
+
+
+def _is_boiler(para: str) -> bool:
+    return len(para) <= _BOILER_MAX_LINE and bool(_BOILER_HINT_RE.search(para))
+
+
+def trim_boilerplate(text: str) -> str:
+    """剥掉首尾的转载模板段，返回剩下的正文。
+
+    为什么要在意这件事：转载稿几乎都会在末尾挂一段免责声明/引导语（100~300 字），
+    于是它的正文比原文**更长**。S5 的代表原先按正文长度选，结果转载版顶替原文
+    成了代表 —— 报告里那条"原文链接"其实指向某个二手站点。
+
+    三条自保规则：
+      - 只动首尾，且只动"短段 + 强特征词"；正文中段一律不碰。
+      - 总剥离量封顶（首 3 段、尾 6 段、合计 800 字）。
+      - 剥完只剩模板、或者什么都不剩，就认为判错了，原样返回 ——
+        宁可代表选错，也不能把一篇文章删成一句话。
+        ⚠️ 不按"剥掉超过一半就退回"来保护：短讯 + 长免责声明是真实存在的形态，
+           按比例保护会把那种转载版重新算得比原文更长，正好放跑要修的问题。
+    """
+    raw = text or ""
+    paras = raw.split("\n")
+    idx = [i for i, p in enumerate(paras) if p.strip()]
+    if len(idx) <= 1:
+        return raw
+
+    budget = _BOILER_MAX_CHARS
+    head = 0
+    while head < len(idx) - 1 and head < _BOILER_MAX_HEAD:
+        p = paras[idx[head]].strip()
+        if not _is_boiler(p) or len(p) > budget:
+            break
+        budget -= len(p)
+        head += 1
+
+    tail = 0
+    while tail < len(idx) - head - 1 and tail < _BOILER_MAX_TAIL:
+        p = paras[idx[len(idx) - 1 - tail]].strip()
+        if not _is_boiler(p) or len(p) > budget:
+            break
+        budget -= len(p)
+        tail += 1
+
+    if not head and not tail:
+        return raw
+    keep = paras[idx[head]:idx[len(idx) - 1 - tail] + 1]
+    if not keep or all(_is_boiler(p.strip()) for p in keep):
+        return raw
+    return "\n".join(keep)
+
+
+def core_chars(text: str) -> int:
+    """正文的"有效长度"（剥掉转载模板之后）。代表选取用它，而不是 body_chars。
+
+    ⚠️ 返回 0 只可能来自空文本；调用方拿到 0 必须退回 body_chars，
+       否则老数据（没有 body_core 的）会被当成"全文都是模板"。
+    """
+    return len(trim_boilerplate(text))
+
+
+# ---------------------------------------------------------------------------
 #  结构工具
 # ---------------------------------------------------------------------------
 def _index(root: Node) -> tuple[dict[int, Node], dict[int, Node]]:
@@ -494,7 +574,9 @@ __all__ = [
     "Article",
     "best_container",
     "collect_text",
+    "core_chars",
     "extract_article",
     "extract_title",
     "score_containers",
+    "trim_boilerplate",
 ]

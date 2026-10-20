@@ -21,7 +21,12 @@ from __future__ import annotations
 
 from urllib.parse import urlsplit
 
-from kwsearch.extract.body import Article, extract_article, extract_title
+from kwsearch.extract.body import (
+    Article,
+    core_chars,
+    extract_article,
+    extract_title,
+)
 from kwsearch.extract.dates import DateResult, normalize_date, pick_date
 from kwsearch.fetch.page import (  # noqa: F401 —— 再导出，保持调用方名字稳定
     ChallengeVerdict,
@@ -93,6 +98,9 @@ def extract_doc(
         channel=channel,
         content_type=content_type,
         body_chars=art.chars if art.confidence != "low" else 0,
+        # 有效长度：剥掉首尾的转载模板段。转载稿的免责声明会让 body_chars 变大，
+        # 而 S5 的代表按长度选 —— 不区分"模板"和"正文"，二手站就会当上代表。
+        body_core=core_chars(art.text) if art.confidence != "low" else 0,
         extra={
             "container": art.container,
             "paragraphs": art.paragraphs,

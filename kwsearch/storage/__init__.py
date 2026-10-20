@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from kwsearch.aggregate import from_signed64, host_of, to_signed64
+from kwsearch.aggregate.cluster import DEFAULT_MIN_BODY
 from kwsearch.models import Candidate, Doc, Mention, utcnow_iso
 
 logger = logging.getLogger(__name__)
@@ -33,6 +34,9 @@ _ADDITIVE_COLUMNS: dict[str, dict[str, str]] = {
     "query": {"query_text": "TEXT", "new_count": "INTEGER NOT NULL DEFAULT 0"},
     # S5 之前建的库没有这两列。cluster_member 由 CREATE TABLE IF NOT EXISTS 自动补。
     "cluster": {"max_hamming": "INTEGER", "method": "TEXT"},
+    # body_core 是"剥掉转载模板后的正文长度"。老库补列后为 NULL，
+    # 聚类时退回 body_chars（代表照旧能选，只是享受不到"不选二手站"这条改进）。
+    "doc": {"body_core": "INTEGER"},
 }
 
 
@@ -76,6 +80,11 @@ class Repository:
     __slots__ = ("conn",)
 
     def __init__(self, conn: sqlite3.Connection) -> None:
+        # 顺手补列，而不是只在 init_db() 里补：`report` / `db` 这些子命令走的是
+        # connect()，但它们同样会读到新列（比如 doc_fingerprints 的 body_core）。
+        # 少补一次的表现是 "no such column"，而老库恰恰是最常见的情形。
+        # _ensure_columns 是幂等的，表不存在时直接跳过。
+        _ensure_columns(conn)
         self.conn = conn
 
     # ------------------------------------------------------------------ task
@@ -178,14 +187,18 @@ class Repository:
         if old is None:
             self.conn.execute(
                 "INSERT INTO doc(url_canon, url_raw, domain, title, summary, published_at,"
-                " time_source, channel, http_status, content_type, body_chars, simhash,"
-                " cluster_id, body_ref, first_seen, last_seen, extra_json)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                " time_source, channel, http_status, content_type, body_chars, body_core,"
+                " simhash, cluster_id, body_ref, first_seen, last_seen, extra_json)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     url_canon, doc.url_raw or url_canon,
                     doc.domain or host_of(doc.url_raw or url_canon),
                     doc.title, doc.summary, doc.published_at, doc.time_source,
                     doc.channel, doc.http_status, doc.content_type, doc.body_chars,
+                    # body_core 恒 > 0（只要抽出了正文）：它是 trim 之后的长度，
+                    # 而 trim 剥掉一半以上就退回原文。所以这里不会写出 0，
+                    # bodies_done 的 "body_core IS NOT NULL" 也就不会造成反复重抓。
+                    doc.body_core or None,
                     sim, doc.cluster_id, doc.body_ref,
                     doc.fetched_at, now,
                     json.dumps(doc.extra, ensure_ascii=False) if doc.extra else None,
@@ -212,10 +225,12 @@ class Repository:
         self.conn.execute(
             "UPDATE doc SET last_seen=?, title=?, summary=?, published_at=?, time_source=?,"
             " http_status=COALESCE(http_status, ?), content_type=COALESCE(content_type, ?),"
-            " body_chars=MAX(body_chars, ?), simhash=COALESCE(simhash, ?)"
+            " body_chars=MAX(body_chars, ?), body_core=MAX(COALESCE(body_core, 0), ?),"
+            " simhash=COALESCE(simhash, ?)"
             " WHERE url_canon=?",
             (now, title, summary, published_at, time_source,
-             doc.http_status, doc.content_type, doc.body_chars, sim, url_canon),
+             doc.http_status, doc.content_type, doc.body_chars,
+             doc.body_core or 0, sim, url_canon),
         )
         return False
 
@@ -240,7 +255,11 @@ class Repository:
         sql = (f"SELECT url_canon FROM doc WHERE body_chars > 0 AND url_canon IN ({marks})")
         params: list[Any] = list(keys)
         if need_simhash_above > 0:
-            sql += " AND (simhash IS NOT NULL OR body_chars < ?)"
+            # 两个"没做完"：正文够长却没有指纹（S5 之前抓的），
+            # 以及有指纹但没有 body_core（代表选取改进之前抓的）。
+            # 后者的代价同样是一次重抓，抓完就固化 —— 不补，代表永远按原始长度选，
+            # 转载版挂着免责声明就继续冒充"原文"。
+            sql += " AND (simhash IS NOT NULL OR body_chars < ?) AND body_core IS NOT NULL"
             params.append(need_simhash_above)
         return {str(r[0]) for r in self.conn.execute(sql, params)}
 
@@ -265,7 +284,8 @@ class Repository:
             chunk = keys[i:i + 500]
             marks = ",".join("?" * len(chunk))
             for r in self.conn.execute(
-                "SELECT url_canon, simhash, body_chars, title, domain, published_at"
+                "SELECT url_canon, simhash, body_chars, body_core, time_source,"
+                " title, domain, published_at"
                 f" FROM doc WHERE url_canon IN ({marks})", chunk,
             ):
                 row = dict(r)
@@ -424,11 +444,18 @@ class Repository:
 
     # ------------------------------------------------------------------ stats
 
-    def stats(self, task_id: str, *, doc_limit: int = 500) -> dict[str, Any]:
+    def stats(
+        self, task_id: str, *, doc_limit: int = 500,
+        min_body_chars: int = DEFAULT_MIN_BODY,
+    ) -> dict[str, Any]:
         """报告层的唯一数据入口。一次查全，不让报告层自己拼 SQL。
 
         doc_limit 是渲染上限，不是数据上限 —— 排名 500 以后的文档对报告没有信息量，
         但库里一条不少（`--json` 或直接查库都能拿到）。
+
+        min_body_chars 只用来把"没参与归并"的条目分清楚：
+        正文过短的属于"本来就不该参与"，缺指纹的属于"重跑能补上"。
+        两者原来合称"无指纹未判"，用户既不知道要不要处理，也不知道处理了有没有用。
         """
         task = self.conn.execute(
             "SELECT * FROM task WHERE task_id=?", (task_id,)).fetchone()
@@ -541,6 +568,22 @@ class Repository:
         unfingerprinted = max(0, doc_count - fingerprinted)
         groups = len(clusters) + unfingerprinted
 
+        # 把"没参与归并"的三种情形分开：无正文 / 有正文但太短 / 有正文缺指纹。
+        # 只有第三种是"重跑能修好"的，另外两种要么没抓到、要么本来就没区分度。
+        no_body = short_body = pending = 0
+        for r in self.conn.execute(
+            "SELECT d.body_chars, d.simhash FROM mention m"
+            " JOIN doc d ON d.url_canon = m.url_canon WHERE m.task_id=?", (task_id,),
+        ):
+            chars = int(r["body_chars"] or 0)
+            if chars <= 0:
+                no_body += 1
+            elif r["simhash"] is None:
+                if chars < min_body_chars:
+                    short_body += 1
+                else:
+                    pending += 1
+
         return {
             "task": t,
             "totals": {
@@ -558,6 +601,9 @@ class Repository:
                 "merged": doc_count - groups,
                 "fingerprinted": fingerprinted,
                 "unfingerprinted": unfingerprinted,
+                "no_body": no_body,
+                "short_body": short_body,
+                "pending_fingerprint": pending,
             },
             "channels": channels,
             "docs": docs,

@@ -419,12 +419,28 @@ def _overview(totals: Mapping[str, Any], task: Mapping[str, Any]) -> str:
         if totals.get("merged"):
             cluster_bits.append(f'合并转载 <b>{_num(totals.get("merged"))}</b> 条')
         if totals.get("unfingerprinted"):
-            # 有没参与判断的条目时不能断言"没有转载"，只能说"能比的都不同" ——
-            # 那 5 条短正文里可能就藏着转载，报告不能替它们背书。
-            cluster_bits.append(
-                f'无指纹未判 <b>{_num(totals.get("unfingerprinted"))}</b> 条')
+            # 没参与比对的条目必须分清楚，因为它们"该怎么办"完全不同：
+            #   待补算指纹 → 重跑同一个关键词会自动补（有救）
+            #   正文过短   → 本来就没有区分度，永远不参与（没救，也不是缺数据）
+            #   无正文     → 抓取失败或 robots 拒绝
+            # 原来这三种合称"无指纹未判"，用户既不知道该不该处理，也不知道处理了有没有用。
+            parts = []
+            if totals.get("pending_fingerprint"):
+                parts.append(f'待补算指纹 <b>{_num(totals.get("pending_fingerprint"))}</b>'
+                             f'（重跑该词自动补）')
+            if totals.get("short_body"):
+                parts.append(f'正文过短 <b>{_num(totals.get("short_body"))}</b>')
+            if totals.get("no_body"):
+                parts.append(f'无正文 <b>{_num(totals.get("no_body"))}</b>')
+            detail = " / ".join(parts) if parts else f'<b>{_num(totals.get("unfingerprinted"))}</b>'
+            cluster_bits.append(f'未参与比对 {detail} 条')
         if not totals.get("merged"):
-            cluster_bits.append('可比对的条目里未发现同文转载')
+            if totals.get("fingerprinted"):
+                # 只有"真的比过"才敢说这句。一条都没比的时候说"未发现转载"，
+                # 等于替一批根本没看过的文档背书。
+                cluster_bits.append('可比对的条目里未发现同文转载')
+            else:
+                cluster_bits.append('本轮没有可参与比对的正文')
     cluster_line = '<span class="arrow">·</span>'.join(
         f'<span class="step">{b}</span>' for b in cluster_bits
     )
@@ -906,14 +922,18 @@ def render_html(data: Mapping[str, Any]) -> str:
 
 
 def render(conn, task_id: str, out_dir: str | Path = "report",  # noqa: ANN001
-           *, write_json: bool = True) -> str:
+           *, write_json: bool = True, min_body_chars: int = 200) -> str:
     """把一个任务渲染成 report/<关键词>/index.html，返回绝对路径。
 
     同一个关键词跑多次会覆盖 index.html —— 这是有意的：报告目录要能双击就开，
     而不是让人在时间戳文件名里挑。历史数据在 SQLite 里，没有丢。
+
+    `min_body_chars` 只影响"未参与归并"那几行文案的分档（正文过短 / 待补算指纹），
+    默认值与 channels.yaml 里 cluster.min_body_chars 保持一致。
     """
     repo = Repository(conn)
-    data = repo.stats(task_id, doc_limit=DOC_RENDER_LIMIT)
+    data = repo.stats(task_id, doc_limit=DOC_RENDER_LIMIT,
+                      min_body_chars=min_body_chars)
 
     folder = Path(out_dir) / safe_dirname(str(data["task"].get("keyword") or ""))
     folder.mkdir(parents=True, exist_ok=True)

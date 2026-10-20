@@ -76,6 +76,10 @@ CREATE TABLE IF NOT EXISTS doc (
     http_status  INTEGER,
     content_type TEXT,
     body_chars   INTEGER,                      -- 正文长度，用于识别"空壳页/JS 站"
+    body_core    INTEGER,                      -- 剥掉首尾转载模板后的正文长度（NULL=老数据未算）
+                                               -- ⚠️ S5 的代表按它排，不按 body_chars：
+                                               --    转载版挂一段免责声明就比原文长，
+                                               --    按原始长度选会把二手站选成"原文"
     simhash      INTEGER,                      -- 64bit 正文指纹，**按补码存成有符号**（SQLite 只有 int64）
                                                -- 读写都要过 aggregate.cluster.to_signed64 / from_signed64
     cluster_id   INTEGER,                      -- ⚠️ 未使用：簇是任务维度的，权威映射见 cluster_member

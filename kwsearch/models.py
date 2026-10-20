@@ -59,6 +59,9 @@ class Doc:
     http_status: int | None = None
     content_type: str = ""
     body_chars: int = 0             # 正文长度：0 = 还没抓正文（S4），或空壳页/JS 站
+    body_core: int = 0              # 剥掉首尾转载模板后的正文长度；0 = 未知（老数据）
+                                    # ⚠️ 代表选取按它排，不按 body_chars：转载版挂一段
+                                    #    免责声明就比原文长，按原始长度选会把二手站选成代表
     simhash: int | None = None      # 64bit，聚合层算
     cluster_id: int | None = None
     body_ref: str | None = None     # 全文落盘相对路径，None = 未存

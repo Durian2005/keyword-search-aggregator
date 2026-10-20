@@ -35,6 +35,7 @@ from kwsearch.aggregate import host_of, relate
 from kwsearch.aggregate.cluster import (
     DEFAULT_HAMMING,
     DEFAULT_MIN_BODY,
+    UNTRUSTED_TIME_SOURCES,
     ClusterInput,
     cluster_docs,
 )
@@ -150,7 +151,12 @@ class RunResult:
     # S5 转载归并
     cluster_groups: int = 0        # 独立内容组数（= 簇数 + 没有指纹的那些）
     cluster_merged: int = 0        # 被并掉的条数
-    cluster_unfingerprinted: int = 0   # 没有指纹：正文过短 / 低置信 / 老数据没算
+    # 没参与归并的两种情形必须分开记 —— 它们的"该怎么办"完全不同：
+    #   pending：正文够长但缺指纹（老数据 / 本轮没轮到抓），重跑会自动补算
+    #   short  ：正文短于 min_body_chars，本来就没有区分度，永远不参与
+    # 混成一个"未判"数字，用户既不知道要不要处理，也不知道处理了有没有用。
+    cluster_pending: int = 0
+    cluster_short: int = 0
     # 人名模式（见 person.py）：卡片数与各档分布
     person_cards: int = 0
     person_tiers: dict[str, int] = field(default_factory=dict)
@@ -457,7 +463,7 @@ def _cluster_stage(
     urls: list[str],
     *,
     say: Progress,
-) -> tuple[int, int, int] | None:
+) -> tuple[int, int, int, int] | None:
     """S5：把本任务入库的文档按正文指纹归并成"独立内容组"。
 
     为什么放在入库**之后**：簇要引用 doc.url_canon，而重跑时大部分条目早就
@@ -467,20 +473,23 @@ def _cluster_stage(
     为什么不在入库前用已有的 Enriched：那条路径只能覆盖"这次抓到的"，
     重跑（全部跳过正文抓取）时会一条都聚不上，行为随运行次数变化。
 
-    返回 (组数, 并入条数, 无指纹条数)；未启用时返回 None。
+    返回 (组数, 并入条数, 待补算指纹条数, 正文过短条数)；未启用时返回 None。
+    后两个数分开返回：一个有救（重跑补算），一个没救（正文本来就不够长）。
     """
     cc = dict(getattr(cfg, "cluster", None) or {})
     if not cc.get("enabled", True):
         say("  🧩 转载归并：已关闭（cluster.enabled=false）")
         return None
     if not urls:
-        return 0, 0, 0
+        return 0, 0, 0, 0
 
     rows = repo.doc_fingerprints(urls)
     items = [
         ClusterInput(
             url_canon=str(r["url_canon"]), simhash=r["simhash"],
             body_chars=int(r["body_chars"] or 0),
+            body_core=int(r["body_core"] or 0),
+            time_trusted=str(r["time_source"] or "") not in UNTRUSTED_TIME_SOURCES,
             title=str(r["title"] or ""), domain=str(r["domain"] or ""),
             published_at=r["published_at"],
         )
@@ -496,7 +505,7 @@ def _cluster_stage(
     biggest = max((c.member_count for c in rep.clusters), default=0)
     extra = f" · 最大簇 {biggest} 篇" if biggest > 1 else ""
     say(f"  🧩 转载归并：{rep.summary_line()}{extra}")
-    return rep.groups, rep.merged, rep.no_simhash + rep.too_short
+    return rep.groups, rep.merged, rep.no_simhash, rep.too_short
 
 
 def run_task(
@@ -813,6 +822,9 @@ def run_task(
                 # 正文摘要是文章自己的开头，比搜索引擎替我们写的那句话更接近原文
                 doc.summary = page_doc.summary
             doc.body_chars = page_doc.body_chars
+            # 有效正文长度也要一起搬：它是 S5 选代表的依据（剥掉转载模板的长度）。
+            # 漏掉这一行，代表会退回按原始长度选，转载版挂着免责声明就继续冒充原文。
+            doc.body_core = page_doc.body_core
             doc.content_type = page_doc.content_type or doc.content_type
             doc.http_status = page_doc.http_status
             # 指纹只能在这里传过去：它是在抓正文时用完整正文算的，
@@ -857,11 +869,20 @@ def run_task(
     # ------------------------------------------------------- S5 转载归并
     clustered = _cluster_stage(cfg, repo, task_id, kept_urls, say=say)
     if clustered is not None:
-        result.cluster_groups, result.cluster_merged, result.cluster_unfingerprinted = clustered
-        if result.cluster_unfingerprinted:
+        (result.cluster_groups, result.cluster_merged,
+         result.cluster_pending, result.cluster_short) = clustered
+        if result.cluster_pending:
+            # 这一条是"有救的"：正文够长、只是缺指纹，换个次数重跑就会补上。
+            # 告警里必须说清这一点，否则用户看到"未判"只会以为功能坏了。
             repo.add_alert(task_id, None, "no_fingerprint",
-                           f"{result.cluster_unfingerprinted} 条没有正文指纹"
-                           f"（正文过短或未取到），未参与转载归并")
+                           f"{result.cluster_pending} 条正文够长但没有指纹"
+                           f"（老数据或本轮未轮到抓正文），未参与转载归并；"
+                           f"重跑同一个关键词会自动补算")
+        if result.cluster_short:
+            # 这一条是"没救的"：正文短于阈值，指纹没有区分度，本来就不该参与。
+            repo.add_alert(task_id, None, "body_too_short",
+                           f"{result.cluster_short} 条正文短于阈值，"
+                           f"指纹没有区分度，未参与转载归并（不是缺数据）")
 
     # --------------------------------------------------------- 人名模式归因
     if person is not None:
@@ -904,7 +925,8 @@ def run_task(
         "bodies_elapsed_ms": result.bodies_elapsed_ms,
         "cluster_groups": result.cluster_groups,
         "cluster_merged": result.cluster_merged,
-        "cluster_unfingerprinted": result.cluster_unfingerprinted,
+        "cluster_pending": result.cluster_pending,
+        "cluster_short": result.cluster_short,
         "person_cards": result.person_cards,
         "person_tiers": result.person_tiers,
         "elapsed_ms": result.elapsed_ms,

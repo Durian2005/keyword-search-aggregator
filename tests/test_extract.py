@@ -14,9 +14,11 @@ from kwsearch.extract.body import (
     Article,
     best_container,
     collect_text,
+    core_chars,
     extract_article,
     extract_title,
     summary_start,
+    trim_boilerplate,
 )
 from kwsearch.extract.dates import (
     DateResult,
@@ -371,6 +373,48 @@ class TestUpdatedVsPublished(unittest.TestCase):
 # ---------------------------------------------------------------------------
 #  Doc 组装
 # ---------------------------------------------------------------------------
+class TestBoilerplate(unittest.TestCase):
+    """转载模板剥离：只认首尾、只认短段、剥过头就退回原文。
+
+    这一层错了的表现是"代表选错"（报告里的原文链接指向二手站），
+    或者更糟 —— 把正文当模板删掉，文章变成一句话。
+    """
+
+    BODY = "\n".join(["红黑树是一种自平衡的二叉查找树，插入和删除都要靠旋转维持平衡。"] * 8)
+    TAIL = ("【免责声明】本文仅代表作者本人观点，与本网站无关。本站对文中陈述、观点判断"
+            "保持中立。如有侵权请联系我们删除。扫描下方二维码关注公众号获取更多干货。")
+
+    def test_tail_disclaimer_trimmed(self) -> None:
+        text = self.BODY + "\n" + self.TAIL
+        self.assertEqual(core_chars(text), len(self.BODY))
+        self.assertLess(len(trim_boilerplate(text)), len(text))
+
+    def test_head_lead_trimmed(self) -> None:
+        text = "本文转自某某博客，有删改。\n" + self.BODY
+        self.assertEqual(core_chars(text), len(self.BODY))
+
+    def test_middle_mention_kept(self) -> None:
+        """正文中间提到"仅代表作者观点"是内容，不是模板 —— 只动首尾。"""
+        text = self.BODY + "\n本文仅代表作者观点，与本刊无关。\n" + self.BODY
+        self.assertEqual(trim_boilerplate(text), text)
+
+    def test_body_word_删除_not_treated_as_template(self) -> None:
+        """单个"删除"会命中"支持插入和删除"，不能当模板线索。"""
+        text = self.BODY + "\n红黑树的删除比插入更复杂，需要自底向上修复。"
+        self.assertEqual(core_chars(text), len(text))
+
+    def test_over_trim_falls_back(self) -> None:
+        """剥掉一半以上 → 判错了，原样返回（宁可代表选错，不能把文章删没）。"""
+        short = "本文转载自某处。\n免责声明：如有侵权请联系我们删除。"
+        self.assertEqual(trim_boilerplate(short), short)
+
+    def test_plain_article_untouched(self) -> None:
+        self.assertEqual(core_chars(self.BODY), len(self.BODY))
+
+    def test_empty_text(self) -> None:
+        self.assertEqual(core_chars(""), 0)
+
+
 class TestExtractDoc(unittest.TestCase):
     def test_basic(self) -> None:
         doc = extract_doc(

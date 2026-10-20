@@ -23,10 +23,17 @@
    转载稿的"共同模板"（站点页头、版权声明、公众号引导语）最容易造出这种链。
    贪心法逐个与**代表**比，天然保证"簇与簇的代表之间互不相似"这条不变量。
 
-4. **代表取正文最长的那个**。
-   正文越长指纹越稳；拿短的当代表，比对的基准就是抖的。
-   同长度时取发布更早的（转载一般晚于原文），最后用 URL 兜底 ——
+4. **代表按"有效正文"选，不按原始长度选**。
+   正文越长指纹越稳，这条仍然成立 —— 但"长"必须量的是**内容**，不是字数。
+   转载稿几乎都会在末尾挂一段免责声明/公众号引导（100~300 字），
+   于是它的 body_chars 比原文更大。按原始长度选，代表就会是二手站点，
+   报告里那条"原文链接"其实指向一个转载页。
+   所以排序用的是 `body_core`（剥掉首尾模板后的长度）。长度相同表示
+   "内容一样多、只是有人多带了模板"，此时取原始长度**更短**的那个；
+   再相同就看发布更早的（转载一般晚于原文），最后用 URL 兜底 ——
    保证同一批输入每次跑出来的分组完全一致。
+   ⚠️ 老数据没有 `body_core`（补列后为 NULL），退回 `body_chars` 参与排序：
+      代表仍然能选出来，只是享受不到这条改进。
 """
 from __future__ import annotations
 
@@ -36,6 +43,13 @@ import re
 import unicodedata
 from dataclasses import dataclass, field
 from typing import Iterable, Sequence
+
+# 这些 time_source 的 published_at 不参与"谁更早"的排序：
+#   regex_updated  站点构建时间（VitePress/Hugo 页脚"最近更新"，全站同一个值）
+#   serp_relative  "5 天之前"回推，精度只到天
+#   fallback       根本没有
+# 拿它们比先后，等于让"站点最近重建过"决定谁是原文。
+UNTRUSTED_TIME_SOURCES = frozenset({"regex_updated", "serp_relative", "fallback", ""})
 
 # 汉明距离阈值。**10 不是拍脑袋，也不是照抄"业界常用 3"。**
 #
@@ -172,9 +186,16 @@ class ClusterInput:
     url_canon: str
     simhash: int | None = None
     body_chars: int = 0
+    body_core: int = 0          # 剥掉转载模板后的正文长度；0/None = 老数据未算，退回 body_chars
+    time_trusted: bool = True   # published_at 是否可用于比较先后（见 UNTRUSTED_TIME_SOURCES）
     title: str = ""
     domain: str = ""
     published_at: str | None = None
+
+    @property
+    def effective_chars(self) -> int:
+        """用于代表排序的"内容长度"：有有效长度就用它。"""
+        return self.body_core if self.body_core and self.body_core > 0 else self.body_chars
 
 
 @dataclass(slots=True)
@@ -240,9 +261,10 @@ class ClusterReport:
     def summary_line(self) -> str:
         bits = [f"{self.groups} 组独立内容", f"并入 {self.merged} 条"]
         if self.no_simhash:
-            bits.append(f"无指纹 {self.no_simhash}")
+            # "待补算"而不是"无指纹"：这批是有正文、只差指纹的，重跑一次就能补上。
+            bits.append(f"待补算指纹 {self.no_simhash}")
         if self.too_short:
-            bits.append(f"正文过短未判 {self.too_short}")
+            bits.append(f"正文过短 {self.too_short}")
         return " · ".join(bits)
 
 
@@ -250,12 +272,17 @@ class ClusterReport:
 
 
 def _order_key(item: ClusterInput) -> tuple:
-    """代表优先序：正文最长 → 发布最早 → URL 字典序。
+    """代表优先序：内容长度 → 原始长度（短的更像原文）→ 发布时间 → URL。
+
+    第二位的 `+body_chars` 是**升序**，也就是同等内容量时选更短的那个：
+    多出来的那几百字如果是模板，我们已经在 body_core 里扣掉了，扣完还更长的
+    才是真的多内容；扣完一样长、原始却更长，那多出来的就是没认出来的模板。
 
     URL 只用来兜底，保证"同一批输入结果完全一致"（否则两份同样长的稿子
     谁当代表取决于输入顺序，报告会随抓取顺序抖动）。
     """
-    return (-item.body_chars, item.published_at or "9999-99-99", item.url_canon)
+    when = item.published_at if item.time_trusted else None
+    return (-item.effective_chars, item.body_chars, when or "9999-99-99", item.url_canon)
 
 
 def cluster_docs(
@@ -326,6 +353,7 @@ __all__ = [
     "ClusterReport",
     "DEFAULT_HAMMING",
     "DEFAULT_MIN_BODY",
+    "UNTRUSTED_TIME_SOURCES",
     "cluster_docs",
     "from_signed64",
     "hamming64",
