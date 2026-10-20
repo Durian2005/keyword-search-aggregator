@@ -249,6 +249,7 @@ td.dim{color:var(--muted)}
 .pev li:first-child{border-top:none}
 .pev a{flex:1 1 auto;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--ink-2)}
 .pm{font-size:11.5px;color:var(--muted);white-space:nowrap}
+.palso{margin-top:9px;font-size:12px;color:var(--muted)}
 
 /* ── 文档列表 ───────────────────────────────────────── */
 .docs{padding:4px 0}
@@ -702,7 +703,10 @@ def _evidence_rows(card: Mapping[str, Any]) -> str:
         title_html = (f'<a href="{url}" target="_blank" rel="noopener noreferrer">{title}</a>'
                       if url else title)
         matched = " · ".join(_esc(m) for m in (e.get("matched") or []))
-        rows.append(f'<li>{title_html}<span class="pm">{matched or "—"}</span></li>')
+        when = _esc(str(e.get("when") or ""))
+        # 日期放最前面：一组证据按时间倒序排，扫一眼就能看出"先在哪、后来去了哪"
+        meta = f"{when} · {matched or '—'}" if when else (matched or "—")
+        rows.append(f'<li>{title_html}<span class="pm">{meta}</span></li>')
     return "".join(rows)
 
 
@@ -726,13 +730,21 @@ def _candidates(cards: Sequence[Mapping[str, Any]]) -> str:
     for c in named:
         tier = str(c.get("tier") or "unrelated")
         negs = "、".join(str(x) for x in (c.get("negatives") or []))
+        also = "、".join(_esc(str(x)) for x in (c.get("also_orgs") or []))
+        first, last = c.get("first_when"), c.get("last_when")
+        # 活跃区间：证据时间的首尾。只到天，够用来把"2021 年在甲校、2025 年在乙公司"分开。
+        span = ""
+        if first and last:
+            span = f"活跃 {_esc(str(first))}" + (
+                f" ~ {_esc(str(last))}" if last != first else "")
         body.append(f"""<div class="pcard">
   <div class="phead">
     <span class="tier {_TIER_CLASS.get(tier, '')}">{_esc(TIER_CN.get(tier, tier))}</span>
     <b>{_esc(c.get("label"))}</b>
     {f'<span class="tier warn">同名疑点：{_esc(negs)}</span>' if negs else ''}
-    <span class="pmeta">{_num(c.get("docs"))} 条证据 · 锚点 {_num(c.get("org_hits"))}+{_num(c.get("weak_hits"))}</span>
+    <span class="pmeta">{_num(c.get("docs"))} 条证据 · 锚点 {_num(c.get("org_hits"))}+{_num(c.get("weak_hits"))}{(' · ' + span) if span else ''}</span>
   </div>
+  {f'<div class="palso">同一批证据里还提到：{also}（未合并，可能只是合作/兼职/同名）</div>' if also else ''}
   <ul class="pev">{_evidence_rows(c)}</ul>
 </div>""")
 

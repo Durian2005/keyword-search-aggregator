@@ -114,8 +114,13 @@ def cmd_run(
     person: PersonQuery | None = None,
 ) -> int:
     from kwsearch.discover import registered_names
+    from kwsearch.person import anchor_warnings
     from kwsearch.query import expand_queries
     have = set(registered_names())
+    if person is not None:
+        # 锚点质量提示放最前面：跑完 50 秒才发现"机构名太泛"是最冤的一种浪费
+        for w in anchor_warnings(person):
+            print(f"  ! {w}")
     variants = expand_queries(keyword, cfg.expand)
     plan: list[list[str]] = []
     for c in cfg.enabled_channels():
@@ -197,10 +202,14 @@ def _run_summary(result) -> str:  # noqa: ANN001
           f" · 配额丢 {result.dropped_cap} · 脱敏 {result.pii_masked}"
           f" · 告警 {result.alerts} · {result.elapsed_ms} ms"
     )
-    if result.person_cards:
+    if result.person_cards or result.person_name_missing:
         from kwsearch.person import TIER_CN
         tiers = "、".join(f"{TIER_CN[t]} {n}" for t, n in result.person_tiers.items() if n)
         head += f"\n候选人 {result.person_cards} 张：{tiers}"
+        if result.person_name_missing:
+            # 这句很重要：没有它，"结果很少"会被误读成"这个人没上网"
+            head += (f"（另有 {result.person_name_missing} 条结果里没出现该姓名，"
+                     f"多为机构页面，未参与归因）")
     return head + "\n\n" + _table(rows, ["通道", "类型", "请求", "解析", "去重", "状态", "停止原因"])
 
 

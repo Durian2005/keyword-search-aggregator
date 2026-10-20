@@ -37,6 +37,10 @@ _ADDITIVE_COLUMNS: dict[str, dict[str, str]] = {
     # body_core 是"剥掉转载模板后的正文长度"。老库补列后为 NULL，
     # 聚类时退回 body_chars（代表照旧能选，只是享受不到"不选二手站"这条改进）。
     "doc": {"body_core": "INTEGER"},
+    # P1 的候选人卡片多了三列：次要机构、活跃时间范围。老库补列后为 NULL。
+    "person_card": {
+        "also_orgs": "TEXT", "first_when": "TEXT", "last_when": "TEXT",
+    },
 }
 
 
@@ -340,16 +344,20 @@ class Repository:
         n = 0
         for c in cards:
             evidence = [
-                {"title": e.title, "url": e.url, "matched": list(e.matched)}
+                {"title": e.title, "url": e.url, "matched": list(e.matched),
+                 "when": getattr(e, "when", None)}
                 for e in getattr(c, "evidence", []) or []
             ]
             self.conn.execute(
                 "INSERT INTO person_card(task_id, label, tier, score, org_hits,"
-                " weak_hits, docs, negatives, evidence_json)"
-                " VALUES (?,?,?,?,?,?,?,?,?)",
+                " weak_hits, docs, negatives, also_orgs, first_when, last_when,"
+                " evidence_json)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                 (task_id, c.label, c.tier, int(c.score or 0), int(c.org_hits or 0),
                  int(c.weak_hits or 0), int(c.docs or 0),
                  ",".join(getattr(c, "negatives", ()) or ()) or None,
+                 ",".join(getattr(c, "also_orgs", ()) or ()) or None,
+                 getattr(c, "first_when", None), getattr(c, "last_when", None),
                  json.dumps(evidence, ensure_ascii=False)),
             )
             n += 1
@@ -540,6 +548,7 @@ class Repository:
         # 人名模式的候选人卡片（普通任务里为空表，报告据此决定要不要出这一块）
         person_cards = [dict(r) for r in self.conn.execute(
             "SELECT label, tier, score, org_hits, weak_hits, docs, negatives,"
+            "       also_orgs, first_when, last_when,"
             "       evidence_json FROM person_card WHERE task_id=?"
             " ORDER BY CASE tier WHEN 'confirmed' THEN 0 WHEN 'likely' THEN 1"
             "   WHEN 'suspect' THEN 2 ELSE 3 END, docs DESC, score DESC",
@@ -550,6 +559,7 @@ class Repository:
             except (ValueError, TypeError):
                 c["evidence"] = []
             c["negatives"] = [x for x in (c.get("negatives") or "").split(",") if x]
+            c["also_orgs"] = [x for x in (c.get("also_orgs") or "").split(",") if x]
 
         stats_json: dict[str, Any] = {}
         if task["stats_json"]:

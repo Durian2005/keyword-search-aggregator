@@ -174,6 +174,29 @@ class TestPersonSection(unittest.TestCase):
         out = render_html(_base_data())
         self.assertNotIn('id="people"', out)
 
+    def test_activity_span_and_secondary_orgs_shown(self) -> None:
+        """活跃区间 + "还提到哪些机构"：卡片要能看出"先在哪、后来去了哪"。"""
+        card = self._card("甲大学", "confirmed", also_orgs=["乙研究院"],
+                          first_when="2021-03-05", last_when="2025-06-01")
+        card["evidence"] = [
+            {"title": "最近的", "url": "https://a.example.com/2", "matched": ["甲大学"],
+             "when": "2025-06-01"},
+            {"title": "更早的", "url": "https://a.example.com/1", "matched": ["甲大学"],
+             "when": "2021-03-05"},
+        ]
+        out = render_html(self._data([card]))
+        self.assertIn("活跃 2021-03-05", out)
+        self.assertIn("2025-06-01", out)
+        self.assertIn("还提到：乙研究院", out)
+        self.assertIn("2021-03-05", out)          # 证据行也带日期
+
+    def test_single_day_span_not_repeated(self) -> None:
+        card = self._card("甲大学", "likely", first_when="2024-02-02",
+                          last_when="2024-02-02")
+        out = render_html(self._data([card]))
+        self.assertIn("活跃 2024-02-02", out)
+        self.assertNotIn("2024-02-02 ~ 2024-02-02", out)
+
     def test_negatives_shown_as_doubt(self) -> None:
         out = render_html(self._data([
             self._card("甲大学", "likely", negatives=["演艺", "招聘"]),

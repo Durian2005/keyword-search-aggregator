@@ -157,7 +157,10 @@ CREATE TABLE IF NOT EXISTS person_card (
     weak_hits     INTEGER NOT NULL DEFAULT 0,
     docs          INTEGER NOT NULL DEFAULT 0,
     negatives     TEXT,                        -- 逗号分隔：演艺/招聘/法律
-    evidence_json TEXT,                        -- [{title,url,matched}]
+    also_orgs     TEXT,                        -- 逗号分隔：同一批证据里还提到的机构（不合并，只标注）
+    first_when    TEXT,                        -- 最早一条证据的日期 → 活跃起点
+    last_when     TEXT,
+    evidence_json TEXT,                        -- [{title,url,matched,when}]
     PRIMARY KEY (task_id, label)
 );
 

@@ -160,6 +160,7 @@ class RunResult:
     # 人名模式（见 person.py）：卡片数与各档分布
     person_cards: int = 0
     person_tiers: dict[str, int] = field(default_factory=dict)
+    person_name_missing: int = 0   # 结果里没出现姓名的条数（机构页面/机翻标题），未参与归因
     per_channel: list[ChannelRun] = field(default_factory=list)
 
     @property
@@ -770,7 +771,7 @@ def run_task(
 
     per_domain: dict[str, int] = {}
     cap_per_domain = sanitizer.max_per_domain
-    person_items: list[tuple[Candidate, Judgment]] = []
+    person_items: list[tuple[Doc, Judgment]] = []
     kept_urls: list[str] = []
     for score, c, mention in scored:
         if result.kept >= cap:
@@ -851,8 +852,9 @@ def run_task(
         repo.upsert_mention(mention)
         kept_urls.append(doc.url_canon)
         if person is not None:
-            # 用洗过、且可能被正文替换过的标题/摘要做归因 —— 证据行要能直接给人看
-            person_items.append((c, judge(doc.title, doc.summary, person)))
+            # 用洗过、且可能被正文替换过的标题/摘要做归因 —— 证据行要能直接给人看。
+            # 传 doc 而不是 candidate：doc 带着页面声明的 published_at，卡片要靠它排时间线。
+            person_items.append((doc, judge(doc.title, doc.summary, person)))
         per_domain[domain] = per_domain.get(domain, 0) + 1
         result.kept += 1
 
@@ -886,10 +888,19 @@ def run_task(
 
     # --------------------------------------------------------- 人名模式归因
     if person is not None:
-        cards = build_cards(person, person_items)
+        pstats: dict[str, int] = {}
+        cards = build_cards(person, person_items, stats=pstats)
         repo.replace_person_cards(task_id, cards)
         result.person_cards = len(cards)
         result.person_tiers = summarize(cards)
+        result.person_name_missing = int(pstats.get("name_missing", 0))
+        if pstats.get("name_missing"):
+            # 这批是"机构对上了、但整页没有这个姓名"的机构页面（招生/师资/实验室介绍）。
+            # 不记账的话，用户会以为"一条都没找到"，而不是"找到的都归不到人头上"。
+            repo.add_alert(task_id, None, "person_name_missing",
+                           f"{pstats['name_missing']} 条结果里没有出现「{person.name}」"
+                           f"（多为机构页面或机翻标题），未参与归因；"
+                           f"真正参与归因的 {pstats.get('attributed', 0)} 条")
         if not person.has_anchors:
             # 没有锚点不等于没有结果，但等于"无法归因" —— 必须在报告里说清楚
             repo.add_alert(task_id, None, "person_no_anchor",

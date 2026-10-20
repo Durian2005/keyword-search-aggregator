@@ -101,7 +101,18 @@ def fake_person(keyword: str, offset: int, ctx) -> ChannelResult:  # noqa: ANN00
     ], "fake_person", keyword)
 
 
+def fake_person_noname(keyword: str, offset: int, ctx) -> ChannelResult:  # noqa: ANN001
+    """站内检索把"机构页面"也带回来了：机构对得上，但整页没有这个人名。"""
+    return _mk([
+        ("https://v1.example.edu.cn/1", "张军-甲大学计算机学院 教授",
+         "张军，研究方向网络安全", "v1.example.edu.cn"),
+        ("https://v2.example.edu.cn/2", "甲大学计算机学院师资队伍",
+         "本院现有专任教师 120 人，其中教授 30 人", "v2.example.edu.cn"),
+    ], "fake_person_noname", keyword)
+
+
 discover._REGISTRY["fake_person"] = fake_person
+discover._REGISTRY["fake_person_noname"] = fake_person_noname
 
 
 # --------------------------------------------------------------- 配置
@@ -125,7 +136,7 @@ filter:
   drop_url_patterns: ["\\\\.(zip|exe)$"]
   drop_domains: []
   max_per_domain: 2
-  drop_zero_hit: true
+  drop_zero_hit: {drop_zero}
 limits:
   max_docs: {max_docs}
   max_minutes: 5
@@ -199,6 +210,18 @@ _PERSON_CH = """
     assertions: {min_items: 1, required_fields: [url, title]}
 """
 
+# 站内检索（site_search）：没有"标题必须含关键词"这层过滤，
+# 机构页面能一路走到归因层 —— 正是 name_missing 要处理的情形。
+_PERSON_NONAME_CH = """
+  - id: fake_person_noname
+    type: site_search
+    parser: fake_person_noname
+    url_template: "https://fake.test/n?q={q}"
+    paging: {mode: none}
+    throttle: {min_interval_s: 0}
+    assertions: {min_items: 1, required_fields: [url, title]}
+"""
+
 
 class RunCase(unittest.TestCase):
     def setUp(self) -> None:
@@ -209,9 +232,13 @@ class RunCase(unittest.TestCase):
     def tearDown(self) -> None:
         self.tmp.cleanup()
 
-    def cfg(self, channels: str, max_docs: int = 20):
+    def cfg(self, channels: str, max_docs: int = 20, *,
+            drop_zero_hit: bool = True):
         p = self.dir / "channels.yaml"
-        p.write_text(_BASE.format(channels=channels, max_docs=max_docs), encoding="utf-8")
+        p.write_text(_BASE.format(
+            channels=channels, max_docs=max_docs,
+            drop_zero="true" if drop_zero_hit else "false",
+        ), encoding="utf-8")
         return load_config(p)
 
     def run_kw(self, cfg, keyword: str = "红黑树", **kw):
@@ -390,6 +417,25 @@ class TestPersonMode(RunCase):
         # 无锚点也要出卡片，但只能是"未匹配机构"
         labels = [x["label"] for x in self.rows("SELECT label FROM person_card")]
         self.assertEqual(labels, ["未匹配机构"])
+
+    def test_name_missing_counted_and_alerted(self) -> None:
+        """机构页面（没有这个人名）不进卡片，但必须记账 —— 否则像"一条都没找到"。
+
+        drop_zero_hit 默认是开的，这类页面通常更早一步就被零命中丢弃；
+        这里关掉它，验证归因层自己也会把关并留下账目（用户改配置时的兜底）。
+        """
+        p = parse_person("张军", ["甲大学计算机学院"], ["教授"])
+        r = self.run_kw(self.cfg(_PERSON_NONAME_CH, drop_zero_hit=False),
+                        keyword="张军", person=p)
+        self.assertEqual(r.kept, 2)
+        self.assertEqual(r.person_cards, 1)          # 只有真提到姓名的那条进卡片
+        rows = self.rows("SELECT label, docs FROM person_card")
+        self.assertEqual([(x["label"], x["docs"]) for x in rows],
+                         [("甲大学计算机学院", 1)])
+        alerts = self.rows("SELECT kind, detail FROM alert WHERE task_id=?", r.task_id)
+        hit = [a for a in alerts if a["kind"] == "person_name_missing"]
+        self.assertTrue(hit)
+        self.assertIn("1 条", hit[0]["detail"])
 
 
 class TestLimits(RunCase):
