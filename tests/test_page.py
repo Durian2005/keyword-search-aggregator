@@ -292,6 +292,49 @@ class TestRobots(unittest.TestCase):
         rc = self._cache({"https://a.com/robots.txt": FetchError("boom", kind="conn")})
         self.assertFalse(rc.check("https://a.com/any").allowed)
 
+    def test_network_error_retried_then_allowed(self) -> None:
+        # 2026-10-21：任务进行中的间歇性 hiccup 不能一棒子打死整个 host ——
+        # 实测 www.xxx.edu.cn 的 robots.txt 平静时 133ms 返回 404，
+        # 任务中却两次被判 unavailable，目标机构的正文和列表页解析连坐丢失。
+        # 前两次超时、第三次成功 → 必须放行，且真的重试了 3 次。
+        calls: list[str] = []
+
+        def fake_fetch(url: str) -> FetchResult:
+            calls.append(url)
+            if len(calls) < 3:
+                raise FetchError("timeout", kind="timeout")
+            return _res("", status=404)
+
+        rc = RobotsCache(None, "kwsearch-test", fetch=fake_fetch)  # type: ignore[arg-type]
+        v = rc.check("https://a.com/any")
+        self.assertTrue(v.allowed)
+        self.assertEqual(v.reason, "missing")
+        self.assertEqual(len(calls), 3)
+
+    def test_persistent_network_error_still_denies(self) -> None:
+        # 一直失败才保守禁止（宁可少抓的底线不退）
+        calls: list[str] = []
+
+        def fake_fetch(url: str) -> FetchResult:
+            calls.append(url)
+            raise FetchError("timeout", kind="timeout")
+
+        rc = RobotsCache(None, "kwsearch-test", fetch=fake_fetch)  # type: ignore[arg-type]
+        self.assertFalse(rc.check("https://a.com/any").allowed)
+        self.assertEqual(len(calls), 3)        # 重试遍数有上限，不会无限打
+
+    def test_http_status_not_retried(self) -> None:
+        # 403/404 是"没有规则"的正常答案，重试它们没有意义
+        calls: list[str] = []
+
+        def fake_fetch(url: str) -> FetchResult:
+            calls.append(url)
+            return _res("", status=403)
+
+        rc = RobotsCache(None, "kwsearch-test", fetch=fake_fetch)  # type: ignore[arg-type]
+        self.assertTrue(rc.check("https://a.com/any").allowed)
+        self.assertEqual(len(calls), 1)
+
     def test_crawl_delay(self) -> None:
         rc = self._cache({"https://a.com/robots.txt":
                           _res("User-agent: *\nCrawl-delay: 3\n", ct="text/plain")})

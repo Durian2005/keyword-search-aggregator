@@ -50,19 +50,25 @@ from kwsearch.discover.base import (
 from kwsearch.discover.quality import keep_related, needles_of
 from kwsearch.enrich import EnrichReport, Enriched, enrich
 from kwsearch.expand import expand_channel
+from kwsearch.extract.listpage import article_links
 from kwsearch.fetch import FetchError
-from kwsearch.fetch.page import HostThrottle
+from kwsearch.fetch import build_fetcher, default_headers
+from kwsearch.fetch.page import HostThrottle, PagePolicy, fetch_pages
 from kwsearch.models import Candidate, Doc, Mention
 from kwsearch.person import (
     TIER_CN,
+    UNMATCHED_LABEL,
     Judgment,
     PersonQuery,
     build_cards,
     judge,
+    org_search_domains,
+    person_site_queries,
+    registered_domain,
     summarize,
 )
 from kwsearch.query import QueryVariant, expand_queries, probe_profile
-from kwsearch.sanitize import Sanitizer
+from kwsearch.sanitize import Sanitizer, is_list_url
 from kwsearch.storage import Repository, init_db
 
 Progress = Callable[[str], None]
@@ -139,6 +145,7 @@ class RunResult:
     dropped_url: int = 0           # 命中丢弃规则
     dropped_zero: int = 0          # 标题/摘要里完全没命中关键词（通道兜底给的噪声）
     dropped_cap: int = 0           # 命中单域配额
+    resolved_list: int = 0         # 列表页解析出来的相关文章数（链接直指正文，不是目录）
     pii_masked: int = 0
     alerts: int = 0
     elapsed_ms: int = 0
@@ -509,6 +516,162 @@ def _cluster_stage(
     return rep.groups, rep.merged, rep.no_simhash, rep.too_short
 
 
+def _discover_org_domains(
+    cfg: AppConfig,
+    person: PersonQuery,
+    task_id: str,
+    repo: Repository,
+    *,
+    say: Progress,
+    sleep: Callable[[float], None],
+) -> dict[str, str]:
+    """人名模式的机构兑现第一步：搜机构名，拿官网域名。
+
+    为什么必须有这一步：Bing 的裸姓名池被名人同名者占满，普通教师排不进来；
+    机构锚点只有配上「姓名 site:官网域」这样的检索动作才兑现得了
+    （2026-10-21 实测：张军 + 计算机学院，site: 第一条就是本人的教授主页，
+    而裸姓名 23 条里一条计算机学院的都没有）。
+
+    候选只用来推域名，**不进文档池** —— 机构主页/新闻不是"这个人在哪"的证据。
+    只用第一个有收获的 serp 通道；被拦立即整体收手（项目铁律：不加重风控）。
+
+    **单发配额通道不参与探测**（`variants: false`，如百度）：它全局只有一发子弹，
+    必须留给主查询的「姓名 site:官网域」—— 那一条的价值远高于用子弹换一个
+    Bing 通常已经问得到的域名。Bing 问不到官网域时，宁可不打站内检索，
+    也不能把子弹花在探测上（2026-10-21 实测：探测打百度 → 主查询必吃验证码）。
+    """
+    out: dict[str, str] = {}
+    seq = -1         # 负序号：机构探测发生在通道循环之前，报告里要排在主查询前面
+    for ch in cfg.enabled_channels():
+        if ch.type != "serp":
+            continue
+        if not ch.variants:
+            continue          # 单发配额通道：子弹留给主查询，探测不碰
+        reason = ch.unavailable_reason()
+        if reason is not None:
+            continue
+        try:
+            fn = get_channel(ch.parser)
+        except KeyError:
+            continue
+        ctx = build_context(cfg, ch.id)
+        found_here = False
+        for org in person.orgs[:3]:
+            if org in out:
+                continue
+            t0 = time.perf_counter()
+            result = fn(org, ch.paging.start, ctx)
+            repo.log_query(task_id, ch.id, seq, ch.build_url(org, ch.paging.start),
+                           query_text=f"[机构探测] {org}", got=len(result.candidates),
+                           blocked=result.blocked,
+                           block_kind=result.block_kind or None,
+                           elapsed_ms=int((time.perf_counter() - t0) * 1000))
+            seq -= 1
+            if result.blocked:
+                say(f"  ⛔ {ch.id} 机构查询被拦（{result.block_kind or '未知'}），"
+                    f"机构域探测收手")
+                return out
+            doms = org_search_domains(result.candidates)
+            if doms:
+                out[org] = doms[0]
+                found_here = True
+                say(f"  ⌖ 机构「{org}」→ 官网域 {doms[0]}"
+                    f"（{len(result.candidates)} 条结果）")
+            elif result.candidates:
+                say(f"  · 机构「{org}」的 {len(result.candidates)} 条结果里"
+                    f"没有可识别的官网域（多为平台域），跳过站内检索")
+            sleep(ch.throttle_min_interval_s)
+        if found_here:
+            break          # 一个通道拿到就够，不逐通道重复打同一个机构名
+    return out
+
+
+def _resolve_list_pages(
+    cfg: AppConfig,
+    repo: Repository,
+    task_id: str,
+    seen: dict[str, Candidate],
+    keyword: str,
+    *,
+    say: Progress,
+    sleep: Callable[[float], None],
+    deadline: float,
+    fetcher=None,  # noqa: ANN001 —— 只在测试里注入假实现，生产走 build_fetcher
+    fetch_body: bool | None = None,
+) -> tuple[int, int]:
+    """把池子里的栏目列表页换成它链着的相关文章。返回 (新文章数, 丢弃的列表页数)。
+
+    为什么不直接丢：列表页点开是一屏目录，用户要的是"点开就是正文"；但列表页里
+    往往正链着目标文章（百度 `site:官网域` 返回列表页就因为这个）。丢页等于把文章
+    一起丢了；解析 = 文章进池、链接直指正文。页内解析不出相关文章的才丢。
+
+    只在会抓正文的模式下跑（`--no-body` 不产生任何请求，列表页维持丢弃）。
+    """
+    ext = dict(getattr(cfg, "extract", None) or {})
+    if fetch_body is False or not ext.get("fetch_body", True):
+        return 0, 0
+    if time.perf_counter() > deadline:
+        return 0, 0
+
+    list_keys = [k for k, c in seen.items() if is_list_url(c.url_raw)]
+    if not list_keys:
+        return 0, 0
+    # 列表页通常个位数；兜底封顶，避免哪天通道集体返回目录页把任务拖垮
+    list_keys = list_keys[:10]
+
+    crawl = dict(getattr(cfg, "crawl", None) or {})
+    qps_raw = crawl.get("per_domain_qps", 1)
+    qps = float(qps_raw if qps_raw is not None else 1)
+    say(f"  ⌗ 列表页解析：{len(list_keys)} 个栏目页 → 捞里面的相关文章")
+
+    try:
+        policy = PagePolicy.from_config(cfg, limit=len(list_keys))
+        f = fetcher or build_fetcher(str(cfg.defaults.get("fetcher", "auto")))
+        batch = fetch_pages(
+            list_keys, policy, fetcher=f,
+            headers=default_headers(cfg.defaults),
+            progress=lambda m: say("    " + m),
+            throttle=HostThrottle(qps, sleep=sleep),
+        )
+    except Exception as e:                                   # noqa: BLE001
+        # 解析起不来不该让任务失败：列表页维持原样会被 check_url 丢弃，照常出报告
+        repo.add_alert(task_id, None, "fetch_fail",
+                       f"列表页解析未执行：{type(e).__name__}: {e}")
+        return 0, 0
+
+    needles = needles_of(keyword)
+    added = dropped = 0
+    for page in batch.pages:
+        src = seen.get(page.url)
+        if src is None:
+            continue
+        arts = article_links(page.html or "", needles, base_url=page.url,
+                             reject=is_list_url)
+        fresh = [(u, t) for u, t in arts if u not in seen]
+        if fresh:
+            for u, t in fresh:
+                seen[u] = Candidate(
+                    url_raw=u, url_canon=u, title=t, snippet=t,
+                    channel=src.channel, rank=src.rank,
+                    extra={**src.extra, "domain": host_of(u),
+                           "resolved_from": src.url_raw},
+                )
+                added += 1
+            repo.add_alert(task_id, src.channel, "resolved",
+                           f"列表页 {page.url[:100]} 解析出 {len(fresh)} 篇相关文章，"
+                           f"链接已直指正文")
+            say(f"    ✓ {page.url[:60]} → {len(fresh)} 篇")
+        else:
+            dropped += 1
+            why = ("页内没有含关键词的文章" if (page.ok or page.html)
+                   else f"列表页抓取失败（{page.failure or '未知'}）")
+            repo.add_alert(task_id, src.channel, "dropped",
+                           f"栏目列表页/站点首页：{why}: {page.url[:100]}")
+            say(f"    ✗ {page.url[:60]}：{why}")
+        seen.pop(page.url, None)
+    return added, dropped
+
+
 def run_task(
     cfg: AppConfig,
     keyword: str,
@@ -544,7 +707,9 @@ def run_task(
     if expand and expand > 0:
         spec["max_queries"] = expand
     # 人名模式：查询侧只打裸姓名（"姓名 + 第二个词"必然触发 Bing 静默降级），
-    # 收窄全部放到结果侧（person.judge）。所以强制 person 档、清掉后缀。
+    # 收窄放到结果侧（person.judge）。所以强制 person 档、清掉后缀。
+    # 但"只发裸姓名"不够（2026-10-21 张军实测）：裸姓名池被名人同名者占满，
+    # 机构锚点必须有配套检索才兑现 —— 官网域探测 + 站内检索，见 _discover_org_domains。
     if person is not None:
         if spec.get("profiles"):
             spec["profile"] = "person"
@@ -557,6 +722,23 @@ def run_task(
     zero_gain = int(spec.get("zero_gain_streak", 2))
     auto_probe = (person is None and bool(spec.get("profiles"))
                   and str(spec.get("profile", "auto")) == "auto")
+
+    # 机构锚点的检索动作：官网域探测（走 Bing）→ 百度那一发子弹打在
+    # 「姓名 site:官网域」上。百度是单人单次配额（第 2 请求就出安全验证，
+    # 2026-10-21 实测），所以这一发**替代**百度的裸姓名查询而不是追加 ——
+    # 裸姓名池 Bing 侧已有，在百度侧再打一遍纯属浪费。
+    # Bing 不认 site:（实测原样返回同名者名人堂）、多词 conjunction 又降级，
+    # 所以站内检索只有百度能打。
+    org_domains: dict[str, str] = {}
+    if person is not None and person.orgs:
+        org_domains = _discover_org_domains(cfg, person, task_id, repo,
+                                            say=say, sleep=sleep)
+        if org_domains:
+            say(f"  ⌖ 机构锚点兑现：官网域 {', '.join(org_domains.values())}"
+                f" → 百度站内检索「{person.name} site:域」")
+        else:
+            say("  · 机构锚点没能探到官网域，本轮只有裸姓名池"
+                "（换机构全称重试，或该机构没有独立网站）")
 
     probed: list[QueryVariant] | None = None
 
@@ -619,14 +801,34 @@ def run_task(
                 pattern = _term_pattern(keyword)
 
         ctx = build_context(cfg, ch.id)
+        # 人名模式 + 探到官网域：百度这唯一一发请求改打「姓名 site:官网域」。
+        # 百度单人单次配额（第 2 请求就出安全验证），裸姓名在百度侧是浪费；
+        # Bing 不认 site:，所以这个查询只有百度能打。没探到域就照旧打裸姓名。
+        org_site_q = (person is not None and ch.id == "baidu_html"
+                      and ch.type == "serp" and bool(org_domains))
+        if org_site_q:
+            dom = next(iter(org_domains.values()))
+            ch_variants = [QueryVariant(f"{person.name} site:{dom}", "org_site", 0)]
+            say(f"  ▸ {ch.id} 站内检索：{person.name} site:{dom}（替代裸姓名）")
+        else:
+            ch_variants = [v for v in variants if v.for_channel(ch.id)]
         try:
             # auto_probe 时初始变体只有基词，但 serp 也必须走 _run_serp：
             # plan_hook 要在 expand_channel 内部（拿到过滤后的基词结果）补变体。
-            if ch.type == "serp" and (len(variants) > 1 or auto_probe):
+            # ch.variants=false 的通道（如百度：第二次请求就出验证码）只打基词一次，
+            # 走 _run_paged —— 变体矩阵对它是自杀而不是扩量。
+            # 人名模式的百度站内检索是例外：它就打一个查询，但必须走 _run_serp
+            # （_run_paged 只认 keyword，不会打 site: 变体）。
+            if ch.type == "serp" and ch.variants and (len(variants) > 1 or auto_probe):
                 run, cands, logs = _run_serp(
-                    ch, ctx, keyword, variants,
+                    ch, ctx, keyword, ch_variants,
                     pattern=pattern, zero_gain_streak=zero_gain, sleep=sleep,
                     plan_hook=_plan_hook if auto_probe else None,
+                )
+            elif org_site_q:
+                run, cands, logs = _run_serp(
+                    ch, ctx, keyword, ch_variants,
+                    pattern=pattern, zero_gain_streak=zero_gain, sleep=sleep,
                 )
             else:
                 run, cands, logs = _run_paged(
@@ -712,6 +914,17 @@ def run_task(
             f" / 本通道去重 {run.unique:3d} / 全局新增 {added:3d}  {run.stopped_reason}")
 
     conn.commit()
+    result.unique = len(seen)
+
+    # -------------------------------------------- 列表页解析（在过滤/打分之前）
+    # 栏目页不当结果，但它链着的相关文章是 —— 抓下来换成文章，链接直指正文。
+    # 必须放在去重之后：解析出的文章要和全池去重；放在打分之后就得重排两遍。
+    resolved_add, resolved_dropped = _resolve_list_pages(
+        cfg, repo, task_id, seen, keyword,
+        say=say, sleep=sleep, deadline=deadline,
+        fetcher=fetcher, fetch_body=fetch_body,
+    )
+    result.resolved_list = resolved_add
     result.unique = len(seen)
 
     # ---------------------------------------------------- 过滤 → 脱敏 → 打分
@@ -854,7 +1067,14 @@ def run_task(
         if person is not None:
             # 用洗过、且可能被正文替换过的标题/摘要做归因 —— 证据行要能直接给人看。
             # 传 doc 而不是 candidate：doc 带着页面声明的 published_at，卡片要靠它排时间线。
-            person_items.append((doc, judge(doc.title, doc.summary, person)))
+            # 域名证据：页面就在机构官网域上（中文站通篇"我校"，机构全称常常
+            # 一个字都不出现，没有这条证据，官网上的正确人物只能判「疑似」）。
+            dom_orgs = tuple(
+                o for o, d in org_domains.items()
+                if d and d == registered_domain(domain or host_of(doc.url_raw))
+            )
+            person_items.append((doc, judge(doc.title, doc.summary, person,
+                                            domain_orgs=dom_orgs)))
         per_domain[domain] = per_domain.get(domain, 0) + 1
         result.kept += 1
 
@@ -906,9 +1126,24 @@ def run_task(
             repo.add_alert(task_id, None, "person_no_anchor",
                            "人名模式未提供机构/方向锚点，全部结果只能归入"
                            "「同名未归因」，不能当作候选人")
+        named = [c for c in cards if c.label != UNMATCHED_LABEL]
+        if not named and person.orgs:
+            # 给了机构却一条都没命中：这是"裸姓名池被名人同名者占满"的典型症状
+            # （2026-10-21 张军实测：23 条全是清华院士/联想副总裁/中超董事长）。
+            # 必须写成告警 —— 只显示"候选人 0 个"的话，用户会以为这人没上网。
+            repo.add_alert(task_id, None, "person_org_unmatched",
+                           f"没有一条结果命中机构「{'、'.join(person.orgs)}」。"
+                           f"裸姓名检索的结果被同名者占满（名人、同名从业者），"
+                           f"目标人物若是普通教师/职员，排不进前列。"
+                           f"已尝试官网域站内检索；仍无命中可换机构全称重跑，"
+                           f"或确认该机构是否有独立网站")
         tiers_txt = "、".join(
-            f"{TIER_CN[t]} {n}" for t, n in result.person_tiers.items() if n) or "无"
-        say(f"  人 候选人 {len(cards)} 张：{tiers_txt}")
+            f"{TIER_CN[t]} {n}" for t, n in result.person_tiers.items() if n)
+        if named:
+            say(f"  人 候选人 {len(named)} 个机构：{tiers_txt}")
+        else:
+            say(f"  人 没有命中机构的候选人；{pstats.get('attributed', 0)} 条"
+                f"同名结果归入「未匹配机构」（报告里折叠展示）")
 
     # ------------------------------------------------------------ 收尾
     result.elapsed_ms = int((time.perf_counter() - t_start) * 1000)
@@ -926,6 +1161,7 @@ def run_task(
         "dropped_url": result.dropped_url,
         "dropped_zero": result.dropped_zero,
         "dropped_cap": result.dropped_cap,
+        "resolved_list": result.resolved_list,
         "pii_masked": result.pii_masked,
         "max_per_domain": cap_per_domain,
         "channels": {r.channel: r.got for r in result.per_channel if not r.skipped},
@@ -951,6 +1187,8 @@ def run_task(
 
     say(f"\n{result.status.upper()}  {result.kept} 条入库（新 {result.docs_new}）"
         f" / 去重后 {result.unique} / 原始 {result.candidates}"
+        + (f" / 列表页解析 {result.resolved_list} 篇"
+           if result.resolved_list else "")
         + (f" / 正文 {result.bodies_ok} 条均 {result.body_chars_avg} 字"
            if result.bodies_ok else " / 未取到正文")
         + (f" / 独立内容 {result.cluster_groups} 组"

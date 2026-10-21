@@ -11,6 +11,9 @@
   drop_url_patterns  .zip/.exe/下载页 —— 不是"信息"，抓了也无用，还容易踩版权
   max_per_domain   单域配额。不加这条，一个知乎/CSDN 就能占满整份报告，
                    读者会误以为"全网都在讨论"，其实只是某个站的站内搜索排名好。
+  列表页/站点首页  内置规则（不走配置）：栏目列表页点进去是一屏文章目录，
+                   站点首页点进去是站门口，都不是"一条结果"。百度 site: 查询
+                   尤其爱返回这些（列表页里链着目标文章，就被搜索引擎算相关）。
 
 ⚠️ 脱敏 vs 丢弃是两种不同处理，别混：
    脱敏 = 内容还有价值，只把敏感片段遮掉（如"联系 138****5678"）
@@ -20,6 +23,7 @@ from __future__ import annotations
 
 import re
 from typing import Any, Callable, Mapping
+from urllib.parse import urlsplit
 
 # 每类 PII 的遮罩函数。保留多少位是权衡过的：
 #   手机号 保留前 3 后 4（能看出归属地段，不能拨通）
@@ -60,6 +64,45 @@ _FALLBACK_PATTERNS: dict[str, str] = {
     "id_card_cn": r"\b\d{17}[\dXx]\b",
     "email": r"\b[\w.+-]+@[\w-]+\.[\w.]+\b",
 }
+
+# ---------------------------------------------------------------- 列表页判定
+# 栏目列表页与站点首页的 URL 形态。用户点开一条结果要看到的是正文，而这些页面
+# 点进去是一屏文章目录（甚至就是站门口）。百度 `site:官网域` 查询尤其爱返回它们：
+# 列表页里链着目标文章，搜索引擎就把整页算成相关。
+#
+# 判定只看**路径最后一段**：剥扩展名、剥尾部数字后查表 —— 整段精确匹配，
+# 不做子串匹配（"my-list-of-tools" 不是列表页）。
+# 真实样本（某某大学计算机学院官网，百度 site: 查询返回）：
+#   /xsjs/list38.htm  /677/list3.htm  /_s2/677/list.psp  /55/list21.psp
+#   /85/list1.htm    /53/list19.psp  /677/list50.psp
+# 同站文章页形态是 /2021/0525/c282a3495/page.htm —— "page" 不在表里，不会误伤。
+_LIST_WORDS = frozenset({
+    "list", "column", "channel", "category", "cat", "topic", "tag", "tags",
+})
+_HOME_WORDS = frozenset({"index", "default", "home", "main"})
+
+
+def _path_tail(url: str) -> str:
+    """URL 路径最后一段：剥扩展名、剥尾部数字、转小写。"""
+    seg = urlsplit(url).path.rstrip("/").rsplit("/", 1)[-1]
+    if "." in seg:
+        seg = seg.rsplit(".", 1)[0]
+    return re.sub(r"\d+$", "", seg).lower()
+
+
+def is_list_url(url: str) -> bool:
+    """栏目列表页或站点首页 → True（这类页面没有"一条结果"的价值）。
+
+    只认形态不猜内容：路径为空（https://a.com）或仅 "/" 视为站点首页；
+    最后一段命中列表词/首页词视为栏目页。机构官网探测**不走这里**——
+    那个场景恰恰需要首页来认域名。
+    """
+    if not url:
+        return False
+    if urlsplit(url).path in ("", "/"):
+        return True
+    tail = _path_tail(url)
+    return tail in _LIST_WORDS or tail in _HOME_WORDS
 
 
 class Sanitizer:
@@ -122,10 +165,12 @@ class Sanitizer:
             for bad in self._drop_domains:
                 if d == bad or d.endswith("." + bad):
                     return f"域名在黑名单（{bad}）"
+        if is_list_url(url):
+            return "栏目列表页/站点首页（点开不是具体文章）"
         for pattern in self._drop_url_re:
             if pattern.search(url or ""):
                 return f"URL 命中丢弃规则（{pattern.pattern}）"
         return None
 
 
-__all__ = ["Sanitizer"]
+__all__ = ["Sanitizer", "is_list_url"]

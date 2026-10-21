@@ -1,12 +1,22 @@
-"""人名模式：裸姓名捞一次池子，结果内归因，输出候选人卡片。
+"""人名模式：裸姓名捞池子 + 机构域站内检索，结果内归因，输出候选人卡片。
 
-**为什么查询侧只能裸姓名**（2026-10-18 实测，见 discover/quality.py）：
+**为什么 Bing 上只能裸姓名**（2026-10-18 实测，见 discover/quality.py）：
 Bing 对"人名 + 任何第二个词"会静默降级成第一个字的结果
 （"张军 某某大学" → 返回"张"的百科/字典/姓氏页），HTTP 200、无提示。
-所以重名问题在查询层无解，收窄必须发生在结果侧 —— 也就是本模块。
+所以重名问题在 Bing 的查询层无解。
+
+**但"只发裸姓名"不够**（2026-10-21 实测，张军 + 某某大学计算机学院）：
+裸姓名池被名人同名者占满（院士、副总裁、董事长、演员），目标人物若是
+普通教师，根本排不进前 10 条 —— 机构锚点于是永远打空，报告只剩一堆同名者。
+修复是给机构锚点配检索动作：先搜机构名拿官网域，再打
+「姓名 site:官网域」与「姓名 机构名」。百度认 site: 与多词中文（不降级），
+这两类查询只投百度；Bing 仍只收裸姓名，不浪费请求也不会被降级页污染。
+
+归因侧也因此多一条证据：**页面就在机构官网域上**（中文站通篇"我校"，
+机构全称常常一个字都不出现，没有这条证据，官网上的正确人物只能判「疑似」）。
 
 判定用三层锚点：
-  1) 强锚点（机构）：标题/摘要里出现用户给的机构 → 这个人大概率属于该单位
+  1) 强锚点（机构）：标题/摘要里出现用户给的机构，或页面位于该机构官网域
   2) 弱锚点（方向 / 身份）：网络安全、教授、博导 …… 只能说明"像这个人"
   3) 负锚点：演员/歌手、招聘、判决书 —— 同名不同人的常见来源
 
@@ -41,6 +51,8 @@ import re
 import unicodedata
 from dataclasses import dataclass, field
 from typing import Any, Sequence
+
+from kwsearch.aggregate import host_of
 
 TIER_CONFIRMED = "confirmed"
 TIER_LIKELY = "likely"
@@ -79,7 +91,75 @@ _GENERIC_ORGS = frozenset({
     "大学", "学院", "学校", "研究院", "研究所", "实验室", "公司", "集团", "医院", "中心",
 })
 
+# ── 机构域探测（2026-10-21，人名模式对应性修复）────────────────────────────
+#
+# 病因（张军 + 某某大学计算机学院实测）：裸姓名池被名人同名者占满
+# （清华院士、联想副总裁、中超董事长……），普通讲师根本排不进来；
+# 机构锚点因此从来只是"结果侧的打分器"，**没有对应的检索动作**。
+# 修复：先用机构名搜一次拿到官网域名，再打「姓名 site:官网域」（百度认 site:，
+# Bing 不认）和「姓名 机构」（百度认多词中文，Bing 会降级所以不投 Bing）。
+#
+# 中文机构域名大量是两级后缀（.edu.cn / .com.cn）：注册域要取三段，
+# 按"最后两段"砍会把 xxx.edu.cn 砍成 edu.cn，site:edu.cn 等于全中国高校。
+_TWO_LEVEL_SUFFIXES = frozenset({
+    "edu.cn", "com.cn", "net.cn", "org.cn", "gov.cn", "ac.cn", "mil.cn",
+})
+
+# 平台域不进 site: 范围：site:qq.com 等于全站扫描，既无礼也无意义。
+# 机构新闻常发在门户/公众号上，但那不是"该机构的站点"，圈进来只会掺入同名者。
+_PLATFORM_DOMAINS = frozenset({
+    "qq.com", "baidu.com", "sogou.com", "zhihu.com", "jianshu.com", "jianshu.io",
+    "csdn.net", "163.com", "sohu.com", "sina.com.cn", "sina.cn", "toutiao.com",
+    "bilibili.com", "iqiyi.com", "youku.com", "douban.com", "juejin.cn",
+    "aliyun.com", "oschina.net", "cnblogs.com", "51cto.com", "jianshu.com",
+})
+
 _WS_RE = re.compile(r"\s+")
+
+
+def registered_domain(host: str) -> str:
+    """取注册域名（www.xxx.edu.cn → xxx.edu.cn；zhuanlan.zhihu.com → zhihu.com）。"""
+    labels = [x for x in (host or "").lower().split(".") if x]
+    if len(labels) >= 3 and ".".join(labels[-2:]) in _TWO_LEVEL_SUFFIXES:
+        return ".".join(labels[-3:])
+    if len(labels) >= 2:
+        return ".".join(labels[-2:])
+    return ".".join(labels)
+
+
+def org_search_domains(
+    cands: Sequence[Any],
+    *,
+    limit: int = 1,
+    min_count: int = 2,
+) -> list[str]:
+    """从机构名查询的结果里取该机构的主域名，按出现次数降序。
+
+    只取出现次数首位、且出现 ≥ min_count 次的注册域：机构查询结果里最集中的
+    那个域基本就是官网。**刻意只取一个** —— 多取会把上级单位/兄弟单位的域也圈
+    进来（学院 xxx.edu.cn vs 母体大学 yyy.edu.cn），
+    而 site: 到母体的域等于把别人的师生也算成这个机构的人。
+    平台域一律排除（见 _PLATFORM_DOMAINS）。
+    """
+    counts: dict[str, int] = {}
+    for c in cands:
+        url = str(getattr(c, "url_raw", "") or getattr(c, "url", "") or "")
+        dom = registered_domain(host_of(url)) if url else ""
+        if not dom or dom in _PLATFORM_DOMAINS:
+            continue
+        counts[dom] = counts.get(dom, 0) + 1
+    ranked = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+    return [d for d, n in ranked[:limit] if n >= min_count]
+
+
+def person_site_queries(name: str, domains: Sequence[str]) -> list[str]:
+    """姓名 + site:机构域。百度认 site:，Bing 不认（只会原样返回同名者名人堂）。
+
+    百度是单人单次配额（第 2 请求就出安全验证，2026-10-21 实测），
+    所以人名模式下这一发**替代**百度的裸姓名查询 —— 调用方负责只取一个域。
+    """
+    n = (name or "").strip()
+    return [f"{n} site:{d}" for d in domains if (d or "").strip() and n]
 
 
 def _norm(s: str) -> str:
@@ -244,14 +324,28 @@ def _pick_primary(
     ))
 
 
-def judge(title: str, snippet: str, person: PersonQuery) -> Judgment:
-    """给一条候选定档。纯字符串匹配 —— 不做实体消歧，也不猜。"""
+def judge(
+    title: str,
+    snippet: str,
+    person: PersonQuery,
+    *,
+    domain_orgs: Sequence[str] = (),
+) -> Judgment:
+    """给一条候选定档。纯字符串匹配 —— 不做实体消歧，也不猜。
+
+    domain_orgs：凭"页面就在该机构官网域上"命中的机构（见 person.org_search_domains）。
+    中文站点通篇自称"我校"，机构全称常常一个字都不出现 —— 没有这条证据，
+    计算机学院官网上张军教授的主页永远只能判「疑似」。
+    域名证据与文本证据同权（都算强锚点），但卡片里会标注（官网域名），
+    看的人能分清这条机构命中是"页面写了校名"还是"页面就在该校网站上"。
+    """
     text = f"{title} {snippet}"
     name_present = mentions_name(person.name, title, snippet)
 
     t_hits = {o: org_hits(o, title) for o in person.orgs}
     s_hits = {o: org_hits(o, snippet) for o in person.orgs}
-    orgs = tuple(o for o in person.orgs if t_hits[o] or s_hits[o])
+    dom_set = tuple(o for o in domain_orgs if o in person.orgs)
+    orgs = tuple(o for o in person.orgs if t_hits[o] or s_hits[o] or o in dom_set)
     weak = tuple(a for a in person.weak_anchors if _plus(a, text))
     negatives = tuple(
         kind for kind, words in NEGATIVE_HINTS.items()
@@ -274,8 +368,12 @@ def judge(title: str, snippet: str, person: PersonQuery) -> Judgment:
         tier = TIER_UNRELATED
 
     primary = _pick_primary(person, orgs, t_hits, s_hits)
+    # 只靠域名命中的机构在证据行里标注出来：文本没写校名，是"站在人家网站上"算的数
+    dom_only = tuple(o for o in dom_set if not (t_hits[o] or s_hits[o]))
+    matches = (tuple(f"{o}（官网域名）" if o in dom_only else o for o in orgs)
+               + weak)
     return Judgment(
-        tier=tier, matches=orgs + weak, orgs=orgs, weak=weak,
+        tier=tier, matches=matches, orgs=orgs, weak=weak,
         negatives=negatives, score=max(0, score), name_present=name_present,
         primary_org=primary,
         also_orgs=tuple(o for o in orgs if o != primary),

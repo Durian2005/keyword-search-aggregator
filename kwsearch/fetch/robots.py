@@ -11,10 +11,18 @@ RFC 9309 的失败语义（保守方向明确）：
     4xx / 200 空内容  → 视为没有限制，允许全部（404 是最常见的正常情况）
     5xx / 网络错误     → 视为暂时不可用，保守禁止
     ⚠️ 这里刻意选"宁可少抓"：robots 拿不到就硬抓，是最容易把项目性质搞坏的一步。
+
+但"网络错误"要先重试再下结论：2026-10-21 实测，任务进行中（并发请求多、
+站点响应变慢）单次 robots.txt 抓取会间歇性超时，而**一次失败就把整个 host
+禁掉整轮任务**——目标机构的文章正文、列表页解析全部连坐丢失
+（张军 + 计算机学院实测：www.xxx.edu.cn 的 robots.txt 平静时 133ms 返回 404，
+任务中却两次被判 unavailable）。robots.txt 是个几百字节的小文件，
+重试成本极低，所以抓取异常时重试两遍再保守禁止。
 """
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass, field
 from typing import Callable
 from urllib.parse import urlsplit
@@ -25,6 +33,11 @@ from kwsearch.fetch import BaseFetcher, FetchResult, RetryPolicy
 logger = logging.getLogger(__name__)
 
 _ROBOTS_PATH = "/robots.txt"
+
+# robots.txt 抓取的重试：只重试**异常**（超时/连接失败/TLS），
+# HTTP 状态码（403/404/5xx）由 _load 按 RFC 语义处理，不重试。
+_ROBOTS_ATTEMPTS = 3
+_ROBOTS_BACKOFF_S = (0.5, 1.0)
 
 
 @dataclass(slots=True)
@@ -129,8 +142,8 @@ class RobotsCache:
     def _load(self, key: str) -> _Entry:
         robots_url = key + _ROBOTS_PATH
         try:
-            res = self._do_fetch(robots_url)
-        except Exception as e:  # 网络错误 / 超时 / TLS 失败
+            res = self._fetch_robots(robots_url)
+        except Exception as e:  # 网络错误 / 超时 / TLS 失败（已重试过）
             logger.warning("robots 不可达（%s）：%s → 保守禁止", robots_url, e)
             return _Entry(deny_all=True, note=f"fetch error: {e}", robots_url=robots_url)
 
@@ -149,6 +162,19 @@ class RobotsCache:
         rp = RobotFileParser()
         rp.parse(body.splitlines())
         return _Entry(rp=rp, note="parsed", robots_url=robots_url)
+
+    def _fetch_robots(self, robots_url: str) -> FetchResult:
+        """带重试的 robots.txt 抓取。只重试**异常**；HTTP 状态码不重试
+        （403/404 在 _load 里各有语义，重试它们没有意义）。"""
+        last: Exception | None = None
+        for attempt in range(_ROBOTS_ATTEMPTS):
+            try:
+                return self._do_fetch(robots_url)
+            except Exception as e:  # noqa: BLE001 —— 网络层错误类型太杂，统一兜住重试
+                last = e
+                if attempt < _ROBOTS_ATTEMPTS - 1:
+                    time.sleep(_ROBOTS_BACKOFF_S[attempt])
+        raise last  # type: ignore[misc]
 
     def _do_fetch(self, robots_url: str) -> FetchResult:
         if self._fetch is not None:

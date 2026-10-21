@@ -10,7 +10,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from kwsearch.sanitize import Sanitizer  # noqa: E402
+from kwsearch.sanitize import Sanitizer, is_list_url  # noqa: E402
 
 
 class TestScrub(unittest.TestCase):
@@ -92,6 +92,63 @@ class TestCheckUrl(unittest.TestCase):
         self.assertEqual(Sanitizer({"max_per_domain": 12}).max_per_domain, 12)
         self.assertEqual(Sanitizer({}).max_per_domain, 0)
         self.assertEqual(Sanitizer({"max_per_domain": -3}).max_per_domain, 0)
+
+
+class TestListUrl(unittest.TestCase):
+    """列表页/站点首页拦截：点开一条结果要看到正文，不是一屏目录。
+
+    规则是内置的（不走配置），因为它是 URL 形态判断，和 .zip/.exe 同一性质。
+    样本全部来自百度 `site:官网域` 查询的真实返回。
+    """
+
+    def test_real_list_pages_dropped(self) -> None:
+        for u in (
+            "https://www.xxx.edu.cn/xsjs/list38.htm",     # 学术动态
+            "https://www.xxx.edu.cn/677/list3.htm",       # 院系风采
+            "https://www.xxx.edu.cn/_s2/677/list.psp",
+            "https://www.xxx.edu.cn/55/list21.psp",       # 校园动态
+            "https://www.xxx.edu.cn/85/list1.htm",        # 党员管理
+            "https://www.xxx.edu.cn/53/list19.psp",       # 校园新闻
+            "https://www.xxx.edu.cn/677/list50.psp",
+        ):
+            self.assertTrue(is_list_url(u), u)
+
+    def test_homepage_dropped(self) -> None:
+        self.assertTrue(is_list_url("https://www.xxx.edu.cn/"))
+        self.assertTrue(is_list_url("https://www.xxx.edu.cn"))
+        self.assertTrue(is_list_url("https://www.xxx.edu.cn/index.htm"))
+        self.assertTrue(is_list_url("https://a.com/main.aspx"))
+
+    def test_article_pages_survive(self) -> None:
+        # 同站文章页形态：/日期/栏目ID/page.htm —— "page" 不在词表里
+        for u in (
+            "https://zsb.xxx.edu.cn/2021/0525/c282a3495/page.htm",
+            "https://www.xxx.edu.cn/2019/0426/c90a139/page.htm",
+            "https://jwc.xxx.edu.cn/2025/1120/c186a21918/page.htm",
+        ):
+            self.assertFalse(is_list_url(u), u)
+
+    def test_list_word_inside_segment_survives(self) -> None:
+        # 整段精确匹配，不做子串："my-list-of-tools" 不是列表页
+        self.assertFalse(is_list_url("https://example.com/2024/my-list-of-tools.html"))
+        self.assertFalse(is_list_url("https://example.com/posts/listing-rules"))
+
+    def test_query_and_fragment_ignored(self) -> None:
+        self.assertTrue(is_list_url("https://example.com/list?page=2#top"))
+        self.assertFalse(is_list_url("https://example.com/post/1?from=list"))
+
+    def test_empty_url_not_dropped(self) -> None:
+        self.assertFalse(is_list_url(""))
+
+    def test_check_url_reports_reason(self) -> None:
+        s = Sanitizer({})
+        self.assertIn("列表页", s.check_url("https://a.com/x/list1.htm") or "")
+        self.assertIsNone(s.check_url("https://a.com/x/page.htm"))
+
+    def test_org_probe_path_not_affected(self) -> None:
+        # 机构官网探测要的恰恰是首页/列表页来认域名 —— 它不走 check_url，
+        # 这里守住 is_list_url 本身对首页返回 True（探测侧不使用本函数）
+        self.assertTrue(is_list_url("https://www.example.edu.cn/"))
 
 
 class TestRelate(unittest.TestCase):

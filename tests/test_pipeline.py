@@ -15,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from kwsearch import discover  # noqa: E402
 from kwsearch.config import load_config  # noqa: E402
+from kwsearch.fetch import BaseFetcher, FetchError, FetchResult  # noqa: E402
 from kwsearch.models import Candidate, ChannelResult  # noqa: E402
 from kwsearch.person import parse_person  # noqa: E402
 from kwsearch.pipeline import run_task  # noqa: E402
@@ -82,11 +83,17 @@ def fake_compound(keyword: str, offset: int, ctx) -> ChannelResult:  # noqa: ANN
     ], "fake_compound", keyword)
 
 
+def fake_single(keyword: str, offset: int, ctx) -> ChannelResult:  # noqa: ANN001
+    """单次配额通道（channels.yaml 里 variants: false）：只该收到基词一次。"""
+    return _mk(_SERP_ITEMS[:2], "fake_single", keyword)
+
+
 discover._REGISTRY["fake_serp"] = fake_serp
 discover._REGISTRY["fake_zero"] = fake_zero
 discover._REGISTRY["fake_blocked"] = fake_blocked
 discover._REGISTRY["fake_paged"] = fake_paged
 discover._REGISTRY["fake_compound"] = fake_compound
+discover._REGISTRY["fake_single"] = fake_single
 
 
 def fake_person(keyword: str, offset: int, ctx) -> ChannelResult:  # noqa: ANN001
@@ -111,8 +118,82 @@ def fake_person_noname(keyword: str, offset: int, ctx) -> ChannelResult:  # noqa
     ], "fake_person_noname", keyword)
 
 
+def fake_baidu_person(keyword: str, offset: int, ctx) -> ChannelResult:  # noqa: ANN001
+    """百度（单人单次配额）：人名模式下只该收到「姓名 site:域」这一发。
+
+    返回的是**只有站内检索才捞得到**的目标人物深页 —— 裸姓名池里没有它
+    （2026-10-21 张军 + 计算机学院实测同款场景：site: 第一条就是本人主页）。
+    """
+    return _mk([
+        ("https://u1.example.edu.cn/deep/1", "【最美教师】张军教授：信息化浪潮席卷生活",
+         "张军，男，教授，研究方向网络安全与保密", "u1.example.edu.cn"),
+    ], "baidu_html", keyword)
+
+
+def fake_namesake(keyword: str, offset: int, ctx) -> ChannelResult:  # noqa: ANN001
+    """同名者：页面有姓名、没有机构锚点，域名也归不到任何机构（平台域/无关域）。"""
+    return _mk([
+        ("https://ent.example.com/1", "张军（歌手）_百科", "流行歌手，代表作……",
+         "ent.example.com"),
+        ("https://other.example.org/2", "张军 教授", "某大学教师", "other.example.org"),
+    ], "fake_namesake", keyword)
+
+
 discover._REGISTRY["fake_person"] = fake_person
 discover._REGISTRY["fake_person_noname"] = fake_person_noname
+discover._REGISTRY["fake_baidu_person"] = fake_baidu_person
+discover._REGISTRY["fake_namesake"] = fake_namesake
+
+
+def fake_listpage(keyword: str, offset: int, ctx) -> ChannelResult:  # noqa: ANN001
+    """返回一个栏目列表页 + 一条普通文章候选。
+
+    列表页仿计算机学院官网同款形态（/xsjs/list38.htm），页内锚文本里
+    藏着两条含关键词的文章 —— 只有抓下列表页才拿得到。
+    摘要里带关键词：真实百度返回列表页时，摘要引用的正是页内匹配片段。
+    """
+    return _mk([
+        ("https://u1.example.edu.cn/xsjs/list38.htm", "学术动态",
+         "红黑树系列讲座公告栏目，含历年讲座安排", "u1.example.edu.cn"),
+        ("https://u2.example.edu.cn/2021/0525/c282a3495/page.htm",
+         "红黑树讲座顺利开讲", "本次讲座介绍红黑树原理与旋转操作", "u2.example.edu.cn"),
+    ], "fake_listpage", keyword)
+
+
+def fake_listpage_dead(keyword: str, offset: int, ctx) -> ChannelResult:  # noqa: ANN001
+    """列表页摘要含关键词（所以能进池），但页内锚文本没有一个含关键词：
+    这才是「解析不出文章」的场景 —— 丢弃并说明原因。"""
+    return _mk([
+        ("https://u1.example.edu.cn/677/list3.htm", "院系风采",
+         "红黑树相关活动的院系展示栏目", "u1.example.edu.cn"),
+    ], "fake_listpage_dead", keyword)
+
+
+discover._REGISTRY["fake_listpage"] = fake_listpage
+discover._REGISTRY["fake_listpage_dead"] = fake_listpage_dead
+
+
+# --------------------------------------------------------------- 假 fetcher
+class _FakeFetcher(BaseFetcher):
+    """按 URL 查表返回；表外一律 404（robots.txt 也走这条 → 视为无限制）。"""
+
+    name = "fake"
+
+    def __init__(self, pages: dict[str, str]) -> None:
+        self.pages = pages
+        self.calls: list[str] = []
+
+    def fetch(self, url: str, headers: dict[str, str], timeout: int = 20) -> FetchResult:
+        self.calls.append(url)
+        body = self.pages.get(url)
+        if body is None:
+            raise FetchError("404 not found", status=404, kind="http")
+        raw = body.encode("utf-8")
+        return FetchResult(
+            status=200, body=body, raw=raw,
+            content_type="text/html; charset=utf-8",
+            final_url=url, content_bytes=len(raw), fetcher=self.name,
+        )
 
 
 # --------------------------------------------------------------- 配置
@@ -135,7 +216,7 @@ filter:
   pii_patterns: {{}}
   drop_url_patterns: ["\\\\.(zip|exe)$"]
   drop_domains: []
-  max_per_domain: 2
+  max_per_domain: {max_per_domain}
   drop_zero_hit: {drop_zero}
 limits:
   max_docs: {max_docs}
@@ -145,8 +226,9 @@ extract:
   challenge_keywords: ["安全验证"]
   # 这里的通道全是假的（fake.test），没有真实页面可抓。
   # 不关掉的话会在每条候选上真的发一次 DNS 超时，把 1 秒的单测拖到 17 秒。
-  fetch_body: false
-crawl: {{}}
+  # 列表页解析测试显式传 fetch_body: true，并注入假 fetcher。
+  fetch_body: {fetch_body}
+crawl: {crawl}
 """
 
 _SERP_CH = """
@@ -200,6 +282,19 @@ _COMPOUND_CH = """
     assertions: {min_items: 1, required_fields: [url, title]}
 """
 
+# 单次配额通道（百度 2026-10-21 实测：第二次请求就出图形验证码）：
+# variants: false 的 serp 通道必须只打基词一次，走 _run_paged 而不是 _run_serp。
+_SINGLE_CH = """
+  - id: fake_single
+    type: serp
+    parser: fake_single
+    url_template: "https://fake.test/single?q={q}"
+    variants: false
+    paging: {mode: none}
+    throttle: {min_interval_s: 0}
+    assertions: {min_items: 1, required_fields: [url, title]}
+"""
+
 _PERSON_CH = """
   - id: fake_person
     type: serp
@@ -222,6 +317,106 @@ _PERSON_NONAME_CH = """
     assertions: {min_items: 1, required_fields: [url, title]}
 """
 
+# 百度（id 必须是 baidu_html：pipeline 按 id 认出"认 site: 的单发通道"）。
+# variants: false = 单人单次配额，第 2 请求就出安全验证（2026-10-21 实测）。
+_PERSON_BAIDU_CH = """
+  - id: baidu_html
+    type: serp
+    parser: fake_baidu_person
+    url_template: "https://fake.test/bd?q={q}"
+    variants: false
+    paging: {mode: none}
+    throttle: {min_interval_s: 0}
+    assertions: {min_items: 1, required_fields: [url, title]}
+"""
+
+# serp 型但永远被拦：验机构探测"被拦即收手"。
+# 注意不能带 variants:false —— 单发配额通道不参与探测（那是另一条规则），
+# 这个通道要验的恰恰是"探测被拦"这条路径。
+_BLOCKED_SERP_CH = """
+  - id: fake_blocked_serp
+    type: serp
+    parser: fake_blocked
+    url_template: "https://fake.test/bs?q={q}"
+    paging: {mode: none}
+    throttle: {min_interval_s: 0}
+    assertions: {min_items: 1, required_fields: [url, title]}
+"""
+
+# 同名者通道：探不到官网域（结果全是平台域/无关域），用于验"机构未命中"告警
+_PERSON_NAMESAKE_CH = """
+  - id: fake_namesake
+    type: serp
+    parser: fake_namesake
+    url_template: "https://fake.test/ns?q={q}"
+    variants: false
+    paging: {mode: none}
+    throttle: {min_interval_s: 0}
+    assertions: {min_items: 1, required_fields: [url, title]}
+"""
+
+# 列表页通道：候选里混着栏目页（list38.htm 同款形态）
+_LISTPAGE_CH = """
+  - id: fake_listpage
+    type: serp
+    parser: fake_listpage
+    url_template: "https://fake.test/lp?q={q}&first={offset}"
+    paging: {mode: offset, param: first, start: 1, step: 10, max_pages: 1}
+    throttle: {min_interval_s: 0}
+    assertions: {min_items: 1, required_fields: [url, title]}
+"""
+
+# 死列表页通道：页内没有任何含关键词的文章
+_LISTPAGE_DEAD_CH = """
+  - id: fake_listpage_dead
+    type: serp
+    parser: fake_listpage_dead
+    url_template: "https://fake.test/lpd?q={q}&first={offset}"
+    paging: {mode: offset, param: first, start: 1, step: 10, max_pages: 1}
+    throttle: {min_interval_s: 0}
+    assertions: {min_items: 1, required_fields: [url, title]}
+"""
+
+# 单发配额 serp 通道（variants:false）：机构探测不许打它，子弹留给主查询
+_SINGLE_PROBE_CH = """
+  - id: fake_single_probe
+    type: serp
+    parser: fake_serp
+    url_template: "https://fake.test/sp?q={q}"
+    variants: false
+    paging: {mode: none}
+    throttle: {min_interval_s: 0}
+    assertions: {min_items: 1, required_fields: [url, title]}
+"""
+
+# 列表页样本：两条锚文本含「红黑树」的文章 + 一条不含 + 一条导航
+_LIST_HTML = """<html><head><title>学术动态</title></head><body>
+<div class="list">
+  <a href="/2019/0426/c90a139/page.htm">红黑树十周年：算法思想的信息化浪潮</a>
+  <a href="/2025/0508/c676a19624/page.htm">激发创新活力，校园大赛决赛圆满落幕</a>
+  <a href="/2021/0525/c282a3495/page.htm">红黑树首次全校公开课顺利开讲</a>
+</div>
+<nav><a href="/">首页</a><a href="/sitemap.htm">网站地图</a></nav>
+</body></html>"""
+
+# 文章正文页（够长，能过 min_body_chars，顺带验正文抽取不受影响）
+_ARTICLE_HTML = """<html><head><title>红黑树公开课</title>
+<script type="application/ld+json">{"datePublished":"2021-05-25T10:00:00+08:00"}</script>
+</head><body><div class="article-body">
+<p>红黑树是一种自平衡二叉查找树，本次公开课系统讲解它的五条性质与旋转操作。</p>
+<p>课堂上演示了插入与删除过程中的左旋右旋，以及变色如何维持黑高平衡。</p>
+<p>听课师生就工程实践中 map 与 set 的红黑树实现进行了提问与讨论。</p>
+</div></body></html>"""
+
+# 死列表页：锚文本里没有任何关键词
+_LIST_HTML_DEAD = """<html><head><title>院系风采</title></head><body>
+<div class="list">
+  <a href="/a/1/page.htm">计算机学院简介</a>
+  <a href="/a/2/page.htm">管理学院简介</a>
+</div>
+<nav><a href="/">首页</a></nav>
+</body></html>"""
+
 
 class RunCase(unittest.TestCase):
     def setUp(self) -> None:
@@ -233,11 +428,15 @@ class RunCase(unittest.TestCase):
         self.tmp.cleanup()
 
     def cfg(self, channels: str, max_docs: int = 20, *,
-            drop_zero_hit: bool = True):
+            drop_zero_hit: bool = True, max_per_domain: int = 2,
+            fetch_body: bool = False, crawl: str = "{}"):
         p = self.dir / "channels.yaml"
         p.write_text(_BASE.format(
             channels=channels, max_docs=max_docs,
             drop_zero="true" if drop_zero_hit else "false",
+            max_per_domain=max_per_domain,
+            fetch_body="true" if fetch_body else "false",
+            crawl=crawl,
         ), encoding="utf-8")
         return load_config(p)
 
@@ -405,8 +604,12 @@ class TestPersonMode(RunCase):
         # 都会触发 Bing 静默降级（见 discover/quality.py）
         p = parse_person("张军", ["甲大学计算机学院"])
         self.run_kw(self.cfg(_PERSON_CH), keyword="张军", person=p)
-        qs = self.rows("SELECT query_text FROM query WHERE channel='fake_person'")
-        self.assertEqual([q["query_text"] for q in qs], ["张军"])
+        qs = self.rows("SELECT query_text FROM query WHERE channel='fake_person'"
+                       " ORDER BY seq")
+        # 裸姓名之外只有机构域探测（负 seq，排在前面）：它不发"姓名+词"，
+        # 没有降级风险；探测只用来推导官网域，候选不进文档池。
+        self.assertEqual([q["query_text"] for q in qs],
+                         ["[机构探测] 甲大学计算机学院", "张军"])
 
     def test_no_anchor_alerts(self) -> None:
         p = parse_person("张军")          # 没有机构/方向锚点
@@ -436,6 +639,166 @@ class TestPersonMode(RunCase):
         hit = [a for a in alerts if a["kind"] == "person_name_missing"]
         self.assertTrue(hit)
         self.assertIn("1 条", hit[0]["detail"])
+
+
+class TestPersonOrgScoping(RunCase):
+    """2026-10-21：机构锚点从"只打分"变成"也检索"。
+
+    病因（张军 + 某某大学计算机学院实测）：裸姓名池被名人同名者占满
+    （23 条里 0 条目标机构），机构锚点没有配套检索动作就永远打空，
+    报告于是只剩一堆同名者。修复三件套：
+      1. 官网域探测：先搜机构名拿官网域（Bing，候选不进池）
+      2. 百度站内检索：「姓名 site:域」**替代**裸姓名（单人单次配额）
+      3. 域名归因证据：页面在机构官网域上 = 强锚点（中文站通篇"我校"，
+         机构全称常常一个字都不出现）
+    """
+
+    def _both(self, **kw):
+        p = parse_person("张军", ["甲大学计算机学院"], ["教授", "网络安全"])
+        return p, self.run_kw(self.cfg(_PERSON_CH + _PERSON_BAIDU_CH,
+                                        max_per_domain=5, **kw),
+                              keyword="张军", person=p)
+
+    def test_site_query_replaces_bare_name_on_baidu(self) -> None:
+        p, r = self._both()
+        qs = self.rows("SELECT query_text FROM query WHERE channel='baidu_html'")
+        # 只此一发，且必须是 site: 形态；裸姓名在百度侧是浪费（池子 Bing 已有）
+        self.assertEqual([q["query_text"] for q in qs],
+                         ["张军 site:example.edu.cn"])
+
+    def test_domain_evidence_confirms_deep_page(self) -> None:
+        p, r = self._both()
+        cards = {c["label"]: c for c in
+                 self.rows("SELECT label, tier, docs FROM person_card")}
+        card = cards.get("甲大学计算机学院")
+        self.assertIsNotNone(card, "官网域上的目标人物必须成卡")
+        self.assertEqual(card["tier"], "confirmed")
+        # 文本命中 2 条（u1/u2）+ 域名命中 1 条（深页，标题没有机构全称）
+        self.assertEqual(card["docs"], 3)
+        tiers = {t: n for t, n in r.person_tiers.items() if n}
+        self.assertEqual(tiers.get("confirmed"), 1)
+        # 域名命中的证据要标注出来：看的人能分清"页面写了校名"和"站在人家网站上"
+        ev = self.rows("SELECT evidence_json FROM person_card"
+                       " WHERE label='甲大学计算机学院'")[0]["evidence_json"]
+        self.assertIn("（官网域名）", ev)
+        self.assertIn("最美教师", ev)
+
+    def test_no_org_no_probe_no_override(self) -> None:
+        p = parse_person("张军", [], ["教授"])       # 没有机构锚点
+        r = self.run_kw(self.cfg(_PERSON_CH + _PERSON_BAIDU_CH, max_per_domain=5),
+                        keyword="张军", person=p)
+        qs = self.rows("SELECT query_text FROM query WHERE channel='fake_person'")
+        self.assertEqual([q["query_text"] for q in qs], ["张军"])
+        qs = self.rows("SELECT query_text FROM query WHERE channel='baidu_html'")
+        self.assertEqual([q["query_text"] for q in qs], ["张军"])   # 照旧裸姓名
+
+    def test_org_probe_blocked_stops_discovery(self) -> None:
+        # 机构查询被拦：探测整体收手，绝不多打（项目铁律：不加重风控）
+        p = parse_person("张军", ["甲大学计算机学院"])
+        r = self.run_kw(self.cfg(_BLOCKED_SERP_CH), keyword="张军", person=p)
+        qs = self.rows("SELECT query_text, blocked FROM query"
+                       " WHERE channel='fake_blocked_serp' ORDER BY seq")
+        self.assertEqual([q["query_text"] for q in qs],
+                         ["[机构探测] 甲大学计算机学院", "张军"])
+        self.assertEqual(qs[0]["blocked"], 1)
+        self.assertEqual(r.kept, 0)
+
+    def test_org_unmatched_alerted(self) -> None:
+        # 给了机构却一条都没命中：必须留下"为什么没有"的告警 ——
+        # 只显示"候选人 0 个"的话，用户会以为这人没上网
+        # （2026-10-21 张军实测：23 条同名者，0 条目标机构）
+        p = parse_person("张军", ["甲大学计算机学院"])
+        r = self.run_kw(self.cfg(_PERSON_NAMESAKE_CH), keyword="张军", person=p)
+        hit = [a for a in
+               self.rows("SELECT kind, detail FROM alert WHERE task_id=?", r.task_id)
+               if a["kind"] == "person_org_unmatched"]
+        self.assertTrue(hit, "机构未命中必须告警")
+        self.assertIn("同名者", hit[0]["detail"])
+        # 没有机构命中 → 唯一一张卡是折叠的"未匹配机构"
+        labels = [c["label"] for c in self.rows("SELECT label FROM person_card")]
+        self.assertEqual(labels, ["未匹配机构"])
+
+    def test_org_text_hit_no_unmatched_alert(self) -> None:
+        # 文本命中机构时不出未命中告警（探到域并做了站内检索，更不算"未尝试"）
+        p = parse_person("张军", ["甲大学计算机学院"])
+        r = self.run_kw(self.cfg(_PERSON_CH), keyword="张军", person=p)
+        kinds = [a["kind"] for a in
+                 self.rows("SELECT kind FROM alert WHERE task_id=?", r.task_id)]
+        self.assertNotIn("person_org_unmatched", kinds)
+
+
+class TestListResolution(RunCase):
+    """2026-10-21：栏目列表页不当结果，但它链着的相关文章是。
+
+    用户原话：「结合上个版本的爬取结果，我只是增加要求尽量能够跳转到原文章」——
+    所以处理方式是**抓下列表页、把含关键词的文章捞出来当结果**（链接直指正文），
+    而不是把整页丢掉了事（丢页 = 把页里的文章一起丢）。百度 site: 查询返回
+    列表页的原因就是列表里链着目标文章。
+    """
+
+    def _pages(self) -> dict[str, str]:
+        base = "https://u1.example.edu.cn"
+        return {
+            f"{base}/xsjs/list38.htm": _LIST_HTML,
+            f"{base}/2019/0426/c90a139/page.htm": _ARTICLE_HTML,
+            f"{base}/2021/0525/c282a3495/page.htm": _ARTICLE_HTML,
+            "https://u2.example.edu.cn/2021/0525/c282a3495/page.htm": _ARTICLE_HTML,
+        }
+
+    def test_list_page_resolved_to_articles(self) -> None:
+        fake = _FakeFetcher(self._pages())
+        r = self.run_kw(self.cfg(_LISTPAGE_CH, fetch_body=True,
+                                 crawl="{robots_obey: false, per_domain_qps: 0}"),
+                        keyword="红黑树", fetcher=fake)
+        # 列表页里的 2 篇相关文章进池；不含关键词的那条锚文本不进
+        self.assertEqual(r.resolved_list, 2)
+        docs = {d["url_raw"]: d["title"] for d in
+                self.rows("SELECT url_raw, title FROM doc")}
+        # 列表页本身不在库里；它的文章在，且标题是锚文本（点开就是正文）
+        self.assertNotIn("https://u1.example.edu.cn/xsjs/list38.htm", docs)
+        self.assertIn("红黑树十周年：算法思想的信息化浪潮", docs.values())
+        self.assertIn("红黑树首次全校公开课顺利开讲", docs.values())
+        # 来源通道的普通候选不受影响
+        self.assertIn("红黑树讲座顺利开讲", docs.values())
+        # 告警说清"哪个列表页解析出了什么"
+        hit = [a for a in
+               self.rows("SELECT kind, detail FROM alert WHERE task_id=?", r.task_id)
+               if a["kind"] == "resolved"]
+        self.assertTrue(hit, "列表页解析必须记账")
+        self.assertIn("list38.htm", hit[0]["detail"])
+
+    def test_dead_list_page_dropped_with_reason(self) -> None:
+        # 页内没有含关键词的文章：丢弃，但原因要写进告警（不能静默消失）
+        fake = _FakeFetcher({"https://u1.example.edu.cn/677/list3.htm": _LIST_HTML_DEAD})
+        r = self.run_kw(self.cfg(_LISTPAGE_DEAD_CH, fetch_body=True,
+                                 crawl="{robots_obey: false, per_domain_qps: 0}"),
+                        keyword="红黑树", fetcher=fake)
+        self.assertEqual(r.resolved_list, 0)
+        self.assertEqual(r.kept, 0)
+        hit = [a for a in
+               self.rows("SELECT kind, detail FROM alert WHERE task_id=?", r.task_id)
+               if a["kind"] == "dropped"]
+        self.assertTrue(hit, "解析不出文章的列表页必须记账")
+        self.assertIn("栏目列表页", hit[0]["detail"])
+        self.assertIn("没有含关键词的文章", hit[0]["detail"])
+
+    def test_no_body_mode_drops_list_page(self) -> None:
+        # --no-body：一个请求都不发，列表页维持丢弃（不能凭空解析）
+        r = self.run_kw(self.cfg(_LISTPAGE_CH, fetch_body=False),
+                        keyword="红黑树")
+        self.assertEqual(r.resolved_list, 0)
+        urls = [d["url_raw"] for d in self.rows("SELECT url_raw FROM doc")]
+        self.assertNotIn("https://u1.example.edu.cn/xsjs/list38.htm", urls)
+
+    def test_single_shot_channel_skipped_by_org_probe(self) -> None:
+        # 单发配额通道（variants:false）不参与机构探测：那一发子弹必须留给
+        # 主查询的「姓名 site:官网域」。探测打它 = 用子弹换 Bing 已能问到的域名
+        # （2026-10-21 实测：探测打百度 → 主查询必吃验证码）
+        p = parse_person("张军", ["甲大学计算机学院"])
+        self.run_kw(self.cfg(_SINGLE_PROBE_CH), keyword="张军", person=p)
+        qs = [q["query_text"] for q in
+              self.rows("SELECT query_text FROM query WHERE channel='fake_single_probe'")]
+        self.assertEqual(qs, ["张军"])       # 只有主查询，没有 [机构探测]
 
 
 class TestLimits(RunCase):
@@ -495,6 +858,30 @@ class TestRepository(RunCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["score"], 4.0)
         conn.close()
+
+
+class TestSingleQuotaChannel(RunCase):
+    """variants: false 的 serp 通道（百度式单次配额）只打基词一次。"""
+
+    def test_single_channel_gets_base_query_only(self) -> None:
+        r = self.run_kw(self.cfg(_SINGLE_CH))
+        qs = self.rows("SELECT * FROM query WHERE task_id=? AND channel='fake_single'",
+                       r.task_id)
+        self.assertEqual(len(qs), 1)                  # 一次请求，没有变体
+        self.assertEqual(qs[0]["query_text"], "红黑树")
+        self.assertEqual(qs[0]["got_count"], 2)
+
+    def test_variants_channel_still_expands(self) -> None:
+        # 对照组：同一份配置里普通 serp 照旧走变体矩阵，开关没有全局副作用
+        cfg = self.cfg(_SERP_CH + _SINGLE_CH)
+        r = self.run_kw(cfg)
+        serp_qs = self.rows("SELECT * FROM query WHERE task_id=? AND channel='fake_serp'",
+                            r.task_id)
+        single_qs = self.rows("SELECT * FROM query WHERE task_id=? AND channel='fake_single'",
+                              r.task_id)
+        self.assertGreaterEqual(len(serp_qs), 2)      # 基词 + 变体
+        self.assertEqual(len(single_qs), 1)           # 仍然只有基词
+        self.assertTrue(all(q["query_text"] == "红黑树" for q in single_qs))
 
 
 if __name__ == "__main__":

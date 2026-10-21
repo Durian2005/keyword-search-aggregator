@@ -139,12 +139,17 @@ def probe_profile(cands: Sequence[Any]) -> str:
 @dataclass(frozen=True, slots=True)
 class QueryVariant:
     q: str
-    strategy: str          # base | suffix | extra
+    strategy: str          # base | suffix | extra | org_site | org_text
     priority: int          # 0 = 基词，越大越靠后
+    channels: tuple[str, ...] = ()   # 限定只在哪些通道上打；空 = 所有 serp 通道
+                                     # （site: 只有百度认，投 Bing 只会白白降级）
 
     @property
     def is_base(self) -> bool:
         return self.strategy == "base"
+
+    def for_channel(self, channel_id: str) -> bool:
+        return not self.channels or channel_id in self.channels
 
 
 def query_key(q: str) -> str:

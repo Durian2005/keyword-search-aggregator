@@ -205,6 +205,39 @@ class TestPersonSection(unittest.TestCase):
         self.assertIn("演艺", out)
 
 
+class TestPersonDocsPool(unittest.TestCase):
+    """人名模式的文档清单必须自称"池子"，并标出已归因条目。
+
+    2026-10-21 张军实测：23 条池子里 1 条是目标人物，其余全是同名者 ——
+    不把清单定性为"池子"、不把目标条目标出来，用户会把整份报告
+    读成"搜出来的都是些什么玩意"。
+    """
+
+    def _data(self, cards: list) -> dict:
+        d = _base_data()
+        d["person_cards"] = cards
+        return d
+
+    def _card(self, label: str) -> dict:
+        return {"label": label, "tier": "confirmed", "docs": 1, "score": 7,
+                "org_hits": 1, "weak_hits": 1, "negatives": [],
+                "evidence": [{"title": "目标人物主页",
+                              "url": "https://a.example.com/1",
+                              "matched": [label]}]}
+
+    def test_person_mode_relabels_docs_section(self) -> None:
+        out = render_html(self._data([self._card("甲大学")]))
+        self.assertIn("同名结果池", out)
+        self.assertIn("不是结论", out)
+        self.assertIn("已归因", out)          # a.example.com/1 是卡片证据 → 打标
+
+    def test_normal_mode_keeps_original_heading(self) -> None:
+        out = render_html(_base_data())
+        self.assertIn("按相关度降序", out)
+        self.assertNotIn("同名结果池", out)
+        self.assertNotIn("已归因", out)
+
+
 class TestClusterFunnel(unittest.TestCase):
     """归并对账那几行：数字要分得清"有救的"和"没救的"。
 

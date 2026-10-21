@@ -70,6 +70,9 @@ _ALERT_CN = {
     "robots_disallow": "robots 禁止",
     "js_required": "需要 JS 渲染",
     "no_fingerprint": "无正文指纹（未参与归并）",
+    "person_name_missing": "人名未出现在页面",
+    "person_no_anchor": "人名模式缺锚点",
+    "person_org_unmatched": "机构锚点未命中",
 }
 
 # regex_updated 也算不可信：它是"页面最近被改过"的时间，不是发布时间，
@@ -631,6 +634,8 @@ def _doc_card(
     d: Mapping[str, Any],
     cluster: Mapping[str, Any] | None = None,
     others: Sequence[Mapping[str, Any]] = (),
+    *,
+    attributed: bool = False,
 ) -> str:
     url = _safe_url(d.get("url_raw") or d.get("url_canon"))
     title = _esc(d.get("title") or "(无标题)")
@@ -638,6 +643,12 @@ def _doc_card(
         if url else title
 
     chips = [f'<span class="tag">{_esc(d.get("domain"))}</span>']
+
+    # 人名模式：这条是候选人卡片里的证据（机构归因通过）——
+    # 同名池子里绝大多数是名人同名者，不标出来读者根本找不着目标人物。
+    if attributed:
+        chips.append('<span class="tag ok" title="已通过机构/方向锚点归因，'
+                     '是上方某张候选人卡片的证据">已归因</span>')
 
     # 有没有抓到正文，决定了这条摘要的"成色"：正文摘要是文章自己的开头，
     # 没有正文时用的是搜索引擎替我们写的那句话。不标出来，读者会以为是同一回事。
@@ -725,8 +736,9 @@ def _candidates(cards: Sequence[Mapping[str, Any]]) -> str:
     if not named:
         body.append(
             '<div class="empty">没有任何结果命中你给的机构锚点。'
-            "这不等于“没有这个人”，只说明这一轮的结果里没有能归因的证据 —— "
-            "换更常用的机构全称、或补一个方向锚点再跑一次。</div>")
+            "这不等于“没有这个人”，只说明这一轮的结果里没有能归因的证据。"
+            "已按机构名探测官网域并做站内检索（百度 site:）；仍无命中时，"
+            "可换更常用的机构全称、或补一个方向锚点再跑一次。</div>")
     for c in named:
         tier = str(c.get("tier") or "unrelated")
         negs = "、".join(str(x) for x in (c.get("negatives") or []))
@@ -767,6 +779,9 @@ def _docs(
     items: Sequence[Mapping[str, Any]],
     totals: Mapping[str, Any],
     clusters: Sequence[Mapping[str, Any]] = (),
+    *,
+    person_mode: bool = False,
+    attributed_urls: set[str] | None = None,
 ) -> str:
     if not items:
         return """
@@ -799,7 +814,8 @@ def _docs(
         cl = by_rep.get(u)
         others = ([m for m in (cl.get("members") or ())
                    if str(m.get("url_canon") or "") != u] if cl else [])
-        cards.append(_doc_card(d, cl, others))
+        cards.append(_doc_card(d, cl, others,
+                               attributed=u in (attributed_urls or set())))
 
     shown = len(cards)
     total = int(totals.get("docs") or shown)
@@ -814,12 +830,29 @@ def _docs(
             f'上列某一条正文高度重合，收在“另有 N 篇”里。'
             f'判定用的是正文指纹（字符 3-gram SimHash），不是标题相似度 —— '
             f'转载方改标题是常态。保留作代表的是簇内正文最完整的那一篇。</p>')
+    # 人名模式：清单必须自己说清楚"我是池子不是结论"。
+    # 2026-10-21 张军实测：23 条池子里 1 条是目标人物，其余全是同名者 ——
+    # 不写这一句，用户会把整份报告读成"搜出来的都是些什么玩意"。
+    if person_mode:
+        heading = ('<h2>文档清单<span class="sub">同名结果池 · '
+                   '仅「已归因」条目经过机构锚点筛选</span></h2>')
+        pool_hint = (
+            '<p class="hint"><b>这是裸姓名检索的原始池子，不是结论。</b>'
+            "人名模式下，搜索引擎对裸姓名返回的是“所有同名者”的名人堂"
+            "（院士、高管、演员、董事长……），目标人物若是普通教师或职员，"
+            "往往排不进前列。真正与机构/方向锚点对应的条目已标 <b>已归因</b>，"
+            "并汇总在上方「候选人」卡片里；其余条目只是“恰好同名”的线索，"
+            "不能当作这个人的信息。</p>")
+    else:
+        heading = '<h2>文档清单<span class="sub">按相关度降序</span></h2>'
+        pool_hint = (
+            '<p class="hint">分数 = 标题命中×3 + 摘要命中×1 + 精确短语×2 + 名次加成（≤1）。'
+            "“仅渠道匹配”表示标题和摘要里都没直接出现关键词，只是通道认为相关 —— "
+            "这部分通常在末尾，可视为待核实的弱信号。</p>")
     return f"""
 <section>
-  <h2>文档清单<span class="sub">按相关度降序</span></h2>
-  <p class="hint">分数 = 标题命中×3 + 摘要命中×1 + 精确短语×2 + 名次加成（≤1）。
-  “仅渠道匹配”表示标题和摘要里都没直接出现关键词，只是通道认为相关 ——
-  这部分通常在末尾，可视为待核实的弱信号。</p>
+  {heading}
+  {pool_hint}
   {merged_note}
   {note}
   <div class="panel"><div class="docs">{''.join(cards)}</div></div>
@@ -844,7 +877,9 @@ def _alerts(alerts: Sequence[Mapping[str, Any]]) -> str:
     for (channel, kind), details in grouped.items():
         cls = "bad" if kind in {"blocked", "challenge", "captcha", "rate_limit",
                                 "unknown_structure", "parse_fail", "fetch_fail"} \
-            else ("warn" if kind in {"limit_reached", "dropped", "robots_disallow"} else "")
+            else ("warn" if kind in {"limit_reached", "dropped", "robots_disallow",
+                                     "person_org_unmatched", "person_name_missing",
+                                     "person_no_anchor"} else "")
         shown = details[:3]
         more = (f'<div class="dim">…另有 {len(details) - len(shown)} 条同类</div>'
                 if len(details) > len(shown) else "")
@@ -906,6 +941,17 @@ def render_html(data: Mapping[str, Any]) -> str:
     tstats = task.get("stats") or {}
     max_per_domain = int(tstats.get("max_per_domain") or 0)
 
+    # 人名模式：文档清单是"同名结果池"，只有候选人卡片里的证据经过机构归因。
+    # 把卡片证据的 URL 收集起来，清单里对应的条目标个「已归因」——
+    # 否则用户扫一眼清单，看到的全是同名者，会以为整份报告都跑偏了
+    # （2026-10-21 张军实测：23 条池子里 1 条是目标人物，不标出来根本找不着）。
+    attributed_urls: set[str] = set()
+    for c in person_cards:
+        for e in c.get("evidence") or []:
+            u = str(e.get("url") or "")
+            if u:
+                attributed_urls.add(u)
+
     return f"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -924,7 +970,8 @@ def render_html(data: Mapping[str, Any]) -> str:
 {_domains(domains, max_per_domain)}
 {_timeline(timeline)}
 {_candidates(person_cards)}
-{_docs(docs, totals, clusters)}
+{_docs(docs, totals, clusters, person_mode=bool(person_cards),
+       attributed_urls=attributed_urls)}
 {_alerts(alerts)}
 </div>
 {_footer(task)}

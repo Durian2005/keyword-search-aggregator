@@ -21,7 +21,10 @@ from kwsearch.person import (  # noqa: E402
     anchor_warnings,
     build_cards,
     judge,
+    org_search_domains,
     parse_person,
+    person_site_queries,
+    registered_domain,
     summarize,
 )
 
@@ -266,6 +269,87 @@ class TestAnchorWarnings(unittest.TestCase):
     def test_no_org_warned(self) -> None:
         w = anchor_warnings(parse_person("张军", roles=["教授"]))
         self.assertTrue(any("没给机构锚点" in x for x in w))
+
+
+class TestOrgDomainTools(unittest.TestCase):
+    """2026-10-21 机构锚点检索三件套的纯函数部分。"""
+
+    def test_registered_domain_two_level_suffix(self) -> None:
+        # .edu.cn 是两级后缀：注册域要取三段，砍成 edu.cn 的话 site:edu.cn
+        # 等于全中国高校
+        self.assertEqual(registered_domain("www.xxx.edu.cn"), "xxx.edu.cn")
+        self.assertEqual(registered_domain("xxxy.xxx.edu.cn"), "xxx.edu.cn")
+        self.assertEqual(registered_domain("a.b.example.com.cn"), "example.com.cn")
+        self.assertEqual(registered_domain("zhuanlan.zhihu.com"), "zhihu.com")
+        self.assertEqual(registered_domain("mp.weixin.qq.com"), "qq.com")
+        self.assertEqual(registered_domain(""), "")
+        self.assertEqual(registered_domain("localhost"), "localhost")
+
+    def test_org_search_domains_picks_modal_non_platform(self) -> None:
+        # 机构查询结果：官网子域密集 → 取注册域；平台域即使出现也不选
+        cands = [
+            _C("官网", "https://www.xxx.edu.cn/"),
+            _C("教务处", "https://jwc.xxx.edu.cn/"),
+            _C("审计学院", "https://sjxy.xxx.edu.cn/"),
+            _C("母体", "https://www.yyy.edu.cn/"),
+            _C("百科", "https://baike.baidu.com/item/x"),
+            _C("新闻", "https://www.sohu.com/a/1"),
+        ]
+        self.assertEqual(org_search_domains(cands), ["xxx.edu.cn"])
+
+    def test_org_search_domains_min_count(self) -> None:
+        # 只出现一次的域不认（可能是篇巧合挂在外站的新闻）
+        cands = [_C("x", "https://a.edu.cn/1"), _C("y", "https://b.edu.cn/2")]
+        self.assertEqual(org_search_domains(cands), [])
+
+    def test_org_search_domains_empty(self) -> None:
+        self.assertEqual(org_search_domains([]), [])
+
+    def test_site_queries(self) -> None:
+        self.assertEqual(person_site_queries("张军", ["xxx.edu.cn"]),
+                         ["张军 site:xxx.edu.cn"])
+        self.assertEqual(person_site_queries("", ["xxx.edu.cn"]), [])
+        self.assertEqual(person_site_queries("张军", []), [])
+
+
+class TestJudgeDomainEvidence(unittest.TestCase):
+    """域名证据：页面就在机构官网域上 = 强锚点。
+
+    中文站点通篇自称"我校"，机构全称常常一个字都不出现 ——
+    没有这条证据，官网上的正确人物只能判「疑似」（2026-10-21 张军实测）。
+    """
+
+    def test_domain_only_is_likely(self) -> None:
+        j = judge("【最美教师】张军：信息化浪潮席卷生活", "教育是终身的事业", P,
+                  domain_orgs=("某某大学计算机学院",))
+        self.assertEqual(j.tier, TIER_LIKELY)
+        self.assertIn("某某大学计算机学院", j.orgs)
+        self.assertTrue(any("（官网域名）" in m for m in j.matches),
+                       "域名命中必须在证据行里标注，让人分清依据")
+
+    def test_domain_plus_weak_is_confirmed(self) -> None:
+        j = judge("【最美教师】张军教授", "研究方向网络安全与保密", P,
+                  domain_orgs=("某某大学计算机学院",))
+        self.assertEqual(j.tier, TIER_CONFIRMED)
+
+    def test_domain_and_text_hit_no_marker(self) -> None:
+        # 文本也写了校名：标注只留给"只靠域名"的情形
+        j = judge("张军-某某大学计算机学院 教授", "简介", P,
+                  domain_orgs=("某某大学计算机学院",))
+        self.assertEqual(j.tier, TIER_CONFIRMED)
+        self.assertEqual(j.matches[0], "某某大学计算机学院")
+
+    def test_domain_for_other_org_ignored(self) -> None:
+        # 域名不属于用户给的任何机构 → 不构成证据
+        j = judge("张军 教授", "简介", P, domain_orgs=("别的大学",))
+        self.assertEqual(j.tier, TIER_SUSPECT)
+        self.assertEqual(j.orgs, ())
+
+    def test_domain_without_name_still_unrelated(self) -> None:
+        # 姓名不在页面上：站在人家网站上也只是"机构页面"，不是这个人的证据
+        j = judge("师资队伍", "本院现有专任教师 120 人", P,
+                  domain_orgs=("某某大学计算机学院",))
+        self.assertEqual(j.tier, TIER_UNRELATED)
 
 
 if __name__ == "__main__":
