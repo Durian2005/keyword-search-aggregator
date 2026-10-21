@@ -262,6 +262,7 @@ td.dim{color:#4a6070}
         <summary>高级选项</summary>
         <div class="inner">
           <label class="check"><input type="checkbox" id="fetch_body" checked> 抓取正文</label>
+          <label class="check"><input type="checkbox" id="stealth"> 隐身抓取（Scrapling 浏览器档，可过 Cloudflare 挑战，需安装 <code>scrapling[fetchers]</code>）</label>
           <div class="field">
             <label for="max_docs">入库上限</label>
             <input type="number" id="max_docs" min="1" max="5000" placeholder="默认取配置" style="width:130px">
@@ -408,6 +409,7 @@ $("go").addEventListener("click", async () => {
     person: $("person").checked,
     orgs: $("orgs").value, fields: $("fields").value, roles: $("roles").value,
     fetch_body: $("fetch_body").checked,
+    stealth: $("stealth").checked,
     max_docs: $("max_docs").value || null,
     expand: $("expand").value || null,
   };

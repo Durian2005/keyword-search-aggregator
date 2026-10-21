@@ -112,6 +112,7 @@ def cmd_run(
     out_dir: str = "report",
     want_report: bool = True,
     fetch_body: bool | None = None,
+    stealth: bool = False,
     person: PersonQuery | None = None,
 ) -> int:
     from kwsearch.discover import registered_names
@@ -168,7 +169,7 @@ def cmd_run(
             cfg, keyword, mode=mode, timespan=timespan, db_path=db_path,
             max_docs=max_docs, expand=expand, require=require,
             no_filter=no_filter, progress=print, fetch_body=fetch_body,
-            person=person,
+            stealth=stealth, person=person,
         )
     except KeyboardInterrupt:
         # 中断也要能解释：已入库的部分留在库里，报告可以正常生成
@@ -438,7 +439,9 @@ def cmd_page(
     if policy.obey_robots:
         from kwsearch.fetch.robots import RobotsCache
 
-        robots = RobotsCache(fetcher, headers.get("User-Agent", "*"), timeout=10)
+        # 隐身档的 robots.txt 走轻量抓取器：为一行规则启动浏览器是纯浪费
+        robots_fetcher = getattr(fetcher, "robots_fetcher", None) or fetcher
+        robots = RobotsCache(robots_fetcher, headers.get("User-Agent", "*"), timeout=10)
 
     batch = fetch_pages(
         targets, policy,
@@ -910,6 +913,10 @@ def main(argv: list[str] | None = None) -> int:
                     help="不抓正文（摘要用搜索结果原文，快但信息量小）")
     pr.add_argument("--out", default="report", help="报告输出目录（默认 report/）")
     pr.add_argument("--no-report", action="store_true", help="只入库，不生成报告")
+    pr.add_argument("--stealth", action="store_true",
+                    help="正文抓取改用 Scrapling 隐身浏览器（可过 Cloudflare 挑战；"
+                         "需 pip install 'scrapling[fetchers]' && scrapling install；"
+                         "默认关闭，robots/不登录/不代理/不存全文的边界不变）")
     # ---- 人名模式（见 person.py）：查询侧只打裸姓名，收窄在结果侧做 ----
     pr.add_argument("--person", action="store_true",
                     help="人名模式：只打裸姓名，按机构/方向锚点在结果内归因，产出候选人卡片")
@@ -935,7 +942,9 @@ def main(argv: list[str] | None = None) -> int:
     pp.add_argument("--timeout", type=int, default=None, help="秒，默认取配置里的 20")
     pp.add_argument("--preview", type=int, default=200, help="预览字符数，0 = 不预览")
     pp.add_argument("--save", help="把响应体写到文件，便于离线调试抽取器")
-    pp.add_argument("--fetcher", default="auto", choices=["auto", "curl_cffi", "httpx"])
+    pp.add_argument("--fetcher", default="auto",
+                    choices=["auto", "curl_cffi", "httpx", "scrapling"],
+                    help="scrapling = 隐身浏览器档（需 scrapling[fetchers]）")
 
     pd = sub.add_parser("discover", help="跑一条通道的发现层，打印候选与断言；--offline/--expand 两种调试法")
     pd.add_argument("keyword")
@@ -970,7 +979,9 @@ def main(argv: list[str] | None = None) -> int:
                        help="额外打印每条正文前 N 字（看抽取质量用）")
     ppage.add_argument("--no-robots", action="store_true",
                        help="不检查 robots.txt（默认遵守 crawl.robots_obey）")
-    ppage.add_argument("--fetcher", default="auto", choices=["auto", "curl_cffi", "httpx"])
+    ppage.add_argument("--fetcher", default="auto",
+                       choices=["auto", "curl_cffi", "httpx", "scrapling"],
+                       help="scrapling = 隐身浏览器档（需 scrapling[fetchers]）")
 
     pext = sub.add_parser(
         "extract",
@@ -984,7 +995,9 @@ def main(argv: list[str] | None = None) -> int:
     pext.add_argument("--show", type=int, default=400, metavar="N",
                       help="每条打印正文前 N 字，0 = 只出表格")
     pext.add_argument("--no-robots", action="store_true", help="不检查 robots.txt")
-    pext.add_argument("--fetcher", default="auto", choices=["auto", "curl_cffi", "httpx"])
+    pext.add_argument("--fetcher", default="auto",
+                      choices=["auto", "curl_cffi", "httpx", "scrapling"],
+                      help="scrapling = 隐身浏览器档（需 scrapling[fetchers]）")
 
     pd = sub.add_parser("db", help="数据库维护")
     pd.add_argument("action", choices=["init", "clear"])
@@ -1018,6 +1031,7 @@ def main(argv: list[str] | None = None) -> int:
                 require=args.require, no_filter=args.no_filter,
                 out_dir=args.out, want_report=not args.no_report,
                 fetch_body=False if args.no_body else None,
+                stealth=args.stealth,
                 person=(parse_person(args.keyword, args.org, args.field, args.role)
                         if args.person else None),
             )

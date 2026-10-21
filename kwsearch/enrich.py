@@ -117,6 +117,7 @@ def enrich(
     cands: Sequence[Candidate],
     *,
     fetcher: BaseFetcher | None = None,
+    stealth: bool | dict | None = None,
     skip: Collection[str] = (),
     limit: int | None = None,
     progress: Progress | None = None,
@@ -158,7 +159,8 @@ def enrich(
     report.attempted = len(picked)
 
     policy = PagePolicy.from_config(cfg, limit=len(picked))
-    fetcher = fetcher or build_fetcher(str(cfg.defaults.get("fetcher", "auto")))
+    fetcher = fetcher or build_fetcher(str(cfg.defaults.get("fetcher", "auto")),
+                                       stealth=stealth)
     batch = fetch_pages(
         list(by_url),
         policy,

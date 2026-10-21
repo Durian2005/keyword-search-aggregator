@@ -43,6 +43,7 @@ class RunPayload:
     fields: tuple[str, ...] = ()
     roles: tuple[str, ...] = ()
     fetch_body: bool | None = None      # None = 听配置的
+    stealth: bool = False               # Scrapling 隐身浏览器档（默认关）
     max_docs: int | None = None
     expand: int | None = None
 
@@ -88,6 +89,10 @@ class RunPayload:
         if fetch_body is not None and not isinstance(fetch_body, bool):
             raise ValueError("fetch_body 必须是 true/false")
 
+        stealth = data.get("stealth", False)
+        if not isinstance(stealth, bool):
+            raise ValueError("stealth 必须是 true/false")
+
         return cls(
             keyword=keyword,
             person=bool(data.get("person")),
@@ -95,6 +100,7 @@ class RunPayload:
             fields=_anchors("fields"),
             roles=_anchors("roles"),
             fetch_body=fetch_body,
+            stealth=stealth,
             max_docs=_int_or_none("max_docs"),
             expand=_int_or_none("expand"),
         )

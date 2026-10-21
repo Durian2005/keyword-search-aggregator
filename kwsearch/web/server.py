@@ -107,6 +107,7 @@ def make_default_runner(cfg: object, db_path: str, out_dir: Path) -> Callable:
             expand=payload.expand,
             progress=log,
             fetch_body=payload.fetch_body,
+            stealth=payload.stealth,
             person=person,
         )
         for line in format_result_lines(result):

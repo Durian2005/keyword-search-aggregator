@@ -367,6 +367,19 @@ def _run_paged(
 # ------------------------------------------------------------------------- 主流程
 
 
+def _stealth_arg(cfg, stealth):
+    """隐身档开关的最终裁定：显式参数 > 配置 defaults.stealth.enabled。
+
+    返回 None = 不启用（build_fetcher 完全忽略 scrapling）；
+    返回 True/dict = 启用（dict 原样传给 StealthConfig.from_mapping）。
+    测试注入 fetcher 时两个阶段都不看这个值。
+    """
+    if stealth is not None:
+        return stealth
+    st = (cfg.defaults or {}).get("stealth") or {}
+    return st if st.get("enabled") else None
+
+
 def _enrich_stage(
     cfg: AppConfig,
     repo: Repository,
@@ -379,6 +392,7 @@ def _enrich_stage(
     deadline: float,
     fetcher=None,  # noqa: ANN001 —— 只在测试里注入假实现，生产走 build_fetcher
     fetch_body: bool | None = None,
+    stealth: bool | dict | None = None,
 ) -> tuple[list[tuple[float, Candidate, Mention]], dict[str, Enriched], EnrichReport | None]:
     """S3d：对"最可能入库"的那批抓正文，并用正文重算分数。
 
@@ -423,6 +437,7 @@ def _enrich_stage(
             cfg, [c for _, c, _ in head],
             skip=done, limit=cap,
             fetcher=fetcher,
+            stealth=_stealth_arg(cfg, stealth),
             progress=lambda m: say("    " + m),
             throttle=HostThrottle(qps, sleep=sleep),
         )
@@ -598,6 +613,7 @@ def _resolve_list_pages(
     deadline: float,
     fetcher=None,  # noqa: ANN001 —— 只在测试里注入假实现，生产走 build_fetcher
     fetch_body: bool | None = None,
+    stealth: bool | dict | None = None,
 ) -> tuple[int, int]:
     """把池子里的栏目列表页换成它链着的相关文章。返回 (新文章数, 丢弃的列表页数)。
 
@@ -626,7 +642,8 @@ def _resolve_list_pages(
 
     try:
         policy = PagePolicy.from_config(cfg, limit=len(list_keys))
-        f = fetcher or build_fetcher(str(cfg.defaults.get("fetcher", "auto")))
+        f = fetcher or build_fetcher(str(cfg.defaults.get("fetcher", "auto")),
+                                     stealth=_stealth_arg(cfg, stealth))
         batch = fetch_pages(
             list_keys, policy, fetcher=f,
             headers=default_headers(cfg.defaults),
@@ -687,6 +704,7 @@ def run_task(
     sleep: Callable[[float], None] = time.sleep,
     fetcher=None,  # noqa: ANN001 —— 单测注入假实现；生产不传，由 build_fetcher 挑
     fetch_body: bool | None = None,
+    stealth: bool | dict | None = None,
     person: PersonQuery | None = None,
 ) -> RunResult:
     """跑一次关键词任务。所有参数显式传入，不读全局状态。"""
@@ -922,7 +940,7 @@ def run_task(
     resolved_add, resolved_dropped = _resolve_list_pages(
         cfg, repo, task_id, seen, keyword,
         say=say, sleep=sleep, deadline=deadline,
-        fetcher=fetcher, fetch_body=fetch_body,
+        fetcher=fetcher, fetch_body=fetch_body, stealth=stealth,
     )
     result.resolved_list = resolved_add
     result.unique = len(seen)
@@ -961,7 +979,7 @@ def run_task(
         scored, enriched, enrich_rep = _enrich_stage(
             cfg, repo, task_id, keyword, scored,
             say=say, sleep=sleep, deadline=deadline,
-            fetcher=fetcher, fetch_body=fetch_body,
+            fetcher=fetcher, fetch_body=fetch_body, stealth=stealth,
         )
         if enrich_rep is not None:
             result.bodies_ok = enrich_rep.ok
