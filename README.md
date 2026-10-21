@@ -4,7 +4,7 @@
 
 输入一个词，输出一个单文件 HTML。中间做四件事：多通道发现、抓正文、抽时间、归并转载，入库前过一遍 PII 脱敏。
 
-不装浏览器、不引代理池、不碰验证码、不存全文。
+默认不装浏览器、不引代理池、不存全文；另有一个**默认关闭**的 Scrapling 隐身抓取档，需要时显式开启（见下文）。
 
 ---
 
@@ -82,7 +82,7 @@ python -m kwsearch run "红黑树"       # 完整跑一次，顺手生成报告
 
 跑完看 `report/红黑树/index.html`。
 
-依赖只有两个必需项：`PyYAML`，以及一个 HTTP 客户端（`curl_cffi` 优先，`httpx` 兜底）。没有浏览器、没有 selenium、没有代理池。
+依赖只有两个必需项：`PyYAML`，以及一个 HTTP 客户端（`curl_cffi` 优先，`httpx` 兜底）。默认不装浏览器、没有 selenium、没有代理池。可选的 Scrapling 隐身档见下面专门一节。
 
 想要快：`--no-body` 跳过正文抓取（实测 5 秒 vs 53 秒），摘要退回搜索页原文。
 
@@ -126,7 +126,33 @@ python -m kwsearch serve        # 默认 127.0.0.1:8787，自动打开浏览器
 
 `db clear` 是破坏性操作，所以有两道闸：命令行先打印将删什么、再要 `--yes`；交互页面则是「预览弹层 + 勾选确认」两步。清空只动 SQLite，已生成的报告 HTML 文件不受影响。
 
-`run` 常用开关：`--mode quick|deep|watch`、`--max-docs N`、`--expand [N]`、`--require REGEX`、`--no-body`、`--no-report`。
+`run` 常用开关：`--mode quick|deep|watch`、`--max-docs N`、`--expand [N]`、`--require REGEX`、`--no-body`、`--no-report`、`--stealth`（见下节）。
+
+---
+
+## Scrapling 隐身抓取（可选，默认关闭）
+
+默认链路是「TLS 指纹伪装的 HTTP 请求」（curl_cffi），遇到 Cloudflare Turnstile / Interstitial 这类**机器人挑战页**只能记 alert 放弃。第三档是可选的 Scrapling 隐身浏览器：用一个指纹伪装过的真实浏览器打开页面，从而能通过这类挑战。**默认完全关闭，不开和以前一模一样。**
+
+```bash
+pip install 'scrapling[fetchers]' && scrapling install   # 后者下载浏览器二进制，必跑
+
+python -m kwsearch run "红黑树" --stealth                # 正文抓取切到隐身档
+python -m kwsearch probe <URL> --fetcher scrapling       # 先拿单条 URL 试水
+python -m kwsearch page <URL> --fetcher scrapling        # 批量试水，看判定表
+```
+
+交互页面里对应「高级选项 → 隐身抓取」勾选框；配置文件里是 `defaults.stealth.enabled: true`。三处等价，任选其一。
+
+参数在 `channels.yaml` 的 `defaults.stealth` 段：`headless` / `solve_cloudflare` / `network_idle` / `disable_resources` / `humanize` / `use_camoufox` / `timeout_ms`，注释都写在配置里。
+
+几条不会因为开了它而改变的边界：
+
+- **robots.txt 照常遵守**，而且 robots.txt 本身走轻量档取（不为一行规则启动浏览器）
+- **不携带任何账号 Cookie**，没有「登录后抓取」这回事
+- **不接代理池**（Scrapling 的 ProxyRotator 不启用），出口 IP 就是本机 IP
+- **不存全文**：拿到的 HTML 只进既有的编码判定 → 抽取 → 摘要链路，存储行为零变化
+- **被拦照样记账**：隐身档不是万能的，挑战没过多半还是会拿到挑战页，照旧判 `challenge` 记 alert
 
 ### 人名模式
 
@@ -233,9 +259,9 @@ python -m kwsearch run "张军" --person --org "某某大学计算机学院" \
 
 红线写进代码，不是写在文档里说说：
 
+- **禁止用于恶意行为** —— 未授权批量抓取、凭证爆破、薅券、DDoS、侵犯他人权益等。隐身抓取档是「像普通浏览器一样访问公开页面」的能力，不是攻击工具；是否越界取决于使用它的人
 - **不抓登录态**、不碰任何需要账号的内容
-- **不绕验证码**、不对抗风控。被拦就记 alert 停下 —— 拦截本身是「这份报告缺了谁」的证据
-- **不引代理池**，不伪装成多个用户
+- **不引代理池**，不伪装成多个用户；隐身档只改「怎么发请求」，不改出口 IP
 - **不存全文、不二次分发**。库里只存摘要（默认 500 字），正文用来算相关度和指纹，用完即弃
 - **PII 入库前遮罩**：手机号、身份证号、邮箱命中即打码。这是「公开信息聚合」和「人肉搜索」的分界线
 

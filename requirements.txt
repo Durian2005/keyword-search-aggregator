@@ -13,7 +13,9 @@ curl_cffi>=0.7
 # 兜底：无指纹伪装
 httpx>=0.27
 
-# ---- 可选 ----
-# Scrapling 完整框架：Spider / CrawlSpider / robots_txt_obey / crawldir 断点续爬
-# 第二阶段（定向站点遍历）才需要，M1/M2 用不到。
+# ---- 可选：Scrapling 隐身抓取档（默认不使用）----
+# 指纹伪装的真实浏览器档，可过 Cloudflare Turnstile 挑战。不装则完全不受影响
+# （代码里懒加载， import 失败只在显式开启时报错并给安装提示）。
+# 注意：装完还要跑一次 `scrapling install` 下载浏览器二进制与指纹依赖，
+# 只 pip install 是不够的。启用方式见 README「Scrapling 隐身抓取」。
 # scrapling[fetchers]>=0.3
