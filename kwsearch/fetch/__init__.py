@@ -1,14 +1,20 @@
 """采集层：URL → FetchResult。只负责拿到字节，不认识任何站点的版式。
 
 档位（按优先级降级）：
-    curl_cffi  —— TLS 指纹伪装，几 MB，无浏览器。M1 实际使用者
+    curl_cffi  —— TLS 指纹伪装，几 MB，无浏览器。默认主力
     httpx      —— 兜底，无指纹伪装
-    scrapling  —— 第三阶段上 CrawlSpider 时接入，接口不变（届时实现同一个 BaseFetcher）
+    scrapling  —— 隐身浏览器档（fetch/stealth.py），默认不启用；
+                  显式 opt-in（--stealth / defaults.stealth.enabled / --fetcher scrapling）
+                  才出现在候选链里，可过 Cloudflare 挑战
 
-⚠️ 本项目【明确不做】的三件事，写在这里比写在文档里更难被自己绕过：
-    - 不引代理池（ProxyRotator 已评估，不启用）
-    - 不绕 Cloudflare / 验证码（StealthyFetcher 不启用；遇挑战页记 alert 后放弃）
-    - 不携带任何账号 Cookie（requires=cookie 的通道一律不做）
+⚠️ 使用边界（2026-10-21 用户修订，替代早前"三不"口径）：
+    - **禁止将本产品用于任何恶意行为**：未授权批量抓取、凭证爆破、薅券、
+      DDoS、侵犯他人权益等。隐身档是"像普通浏览器一样访问公开页面"的能力，
+      不是攻击工具 —— 是否越界取决于使用它的人。
+    - 仍然不做：抓登录态（不携带任何账号 Cookie）、引代理池（ProxyRotator
+      不接）、存全文/二次分发。
+    - **仍然遵守 robots.txt**：隐身档只换"怎么发请求"，不换"允不允许发"
+      （BaseFetcher.robots_fetcher 让 robots.txt 走轻量档，不启动浏览器）。
 
 ⚠️ Windows + 中文目录：curl_cffi 打不开非 ASCII 路径下的 CA 文件（前作 坑 17）。
    本项目目录同样含中文，所以 verify 一律走 fetch.ca.ca_bundle_arg()，
@@ -27,6 +33,12 @@ from dataclasses import dataclass
 from typing import Any
 
 from kwsearch.fetch.ca import ca_bundle_arg
+from kwsearch.fetch.stealth import (
+    INSTALL_HINT,
+    StealthConfig,
+    StealthFetcher,
+    StealthUnavailable,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -116,6 +128,22 @@ class BaseFetcher(ABC):
     def fetch(self, url: str, headers: dict[str, str], timeout: int = 20) -> FetchResult:
         raise NotImplementedError
 
+    def close(self) -> None:
+        """释放抓取器持有的资源（浏览器会话等）。默认无操作。
+
+        fetch_pages 批末统一调用 —— 加默认实现而不是 getattr 探测，
+        这样每个实现类不可能忘记声明，调用方也不用写 hasattr。
+        """
+
+    @property
+    def robots_fetcher(self) -> "BaseFetcher":
+        """robots.txt 用哪个抓取器取。默认自己。
+
+        重档（隐身浏览器）覆盖它返回轻量档：为一行 robots 规则启动一次
+        浏览器是纯浪费，且浏览器 UA 与 robots 判定用的 UA 也不是一回事。
+        """
+        return self
+
 
 class CurlCffiFetcher(BaseFetcher):
     """curl_cffi：TLS/HTTP2 指纹伪装，仅几 MB，无需浏览器。M1 主力。"""
@@ -175,14 +203,42 @@ class HttpxFetcher(BaseFetcher):
         )
 
 
-def build_fetcher(prefer: str = "auto", impersonate: str = "chrome") -> BaseFetcher:
-    """按优先级挑第一个可用实现。全部不可用则抛 RuntimeError 并列出各家的失败原因。"""
+def build_fetcher(
+    prefer: str = "auto",
+    impersonate: str = "chrome",
+    stealth: bool | dict[str, Any] | StealthConfig | None = None,
+) -> BaseFetcher:
+    """按优先级挑第一个可用实现。全部不可用则抛 RuntimeError 并列出各家的失败原因。
+
+    `stealth` 是隐身档开关（默认 None = 不启用）：
+        None/False   完全不考虑 scrapling（默认行为，零变化）
+        True         用 StealthConfig() 默认档
+        dict         StealthConfig.from_mapping(dict)（channels.yaml 的 defaults.stealth）
+        StealthConfig 原样使用
+    显式要了隐身档却装不上 scrapling → **直接抛 StealthUnavailable**，不降级：
+    静默退回 curl_cffi 会让"我开了 stealth"变成假象。
+    """
+    cfg: StealthConfig | None = None
+    if stealth is not None and stealth is not False:
+        if isinstance(stealth, StealthConfig):
+            cfg = stealth
+        elif isinstance(stealth, dict):
+            cfg = StealthConfig.from_mapping(stealth)
+        else:
+            cfg = StealthConfig()
+
     order = [prefer] if prefer != "auto" else []
     order += [n for n in ("curl_cffi", "httpx") if n not in order]
+    if cfg is not None and "scrapling" not in order:
+        order.insert(0, "scrapling")
+    if "scrapling" in order and cfg is None:
+        cfg = StealthConfig()
 
     errors: list[str] = []
     for name in order:
         try:
+            if name in ("scrapling", "scrapling_stealth"):
+                return StealthFetcher(cfg)  # 没装 → StealthUnavailable 直接上抛
             if name == "curl_cffi":
                 return CurlCffiFetcher(impersonate=impersonate)
             if name == "httpx":
@@ -255,6 +311,10 @@ __all__ = [
     "FetchResult",
     "FetchError",
     "RetryPolicy",
+    "StealthConfig",
+    "StealthFetcher",
+    "StealthUnavailable",
+    "INSTALL_HINT",
     "build_fetcher",
     "default_headers",
     "fetch_with_retry",

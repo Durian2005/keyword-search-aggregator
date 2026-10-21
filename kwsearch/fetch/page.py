@@ -475,7 +475,11 @@ def fetch_pages(
     headers = headers or default_headers()
     throttle = throttle or HostThrottle(policy.per_domain_qps)
     if robots is None and policy.obey_robots:
-        robots = RobotsCache(fetcher, headers.get("User-Agent", "*"), timeout=10)
+        # 重档（隐身浏览器）只为抓正文服务；robots.txt 是一行纯文本，
+        # 交给轻量档取（BaseFetcher.robots_fetcher），不启动浏览器。
+        # getattr 兜底：单测注入的假 fetcher 是鸭子类型，未必有这个属性。
+        robots_fetcher = getattr(fetcher, "robots_fetcher", None) or fetcher
+        robots = RobotsCache(robots_fetcher, headers.get("User-Agent", "*"), timeout=10)
 
     per_domain: dict[str, int] = {}
     n = len(targets)
@@ -502,6 +506,16 @@ def fetch_pages(
         elif page.detail:
             extra = page.detail
         say(f"  [{i}/{n}] {mark} {host}  {extra}")
+
+    # 批末收尾：释放抓取器资源（隐身档开着浏览器，不关会一直占内存）。
+    # BaseFetcher.close 默认无操作，轻量档调用它是空转；用 getattr 兜底
+    # 是为了容忍鸭子类型的假实现（单测注入的那些没有 close）。
+    closer = getattr(fetcher, "close", None)
+    if callable(closer):
+        try:
+            closer()
+        except Exception as e:  # noqa: BLE001 —— 收尾失败不该抹掉已经抓到的结果
+            logger.warning("抓取器收尾失败: %s", e)
 
     batch.elapsed_ms = int((time.perf_counter() - t0) * 1000)
     return batch
