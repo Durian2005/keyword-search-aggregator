@@ -30,9 +30,11 @@ _PARSE_REGISTRY: dict[str, ParseFn] = {}
 # 已存在的实现模块。加通道就在这行加名字。
 _IMPL_MODULES = [
     "kwsearch.discover.bing",
+    "kwsearch.discover.baidu",
     "kwsearch.discover.bilibili",
     "kwsearch.discover.gdelt",
     "kwsearch.discover.searxng",
+    "kwsearch.discover.sogou_weixin",
 ]
 
 

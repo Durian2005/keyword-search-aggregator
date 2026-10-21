@@ -99,6 +99,68 @@ channels:
     robots_note: "同上；分页与 site: 均无效，仅作 10 条快照"
 
   # --------------------------------------------------------------------------
+  # 百度网页搜索 —— 中文覆盖最厚的通用引擎，但是**单次配额**通道
+  # 实测 2026-10-21：www.baidu.com/s?wd=红黑树&rn=20 → 200 / 1,390,231B /
+  #   `<!--STATUS OK-->`（真实结果页，非验证码）/ ~1.5s / 20 个 c-container 块
+  # ⚠️ **第 2 次请求就出 wappass 图形验证码，且 HTTP 仍是 200**（2026-10-21 实测）。
+  #    ⇒ variants: false（只打基词一次）+ max_pages: 1。变体矩阵对百度是自杀。
+  # ⚠️ 20 个块里混着图片聚合 / 相关新闻 / 推荐列表卡片，mu 指向 baidu 自己的页面
+  #    → 解析层按 mu 域名拉黑（见 discover/baidu.py），百科词条保留
+  # ⚠️ 真实 URL 在块开标签的 mu 属性里，href 是 baidu.com/link 中转，没有 mu 就丢
+  # ⚠️ 页面没有可信发布日期线索，published_hint 恒为 None，时间靠正文层补
+  # --------------------------------------------------------------------------
+  - id: baidu_html
+    name: 百度网页
+    type: serp
+    enabled: true
+    requires: none
+    parser: baidu_html
+    url_template: "https://www.baidu.com/s?ie=utf-8&rn=20&wd={q}"
+    variants: false                # 单次配额：只打基词，绝不走变体矩阵
+    paging:
+      mode: none
+    throttle:
+      min_interval_s: 8            # 已是单次请求，间隔是给同任务其它通道让路
+    assertions:
+      min_items: 3
+      required_fields: [url, title]
+    robots_checked: "2026-10-21"
+    robots_note: "匿名访问仅首查可用；第二次即图形验证码，不做任何规避"
+
+  # --------------------------------------------------------------------------
+  # 搜狗微信文章搜索 —— 微信公众号内容的唯一公开入口
+  # 实测 2026-10-21：weixin.sogou.com/weixin?type=2&query=红黑树 → 200 /
+  #   33,590B / ~0.4s / ul.news-list 下 10 条 li，无验证码，账号名与
+  #   timeConvert(unix秒) 时间都在页面上
+  # ⚠️ 风控比网页搜索敏感（历史版本对连续请求直接出验证码）→ max_pages: 1 + 10s
+  # ⚠️ href 是 /link?url= 中转：不逐条解跳转（每结果多一次请求，正中风控下怀）；
+  #    URL 保留搜狗链（浏览器打开会 302 到 mp.weixin.qq.com），
+  #    extra.domain 记真实内容域 mp.weixin.qq.com，避免来源分布被中转域名垄断
+  # --------------------------------------------------------------------------
+  - id: sogou_weixin
+    name: 搜狗微信
+    type: site_search
+    enabled: true
+    requires: none
+    parser: sogou_weixin
+    url_template: "https://weixin.sogou.com/weixin?type=2&page={offset}&query={q}"
+    headers:
+      Referer: "https://weixin.sogou.com/"
+    paging:
+      mode: offset
+      param: page
+      start: 1
+      step: 1
+      max_pages: 1                 # 风控敏感，只取第一页 10 条
+    throttle:
+      min_interval_s: 10
+    assertions:
+      min_items: 3
+      required_fields: [url, title]
+    robots_checked: "2026-10-21"
+    robots_note: "匿名访问首查可用；连续请求会出验证码，被拦即停不重试"
+
+  # --------------------------------------------------------------------------
   # B站视频搜索 —— 中文垂类最深，且【分页真实有效】（20 条/页，最多 50 页）
   # 实测 2026-10-18：200 / code=0 / numResults=1000（是上限，不是真实命中）/ 20 条每页
   #   ⚠️ Referer 必须是 https://search.bilibili.com/ ！
@@ -330,7 +392,10 @@ extract:
   # gb18030 几乎能吃下任意字节序列，放前面会把 UTF-8 页面"成功"解成乱码还不报错。
   encoding_fallbacks: [utf-8, gb18030]
   date_sources: [jsonld, meta, regex, serp, fallback]   # 时间抽取优先级，顺序有意义
-  challenge_keywords: ["安全验证", "滑动验证", "请输入验证码", "访问过于频繁", "请稍后再试", "robot check", "unusual traffic"]
+  # 挑战页关键词。命中即判 challenge（记 alert、通道停），不做任何规避。
+  # "异常访问请求" / "antispider" 是搜狗的风控页用语（2026-10-21 实测页面文案），
+  # "百度安全验证" 是百度的 wappass 页 —— 都是 200 状态返回的，只能按文案认。
+  challenge_keywords: ["安全验证", "滑动验证", "请输入验证码", "访问过于频繁", "请稍后再试", "robot check", "unusual traffic", "异常访问请求", "antispider", "百度安全验证"]
 
 # ============================================================================
 #  S5 近重复聚簇（转载归并）
@@ -355,7 +420,18 @@ filter:
     phone_cn: "\\b1[3-9]\\d{9}\\b"
     id_card_cn: "\\b\\d{17}[\\dXx]\\b"
     email: "\\b[\\w.+-]+@[\\w-]+\\.[\\w.]+\\b"
-  drop_domains: []               # 明确要拉黑的站
+  # 明确要拉黑的站。原则：宁缺毋滥 —— 拉黑的都是"内容农场/聚合壳"，
+  # 留着不会增加信息量，只会把报告搅浑。2026-10-21 按百度/微信通道实测补：
+  #   百家号是人名搜索里"同名不同人"拼凑文的最大来源；
+  #   知道/文库/贴吧/经验对报告质量是负贡献（文库还有下载墙）。
+  # ⚠️ 百科（baike.baidu.com）不拉黑：术语类查询它是有效条目。
+  drop_domains: [
+    "baijiahao.baidu.com",   # 百家号：SEO 农场，人名噪声主来源
+    "zhidao.baidu.com",      # 百度知道：问答壳
+    "wenku.baidu.com",       # 百度文库：下载墙
+    "tieba.baidu.com",       # 百度贴吧：闲聊
+    "jingyan.baidu.com",     # 百度经验：低质步骤文
+  ]
   drop_url_patterns: ["\\.(zip|exe|apk|dmg|iso)$", "/download/"]
   max_per_domain: 30             # 单域最多留多少条，防止某个大站垄断报告
   # 标题和摘要里都没出现关键词的条目直接丢。

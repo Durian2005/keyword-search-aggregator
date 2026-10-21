@@ -66,6 +66,10 @@ class ChannelConfig:
     # 存在的意义：GDELT 单次要 13s，全局 20s×3 次的"快速任务"被拖到 1 分钟；
     #   而全局收紧又会饿死慢站。超时是通道属性，不是全局属性。
     fetch_over: dict[str, Any] = field(default_factory=dict)
+    # 是否参与查询变体矩阵。默认 true；false = 只打基词一次。
+    # 为什么需要这个开关：百度第二次请求就出图形验证码（实测 2026-10-21），
+    # 变体矩阵对它不是扩量而是自杀。这类"单次配额"通道必须显式关掉。
+    variants: bool = True
     robots_checked: str = ""
     robots_note: str = ""
 
@@ -160,6 +164,7 @@ def _build_channel(raw: dict[str, Any], idx: int) -> ChannelConfig:
         throttle_min_interval_s=float(throttle.get("min_interval_s", 1.0)),
         assertions=assertions,
         fetch_over=dict(fetch_over),
+        variants=bool(raw.get("variants", True)),
         robots_checked=str(raw.get("robots_checked", "")),
         robots_note=str(raw.get("robots_note", "")),
     )
