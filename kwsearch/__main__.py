@@ -8,6 +8,7 @@
     run --dry       打印"将要发哪些请求"的计划（不联网）
     run             执行 抓取 → 正文 → 入库 → 转载归并 → 报告（S4/S3d/S5）
     report [id]     由已有任务重新生成 HTML 报告（S6）
+    serve           启动本地交互页面（浏览器里点着用，stdlib 服务，零新增依赖）
     db init         建库
 
 只读的六个（channels / probe / discover / page / extract / run --dry）是调试脚手架：
@@ -200,7 +201,9 @@ def _run_summary(result) -> str:  # noqa: ANN001
         + f"\n入库 {result.kept}（新 {result.docs_new}） · 去重后 {result.unique}"
           f" · 原始 {result.candidates} · 丢弃 {result.dropped_url}"
           f" · 配额丢 {result.dropped_cap} · 脱敏 {result.pii_masked}"
-          f" · 告警 {result.alerts} · {result.elapsed_ms} ms"
+          + (f" · 列表页解析 {result.resolved_list} 篇"
+             if result.resolved_list else "")
+          + f" · 告警 {result.alerts} · {result.elapsed_ms} ms"
     )
     if result.person_cards or result.person_name_missing:
         from kwsearch.person import TIER_CN
@@ -268,6 +271,28 @@ def cmd_report(cfg: AppConfig, task_id: str | None, out_dir: str, db_path: str) 
 
     print(f"报告：{path}")
     return 0
+
+
+def cmd_serve(
+    cfg: AppConfig,
+    host: str,
+    port: int,
+    out_dir: str,
+    no_browser: bool,
+    *,
+    db_path: str = DB_DEFAULT,
+) -> int:
+    """本地交互页面：把 run/report 包进一个浏览器页面，命令照旧可用。
+
+    与 CLI 的关系是「同一套内核，两个入口」：页面发的每个请求最终都走
+    run_task + render，和命令行没有第二份实现。默认只绑 127.0.0.1。
+    """
+    from kwsearch.web import serve as web_serve
+
+    return web_serve(
+        host, port, cfg=cfg, db_path=db_path, out_dir=out_dir,
+        open_browser=not no_browser,
+    )
 
 
 def cmd_probe(
@@ -792,18 +817,58 @@ def cmd_discover(
     return 5 if problems_all else 0
 
 
-def cmd_db(cfg: AppConfig, action: str, db_path: str) -> int:
-    from kwsearch.storage import init_db
+def cmd_db(cfg: AppConfig, action: str, db_path: str, assume_yes: bool = False) -> int:
+    from kwsearch.storage import Repository, init_db, recent_tasks
 
-    if action != "init":
-        print(f"未知 db 动作: {action}（可选 init）", file=sys.stderr)
+    if action == "init":
+        conn = init_db(db_path)
+        tables = [r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")]
+        conn.close()
+        print(f"已初始化 {Path(db_path).resolve()}")
+        print("表: " + ", ".join(tables))
+        return 0
+
+    if action != "clear":
+        print(f"未知 db 动作: {action}（可选 init / clear）", file=sys.stderr)
         return 2
+
+    # ---- 清空所有历史数据 ----
+    # 破坏性操作，两道闸：先打印将删什么（不看数就删等于盲删），
+    # 再要求 --yes 明示确认。页面上同样两步（预览 + 确认框）。
+    if not Path(db_path).exists():
+        print(f"数据库不存在，没什么可清: {Path(db_path).resolve()}")
+        return 0
     conn = init_db(db_path)
-    tables = [r[0] for r in conn.execute(
-        "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")]
+    repo = Repository(conn)
+    preview = repo.wipe_preview()
+    total = sum(preview.values())
+    print(f"数据库: {Path(db_path).resolve()}")
+    if total == 0:
+        print("已经是空库（所有表 0 行）。")
+        conn.close()
+        return 0
+    print("将删除以下全部数据：")
+    tasks = recent_tasks(conn, 10)
+    if tasks:
+        print("  任务（最近 10 个）:")
+        for r in tasks:
+            kw = (r["keyword"] or "")[:20]
+            when = (r["started_at"] or "")[:16].replace("T", " ")
+            print(f"    {kw:22s} {when}  {r['status']}")
+    for t, n in preview.items():
+        if n:
+            print(f"  {t:14s} {n:>6d} 行")
+    print(f"合计 {total} 行。报告 HTML 文件不受影响，仍在报告目录里。")
+    sys.stdout.flush()   # 管道里 stdout 是块缓冲，不让"将删什么"排在闸门提示后面
+    if not assume_yes:
+        print("未加 --yes，什么也没删。确认请执行: db clear --yes", file=sys.stderr)
+        conn.close()
+        return 2
+    deleted = repo.wipe()
+    gone = sum(deleted.values())
+    print(f"已清空 {gone} 行，库恢复到初始状态。")
     conn.close()
-    print(f"已初始化 {Path(db_path).resolve()}")
-    print("表: " + ", ".join(tables))
     return 0
 
 
@@ -854,6 +919,14 @@ def main(argv: list[str] | None = None) -> int:
                     help="弱锚点（研究方向/业务领域），可重复，如 --field 网络安全")
     pr.add_argument("--role", action="append", default=[], metavar="身份",
                     help="弱锚点（身份/职称），可重复，如 --role 教授 --role 博导")
+
+    ps = sub.add_parser("serve", help="启动本地交互页面（浏览器操作，零新增依赖）")
+    ps.add_argument("--host", default="127.0.0.1",
+                    help="监听地址（默认 127.0.0.1，仅本机；改 0.0.0.0 会暴露给局域网）")
+    ps.add_argument("--port", type=int, default=8787,
+                    help="起始端口，被占用则顺序往上试（默认 8787）")
+    ps.add_argument("--out", default="report", help="报告输出目录（默认 report/）")
+    ps.add_argument("--no-browser", action="store_true", help="只起服务，不自动打开浏览器")
 
     pp = sub.add_parser("probe", help="单 URL 探针：状态/耗时/大小/预览，通道上线前先跑它")
     pp.add_argument("url")
@@ -914,7 +987,9 @@ def main(argv: list[str] | None = None) -> int:
     pext.add_argument("--fetcher", default="auto", choices=["auto", "curl_cffi", "httpx"])
 
     pd = sub.add_parser("db", help="数据库维护")
-    pd.add_argument("action", choices=["init"])
+    pd.add_argument("action", choices=["init", "clear"])
+    pd.add_argument("--yes", action="store_true",
+                    help="确认执行破坏性操作（仅 clear 需要；不加只预览不删）")
 
     args = p.parse_args(argv)
 
@@ -947,7 +1022,7 @@ def main(argv: list[str] | None = None) -> int:
                         if args.person else None),
             )
         if args.cmd == "db":
-            return cmd_db(cfg, args.action, args.db)
+            return cmd_db(cfg, args.action, args.db, assume_yes=args.yes)
         if args.cmd == "probe":
             timeout = args.timeout or int(cfg.defaults.get("timeout", 20))
             return cmd_probe(cfg, args.url, args.header, timeout,
@@ -970,6 +1045,9 @@ def main(argv: list[str] | None = None) -> int:
             )
         if args.cmd == "report":
             return cmd_report(cfg, args.task_id, args.out, args.db)
+        if args.cmd == "serve":
+            return cmd_serve(cfg, args.host, args.port, args.out,
+                             args.no_browser, db_path=args.db)
     except NotImplementedError as e:
         print(f"未实现: {e}", file=sys.stderr)
         return 3

@@ -49,6 +49,10 @@ def connect(db_path: str | Path) -> sqlite3.Connection:
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    # 默认 busytimeout 是 0：别的连接（典型：交互页面服务还开着）持锁时立刻
+    # 报 "database is locked"。等 5 秒再失败，本地单人工具足够宽容，
+    # 又不至于把一个真死锁挂成无限等待。
+    conn.execute("PRAGMA busy_timeout = 5000")
     return conn
 
 
@@ -78,7 +82,69 @@ def init_db(db_path: str | Path) -> sqlite3.Connection:
     return conn
 
 
-class Repository:
+# ── 清空所有历史数据 ────────────────────────────────────────────────────────
+
+# 删除顺序：**子表先**。schema 里唯一一条外键是 mention.url_canon → doc，
+# 而连接开着 foreign_keys=ON（立即检查），先删 doc 会直接抛 FOREIGN KEY 失败。
+# 以后新增带外键的表，把它挪到被引用表前面。
+_WIPE_ORDER: tuple[str, ...] = (
+    "mention",          # → doc
+    "query", "cluster_member", "cluster", "person_card",
+    "queue", "alert",
+    "doc", "task",
+    "robots",           # 礼貌缓存，不是用户数据，但留着会让人以为"没清干净"
+)
+
+
+def table_counts(conn: sqlite3.Connection) -> dict[str, int]:
+    """每张表现存行数。表不存在（老库 / 空库）记 0，不抛。"""
+    counts: dict[str, int] = {}
+    for t in _WIPE_ORDER:
+        try:
+            counts[t] = int(conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0])
+        except sqlite3.OperationalError:
+            counts[t] = 0
+    return counts
+
+
+class _WipeMixin:
+    """清空相关操作。混在 Repository 上，保持 conn 单入口。"""
+
+    conn: sqlite3.Connection
+
+    def wipe_preview(self) -> dict[str, int]:
+        """清空前先看数：每张表有多少行。**不删任何东西**，可反复调用。"""
+        return table_counts(self.conn)
+
+    def wipe(self) -> dict[str, int]:
+        """清空所有历史数据，返回每张表删掉的行数。
+
+        一个事务里做完：中途失败（磁盘满 / 库被锁）整体回滚，绝不留下"删了一半"的库 ——
+        那种库比不清更危险，报告会把残缺的历史当完整历史展示。
+
+        DELETE 之后 SQLite 不会把文件变小，也不重置 AUTOINCREMENT 记数器
+        （cluster_id 会从旧最大值继续往上）。两者都补上：VACUUM 收缩文件，
+        清 sqlite_sequence 让簇编号重新从 1 开始 —— 用户视角"这就是一个空库"。
+        VACUUM 不能在事务里跑，所以放在提交之后；它失败（库被别的连接占着）
+        不影响"数据已清"这个事实，只留个日志。
+        """
+        before = table_counts(self.conn)
+        with self.conn:                      # 退出时提交；异常自动回滚
+            for t in _WIPE_ORDER:
+                self.conn.execute(f"DELETE FROM {t}")
+            # sqlite_sequence 是 SQLite 内部表，只在有 AUTOINCREMENT 列时才存在
+            try:
+                self.conn.execute("DELETE FROM sqlite_sequence")
+            except sqlite3.OperationalError:
+                pass
+        try:
+            self.conn.execute("VACUUM")
+        except sqlite3.Error as e:           # noqa: BLE001 —— 收缩失败不该让清空失败
+            logger.warning("已清空数据，但 VACUUM 收缩文件失败: %s", e)
+        return before
+
+
+class Repository(_WipeMixin):
     """一个任务的全部读写。**不是线程安全的**，M1 串行执行。"""
 
     __slots__ = ("conn",)
@@ -634,5 +700,5 @@ def recent_tasks(conn: sqlite3.Connection, limit: int = 10) -> list[sqlite3.Row]
         " FROM task ORDER BY started_at DESC LIMIT ?", (limit,)))
 
 
-__all__ = ["Repository", "connect", "init_db", "recent_tasks", "SCHEMA_PATH"]
-
+__all__ = ["Repository", "connect", "init_db", "recent_tasks",
+           "table_counts", "SCHEMA_PATH"]
