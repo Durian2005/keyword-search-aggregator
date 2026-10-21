@@ -22,6 +22,8 @@ venv/
 .workbuddy/
 .env
 *.local.yaml
+# 本机双击启动器：便利文件，且回退分支写死了本机路径，不进库
+/*.bat
 
 # ---- 编辑器 ----
 .vscode/
