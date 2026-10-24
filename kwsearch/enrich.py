@@ -29,6 +29,8 @@ from kwsearch.config import AppConfig
 from kwsearch.extract import extract_article, extract_doc
 from kwsearch.fetch import BaseFetcher, build_fetcher, default_headers
 from kwsearch.fetch.page import (
+    F_GOV,
+    F_ROBOTS,
     HostThrottle,
     PageFetch,
     PagePolicy,
@@ -85,10 +87,14 @@ class EnrichReport:
     ok: int = 0                     # 正文可用
     low: int = 0                    # 抓到了但正文低置信（body_chars=0）
     skipped_existing: int = 0       # 库里已有正文，跳过
-    skipped_robots: int = 0         # robots 不允许
+    skipped_robots: int = 0         # robots 不允许（obey 档被拦下的）
+    robots_forced: int = 0          # 无视 robots 规则强制抓取（record / 失败放行）
+    gov_blocked: int = 0            # 政府网站红线拦下（请求未发）
     failed: dict[str, int] = field(default_factory=dict)
     elapsed_ms: int = 0
     items: dict[str, Enriched] = field(default_factory=dict)
+    robots_stats: dict[str, int] = field(default_factory=dict)  # RobotsCache.stats 快照
+    robots_hosts: list[dict] = field(default_factory=list)      # 逐域结论（报告用）
 
     @property
     def success_rate(self) -> float:
@@ -106,6 +112,10 @@ class EnrichReport:
             bits.append(f"低置信 {self.low}")
         if self.skipped_existing:
             bits.append(f"已有正文跳过 {self.skipped_existing}")
+        if self.robots_forced:
+            bits.append(f"robots 强制 {self.robots_forced}")
+        if self.gov_blocked:
+            bits.append(f"政府站拦截 {self.gov_blocked}")
         if self.failed:
             top = "、".join(f"{k} {v}" for k, v in list(self.failed.items())[:4])
             bits.append(f"失败 {top}")
@@ -123,6 +133,8 @@ def enrich(
     progress: Progress | None = None,
     throttle: HostThrottle | None = None,
     robots: RobotsCache | None = None,
+    robots_mode: str | None = None,
+    robots_on_failure: str | None = None,
 ) -> EnrichReport:
     """对一批候选抓正文并抽取。**不抛异常**：单条失败只记进 failed。
 
@@ -158,7 +170,9 @@ def enrich(
     }
     report.attempted = len(picked)
 
-    policy = PagePolicy.from_config(cfg, limit=len(picked))
+    policy = PagePolicy.from_config(cfg, limit=len(picked),
+                                    robots_mode=robots_mode,
+                                    robots_on_failure=robots_on_failure)
     fetcher = fetcher or build_fetcher(str(cfg.defaults.get("fetcher", "auto")),
                                        stealth=stealth)
     batch = fetch_pages(
@@ -170,7 +184,12 @@ def enrich(
         throttle=throttle,
         robots=robots,
     )
-    report.skipped_robots = sum(1 for p in batch.pages if p.robots == "disallow")
+    # 口径：skipped_robots 只数"真的被拦下没抓"的；record 档强制抓的另记 forced
+    report.skipped_robots = sum(1 for p in batch.pages if p.failure == F_ROBOTS)
+    report.robots_forced = sum(1 for p in batch.pages if p.robots_forced)
+    report.gov_blocked = sum(1 for p in batch.pages if p.failure == F_GOV)
+    report.robots_stats = dict(batch.robots_stats)
+    report.robots_hosts = list(batch.robots_hosts)
 
     for page in batch.pages:
         if not page.ok:

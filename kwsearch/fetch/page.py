@@ -25,7 +25,12 @@ from urllib.parse import urlsplit
 
 from kwsearch.config import AppConfig
 from kwsearch.fetch.encoding import decode_html
-from kwsearch.fetch.robots import RobotsCache, RobotsVerdict
+from kwsearch.fetch.robots import (
+    RobotsCache,
+    RobotsVerdict,
+    resolve_on_failure,
+    resolve_robots_mode,
+)
 from kwsearch.fetch import (
     BaseFetcher,
     FetchError,
@@ -34,6 +39,7 @@ from kwsearch.fetch import (
     fetch_with_retry,
 )
 from kwsearch.htmlx import normalize, parse_html, strip_tags
+from kwsearch.sanitize import DEFAULT_BLOCK_HOST_SUFFIXES, is_blocked_host
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +57,7 @@ F_NON_HTML = "non_html"       # PDF / 图片 / 压缩包
 F_TOO_LARGE = "too_large"
 F_GARBLED = "garbled"         # 解码后仍是替换字符
 F_EMPTY = "empty"             # 打开了但几乎没有文字（空壳页 / 纯 JS 站）
+F_GOV = "gov_blocked"         # 政府网站：项目唯一红线，请求根本不发
 
 # 这些失败说明"这个站不想让我们看"，与"这篇文章其实没内容"性质不同。
 HARD_FAILURES = frozenset({F_ROBOTS, F_BLOCKED, F_CHALLENGE, F_TIMEOUT, F_CONN, F_SERVER})
@@ -251,7 +258,8 @@ class PageFetch:
     ok: bool = False
     failure: str | None = None
     detail: str = ""
-    robots: str = ""            # allow | disallow | missing | unavailable
+    robots: str = ""            # allow | disallow | missing | unavailable | skipped
+    robots_forced: bool = False # robots 本该拒绝但被档位放行（record / 失败放行）
     crawl_delay: float | None = None
 
     @property
@@ -280,9 +288,16 @@ class PagePolicy:
     js_required_ratio: float = 0.3
     challenge_keywords: tuple[str, ...] = ()
     encoding_fallbacks: tuple[str, ...] = ("utf-8", "gb18030")
-    obey_robots: bool = True
+    robots_mode: str = "obey"          # obey | record | off（fetch/robots.py）
+    robots_on_failure: str = "deny"    # deny | allow
+    block_host_suffixes: tuple[str, ...] = DEFAULT_BLOCK_HOST_SUFFIXES  # 政府站红线
     limit: int | None = None
     retry: RetryPolicy = field(default_factory=RetryPolicy)
+
+    @property
+    def obey_robots(self) -> bool:
+        """历史口径：是否做 robots 检查。record 也算"查"（只是不拦）。"""
+        return self.robots_mode != "off"
 
     @classmethod
     def from_config(
@@ -291,6 +306,8 @@ class PagePolicy:
         *,
         limit: int | None = None,
         obey_robots: bool | None = None,
+        robots_mode: str | None = None,
+        robots_on_failure: str | None = None,
     ) -> PagePolicy:
         crawl = cfg.crawl or {}
         ext = cfg.extract or {}
@@ -298,6 +315,13 @@ class PagePolicy:
         # 0 要原样保留（= 不限速，测试与离线回放用），不能被 `or 1` 吃掉：
         # 那样"显式设成 0"和"没设"会变成同一件事，测试会白等每秒 1 次的间隔。
         qps = crawl.get("per_domain_qps", 1)
+        # 档位优先级：显式 robots_mode > CLI --no-robots > 配置 > 默认 obey
+        mode = resolve_robots_mode(
+            crawl,
+            robots_mode if robots_mode is not None
+            else (None if obey_robots is None else ("obey" if obey_robots else "off")),
+        )
+        raw_suffixes = flt.get("block_host_suffixes")
         return cls(
             timeout=int(cfg.defaults.get("timeout", 20)),
             per_domain_qps=float(qps if qps is not None else 1),
@@ -307,7 +331,12 @@ class PagePolicy:
             js_required_ratio=float(ext.get("js_required_ratio", 0.3)),
             challenge_keywords=tuple(k for k in (ext.get("challenge_keywords") or ()) if k),
             encoding_fallbacks=tuple(ext.get("encoding_fallbacks") or ("utf-8", "gb18030")),
-            obey_robots=bool(crawl.get("robots_obey", True) if obey_robots is None else obey_robots),
+            robots_mode=mode,
+            robots_on_failure=resolve_on_failure(crawl, robots_on_failure),
+            block_host_suffixes=tuple(
+                str(s).strip() for s in (raw_suffixes if raw_suffixes is not None
+                                         else DEFAULT_BLOCK_HOST_SUFFIXES) if str(s).strip()
+            ),
             limit=limit,
             retry=RetryPolicy.from_mapping(cfg.defaults.get("retry")),
         )
@@ -336,8 +365,14 @@ def fetch_page(
         page.elapsed_ms = int((time.perf_counter() - t0) * 1000)
         return page
 
-    if robots is not None and not robots.allowed:
-        return done(F_ROBOTS, f"robots 判定 {robots.reason}")
+    # 红线双保险：即使上游把政府站 URL 漏进来，请求也不发
+    if is_blocked_host(urlsplit(url).netloc, policy.block_host_suffixes):
+        return done(F_GOV, "政府网站（红线：不抓）")
+
+    if robots is not None:
+        page.robots_forced = robots.forced
+        if not robots.allowed:
+            return done(F_ROBOTS, f"robots 判定 {robots.reason}")
 
     try:
         res = fetch_with_retry(fetcher, url, headers, policy.retry, policy.timeout)
@@ -403,8 +438,10 @@ def fetch_page(
 class PageBatch:
     pages: list[PageFetch] = field(default_factory=list)
     elapsed_ms: int = 0
-    skipped: int = 0               # 配额 / 去重，没发请求
+    skipped: int = 0               # 配额 / 去重 / 政府站红线，没发请求
     slept_s: float = 0.0
+    robots_stats: dict[str, int] = field(default_factory=dict)   # RobotsCache.stats 快照
+    robots_hosts: list[dict] = field(default_factory=list)       # 逐域结论（报告用）
 
     @property
     def total(self) -> int:
@@ -474,18 +511,26 @@ def fetch_pages(
 
     headers = headers or default_headers()
     throttle = throttle or HostThrottle(policy.per_domain_qps)
-    if robots is None and policy.obey_robots:
+    if robots is None and policy.robots_mode != "off":
         # 重档（隐身浏览器）只为抓正文服务；robots.txt 是一行纯文本，
         # 交给轻量档取（BaseFetcher.robots_fetcher），不启动浏览器。
         # getattr 兜底：单测注入的假 fetcher 是鸭子类型，未必有这个属性。
         robots_fetcher = getattr(fetcher, "robots_fetcher", None) or fetcher
-        robots = RobotsCache(robots_fetcher, headers.get("User-Agent", "*"), timeout=10)
+        robots = RobotsCache(robots_fetcher, headers.get("User-Agent", "*"), timeout=10,
+                            mode=policy.robots_mode,
+                            on_failure=policy.robots_on_failure)
 
     per_domain: dict[str, int] = {}
     n = len(targets)
 
     for i, url in enumerate(targets, start=1):
         host = urlsplit(url).netloc.lower()
+        # 政府站红线：连限速排队都不进，请求不发
+        if is_blocked_host(host, policy.block_host_suffixes):
+            batch.pages.append(PageFetch(
+                url=url, failure=F_GOV, detail="政府网站（红线：不抓）"))
+            say(f"  [{i}/{n}] ✗ {F_GOV} {host}  政府网站（红线：不抓）")
+            continue
         if per_domain.get(host, 0) >= policy.max_per_domain:
             batch.skipped += 1
             say(f"  [{i}/{n}] ○ 跳过（{host} 已达单域上限 {policy.max_per_domain}）")
@@ -517,12 +562,20 @@ def fetch_pages(
         except Exception as e:  # noqa: BLE001 —— 收尾失败不该抹掉已经抓到的结果
             logger.warning("抓取器收尾失败: %s", e)
 
+    # robots 统计随批带出去：调用方（enrich / CLI / 报告）不接触缓存对象本身
+    if robots is not None:
+        batch.robots_stats = dict(robots.stats)
+        host_records = getattr(robots, "host_records", None)
+        if callable(host_records):
+            batch.robots_hosts = list(host_records())
+
     batch.elapsed_ms = int((time.perf_counter() - t0) * 1000)
     return batch
 
 
 __all__ = [
     "ChallengeVerdict",
+    "F_GOV",
     "HARD_FAILURES",
     "HostThrottle",
     "PageBatch",

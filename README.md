@@ -146,13 +146,34 @@ python -m kwsearch page <URL> --fetcher scrapling        # 批量试水，看判
 
 参数在 `channels.yaml` 的 `defaults.stealth` 段：`headless` / `solve_cloudflare` / `network_idle` / `disable_resources` / `humanize` / `use_camoufox` / `timeout_ms`，注释都写在配置里。
 
-几条不会因为开了它而改变的边界：
+几条不会因为开了它而改变的事实：
 
-- **robots.txt 照常遵守**，而且 robots.txt 本身走轻量档取（不为一行规则启动浏览器）
-- **不携带任何账号 Cookie**，没有「登录后抓取」这回事
-- **不接代理池**（Scrapling 的 ProxyRotator 不启用），出口 IP 就是本机 IP
-- **不存全文**：拿到的 HTML 只进既有的编码判定 → 抽取 → 摘要链路，存储行为零变化
+- **robots 档位与隐身档无关**：是否放行由 `--robots-mode` / `crawl.robots_mode` 决定（默认 obey），隐身档只改「怎么发请求」，不改「允不允许发」；robots.txt 本身仍走轻量档取（不为一行规则启动浏览器）
+- **不携带账号 Cookie**：当前实现没有登录态支持（历史红线已作废，这是现状描述）
+- **出口 IP 就是本机 IP**：Scrapling 的 ProxyRotator 未接入
 - **被拦照样记账**：隐身档不是万能的，挑战没过多半还是会拿到挑战页，照旧判 `challenge` 记 alert
+
+### robots.txt 档位（可绕过，全留痕）
+
+2026-10-22 起 robots.txt 从"必须遵守"改成三档显式能力（Scrapling 的 robots 设计是合规向的
+`robots_txt_obey` 开关，本项目在此之上补了绕过档，但留痕纪律照旧）：
+
+```bash
+python -m kwsearch run "红黑树" --robots-mode record    # 查 robots 但不拦（强制抓取留痕）
+python -m kwsearch run "红黑树" --robots-mode off       # 完全不查（--no-robots 等价）
+python -m kwsearch run "红黑树" --robots-on-failure allow  # robots.txt 拉不到时放行（留痕）
+python -m kwsearch page <URL> --robots-mode record      # S3a 同样可覆盖
+```
+
+| 档位 | 行为 | 默认 |
+|---|---|---|
+| `obey` | 按 RFC 9309 遵守 Disallow / Crawl-delay | ✅ 默认 |
+| `record` | 查 robots 但不拦，Disallow 照抓，逐条 `forced` 留痕 | 可选 |
+| `off` | 完全不拉 robots.txt | 可选 |
+
+交互页面在「高级选项 → 反爬与合规」里提供同样的档位选择，**默认全部保守**（obey / deny / 隐身关闭）。
+配置写法见 `channels.yaml` 的 `crawl.robots_mode` / `crawl.robots_on_failure`。
+不管用哪一档，报告里都有「robots 覆盖」一节逐域列出依据；**政府站红线（.gov.cn）不受档位影响，永远拦截**。
 
 ### 人名模式
 
@@ -255,15 +276,15 @@ python -m kwsearch run "张军" --person --org "某某大学计算机学院" \
 
 ---
 
-## 它不做什么
+## 红线与使用边界
 
-红线写进代码，不是写在文档里说说：
+**项目红线（2026-10-22 用户修订，替代 2026-10-21 口径）：只有一条 —— 不抓政府网站。**
 
-- **禁止用于恶意行为** —— 未授权批量抓取、凭证爆破、薅券、DDoS、侵犯他人权益等。隐身抓取档是「像普通浏览器一样访问公开页面」的能力，不是攻击工具；是否越界取决于使用它的人
-- **不抓登录态**、不碰任何需要账号的内容
-- **不引代理池**，不伪装成多个用户；隐身档只改「怎么发请求」，不改出口 IP
-- **不存全文、不二次分发**。库里只存摘要（默认 500 字），正文用来算相关度和指纹，用完即弃
-- **PII 入库前遮罩**：手机号、身份证号、邮箱命中即打码。这是「公开信息聚合」和「人肉搜索」的分界线
+- **不抓政府网站**：`.gov.cn` 等后缀硬拦截（`filter.block_host_suffixes`，默认开启且无绕过开关）。过滤层丢弃 + 抓取层拒绝双保险，命中记 `gov_blocked` 告警，请求根本不发。
+- 2026-10-21 版红线（禁止恶意行为 / 不抓登录态 / 不引代理池 / 不存全文）**已作废**。
+- **robots.txt 的遵守与绕过是显式能力**：`--robots-mode obey|record|off` 三档（默认 obey），`--robots-on-failure deny|allow` 管失败语义；record/off 档的每一笔强制抓取都进报告「robots 覆盖」清单，不做隐形绕过。
+- 反爬相关（隐身抓取、robots 绕过）在交互页面里都是**可选项，默认关闭/遵守**。
+- **PII 入库前遮罩保留**：手机号、身份证号、邮箱命中即打码 —— 这是报告质量规则（不遮会把报告变成通讯录），不再是红线。
 
 ---
 
@@ -273,7 +294,7 @@ python -m kwsearch run "张军" --person --org "某某大学计算机学院" \
 python -m unittest discover -s tests
 ```
 
-412 个用例，包含降级判定的真实样本回归、GBK 站解码、robots 失败语义、SimHash 阈值边界、正文模板剥离、人名锚点定档与时间线、报告转义等。样本里的人名与机构名已替换为中性占位，标题结构与判定结果不变。
+583 个用例，包含降级判定的真实样本回归、GBK 站解码、robots 失败语义与三档绕过（record/off/失败放行、Request-rate）、政府站红线双保险、SimHash 阈值边界、正文模板剥离、人名锚点定档与时间线、报告转义等。样本里的人名与机构名已替换为中性占位，标题结构与判定结果不变。
 
 ---
 

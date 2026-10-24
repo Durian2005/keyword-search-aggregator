@@ -54,6 +54,7 @@ from kwsearch.extract.listpage import article_links
 from kwsearch.fetch import FetchError
 from kwsearch.fetch import build_fetcher, default_headers
 from kwsearch.fetch.page import HostThrottle, PagePolicy, fetch_pages
+from kwsearch.fetch.robots import resolve_on_failure, resolve_robots_mode
 from kwsearch.models import Candidate, Doc, Mention
 from kwsearch.person import (
     TIER_CN,
@@ -68,7 +69,7 @@ from kwsearch.person import (
     summarize,
 )
 from kwsearch.query import QueryVariant, expand_queries, probe_profile
-from kwsearch.sanitize import Sanitizer, is_list_url
+from kwsearch.sanitize import Sanitizer, is_blocked_host, is_list_url
 from kwsearch.storage import Repository, init_db
 
 Progress = Callable[[str], None]
@@ -147,6 +148,12 @@ class RunResult:
     dropped_cap: int = 0           # 命中单域配额
     resolved_list: int = 0         # 列表页解析出来的相关文章数（链接直指正文，不是目录）
     pii_masked: int = 0
+    # robots 档位与红线（2026-10-22 全案）
+    gov_blocked: int = 0           # 政府网站红线拦截（项目唯一红线，请求未发）
+    robots_forced: int = 0          # 无视 robots 规则强制抓取的条数（record/失败放行）
+    robots_mode: str = ""          # 本次生效档位：obey | record | off
+    robots_stats: dict = field(default_factory=dict)   # 计数 + mode/on_failure
+    robots_hosts: list[dict] = field(default_factory=list)
     alerts: int = 0
     elapsed_ms: int = 0
     # S3d 正文富化
@@ -393,6 +400,8 @@ def _enrich_stage(
     fetcher=None,  # noqa: ANN001 —— 只在测试里注入假实现，生产走 build_fetcher
     fetch_body: bool | None = None,
     stealth: bool | dict | None = None,
+    robots_mode: str | None = None,
+    robots_on_failure: str | None = None,
 ) -> tuple[list[tuple[float, Candidate, Mention]], dict[str, Enriched], EnrichReport | None]:
     """S3d：对"最可能入库"的那批抓正文，并用正文重算分数。
 
@@ -440,6 +449,8 @@ def _enrich_stage(
             stealth=_stealth_arg(cfg, stealth),
             progress=lambda m: say("    " + m),
             throttle=HostThrottle(qps, sleep=sleep),
+            robots_mode=robots_mode,
+            robots_on_failure=robots_on_failure,
         )
     except Exception as e:                                   # noqa: BLE001
         # 抓正文整体起不来（网络全断 / fetcher 装不上）不该让任务失败：
@@ -614,6 +625,8 @@ def _resolve_list_pages(
     fetcher=None,  # noqa: ANN001 —— 只在测试里注入假实现，生产走 build_fetcher
     fetch_body: bool | None = None,
     stealth: bool | dict | None = None,
+    robots_mode: str | None = None,
+    robots_on_failure: str | None = None,
 ) -> tuple[int, int]:
     """把池子里的栏目列表页换成它链着的相关文章。返回 (新文章数, 丢弃的列表页数)。
 
@@ -629,7 +642,9 @@ def _resolve_list_pages(
     if time.perf_counter() > deadline:
         return 0, 0
 
-    list_keys = [k for k, c in seen.items() if is_list_url(c.url_raw)]
+    list_keys = [k for k, c in seen.items()
+                 if is_list_url(c.url_raw)
+                 and not is_blocked_host(host_of(c.url_raw))]
     if not list_keys:
         return 0, 0
     # 列表页通常个位数；兜底封顶，避免哪天通道集体返回目录页把任务拖垮
@@ -641,7 +656,9 @@ def _resolve_list_pages(
     say(f"  ⌗ 列表页解析：{len(list_keys)} 个栏目页 → 捞里面的相关文章")
 
     try:
-        policy = PagePolicy.from_config(cfg, limit=len(list_keys))
+        policy = PagePolicy.from_config(cfg, limit=len(list_keys),
+                                        robots_mode=robots_mode,
+                                        robots_on_failure=robots_on_failure)
         f = fetcher or build_fetcher(str(cfg.defaults.get("fetcher", "auto")),
                                      stealth=_stealth_arg(cfg, stealth))
         batch = fetch_pages(
@@ -706,8 +723,14 @@ def run_task(
     fetch_body: bool | None = None,
     stealth: bool | dict | None = None,
     person: PersonQuery | None = None,
+    robots_mode: str | None = None,
+    robots_on_failure: str | None = None,
 ) -> RunResult:
-    """跑一次关键词任务。所有参数显式传入，不读全局状态。"""
+    """跑一次关键词任务。所有参数显式传入，不读全局状态。
+
+    robots_mode / robots_on_failure：CLI/交互页显式覆盖配置档位
+    （obey|record|off / deny|allow），None = 听配置 crawl.robots_mode。
+    """
     say = progress or (lambda _m: None)
     t_start = time.perf_counter()
 
@@ -774,6 +797,10 @@ def run_task(
         return probed[1:]
 
     result = RunResult(task_id=task_id, keyword=keyword, mode=mode)
+    # 本次生效的 robots 档位（CLI/交互页 > 配置）；全程只算一次，报告与告警共用
+    result.robots_mode = resolve_robots_mode(cfg.crawl, robots_mode)
+    result.robots_stats = {"mode": result.robots_mode,  # type: ignore[dict-item]
+                           "on_failure": resolve_on_failure(cfg.crawl, robots_on_failure)}
     seen: dict[str, Candidate] = {}
     degraded = False
 
@@ -941,6 +968,7 @@ def run_task(
         cfg, repo, task_id, seen, keyword,
         say=say, sleep=sleep, deadline=deadline,
         fetcher=fetcher, fetch_body=fetch_body, stealth=stealth,
+        robots_mode=robots_mode, robots_on_failure=robots_on_failure,
     )
     result.resolved_list = resolved_add
     result.unique = len(seen)
@@ -950,6 +978,12 @@ def run_task(
     for c in seen.values():
         domain = str(c.extra.get("domain") or host_of(c.url_raw))
         c.extra["domain"] = domain
+        # 政府站红线（项目唯一红线）：单独记账，不混进一般"丢弃规则"
+        if is_blocked_host(domain, sanitizer.block_suffixes):
+            result.gov_blocked += 1
+            repo.add_alert(task_id, c.channel, "gov_blocked",
+                           f"政府网站（红线：不抓）: {c.url_raw[:120]}")
+            continue
         reason = sanitizer.check_url(c.url_raw, domain)
         if reason:
             result.dropped_url += 1
@@ -980,6 +1014,7 @@ def run_task(
             cfg, repo, task_id, keyword, scored,
             say=say, sleep=sleep, deadline=deadline,
             fetcher=fetcher, fetch_body=fetch_body, stealth=stealth,
+            robots_mode=robots_mode, robots_on_failure=robots_on_failure,
         )
         if enrich_rep is not None:
             result.bodies_ok = enrich_rep.ok
@@ -987,6 +1022,33 @@ def run_task(
             result.bodies_skipped = enrich_rep.skipped_existing
             result.bodies_elapsed_ms = enrich_rep.elapsed_ms
             result.body_chars_avg = enrich_rep.body_chars_avg
+            result.robots_forced += enrich_rep.robots_forced
+            result.gov_blocked += enrich_rep.gov_blocked
+            # 合并而不是覆盖：mode/on_failure 两个键在 result 创建时已写入
+            result.robots_stats.update(enrich_rep.robots_stats)
+            result.robots_hosts = enrich_rep.robots_hosts
+            # robots 表留档（合规证据）：逐域写一条，报告与 db 都能复核
+            for h in enrich_rep.robots_hosts:
+                st = str(h.get("status") or "")
+                status_code: int | None = None
+                if st.startswith("HTTP "):
+                    try:
+                        status_code = int(st.split()[1])
+                    except (IndexError, ValueError):
+                        status_code = None
+                repo.put_robots(
+                    str(h.get("host") or ""),
+                    status=status_code,
+                    crawl_delay=h.get("crawl_delay"),
+                    allowed=True,
+                    note=f"mode={result.robots_mode}; {st}; "
+                         f"denied={h.get('denied', 0)}; forced={h.get('forced', 0)}",
+                )
+            if enrich_rep.robots_forced:
+                repo.add_alert(task_id, None, "robots_forced",
+                               f"{enrich_rep.robots_forced} 条 URL 无视 robots.txt 规则"
+                               f"强制抓取（robots_mode={result.robots_mode}），"
+                               f"逐域清单见报告「robots 覆盖」")
             if enrich_rep.low:
                 repo.add_alert(task_id, None, "parse_fail",
                                f"{enrich_rep.low} 条抓到了页面但抽不出可信正文"
@@ -1195,6 +1257,14 @@ def run_task(
         "person_cards": result.person_cards,
         "person_tiers": result.person_tiers,
         "elapsed_ms": result.elapsed_ms,
+        "robots_mode": result.robots_mode,
+        "robots_on_failure": resolve_on_failure(cfg.crawl, robots_on_failure),
+        "robots_forced": result.robots_forced,
+        "gov_blocked": result.gov_blocked,
+        # 逐域 robots 结论（报告「robots 覆盖清单」数据源）；dict 里 mode/on_failure
+        # 两个键与计数键混放，消费方按类型取（report._robots 已这样写）
+        "robots": result.robots_stats,
+        "robots_hosts": result.robots_hosts,
     }
     repo.finish_task(task_id, result.status, result.truncated, stats_payload)
 

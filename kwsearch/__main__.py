@@ -114,6 +114,8 @@ def cmd_run(
     fetch_body: bool | None = None,
     stealth: bool = False,
     person: PersonQuery | None = None,
+    robots_mode: str | None = None,
+    robots_on_failure: str | None = None,
 ) -> int:
     from kwsearch.discover import registered_names
     from kwsearch.person import anchor_warnings
@@ -158,6 +160,11 @@ def cmd_run(
     # 真实运行时只报"将要做什么"，不铺整张表 —— 执行过程的逐通道结果更有用
     print(f"[{mode}] 关键词 = {keyword!r}  变体 {len(variants)} 个  "
           f"计划最多 {total} 个请求  上限 {max_docs or cfg.limits.get('max_docs', 1000)} 条")
+    if robots_mode:
+        print(f"robots 档位 = {robots_mode}"
+              + (f" · 失败语义 = {robots_on_failure}" if robots_on_failure else "")
+              + ("（⚠ 将无视 robots.txt 规则抓取，逐条留痕进报告）"
+                 if robots_mode in ("record", "off") else ""))
     if mode != "quick":
         print(f"⚠ mode={mode} 尚未实现（deep 需要种子域遍历，M3），本次按 quick 执行。")
 
@@ -170,6 +177,7 @@ def cmd_run(
             max_docs=max_docs, expand=expand, require=require,
             no_filter=no_filter, progress=print, fetch_body=fetch_body,
             stealth=stealth, person=person,
+            robots_mode=robots_mode, robots_on_failure=robots_on_failure,
         )
     except KeyboardInterrupt:
         # 中断也要能解释：已入库的部分留在库里，报告可以正常生成
@@ -214,6 +222,13 @@ def _run_summary(result) -> str:  # noqa: ANN001
             # 这句很重要：没有它，"结果很少"会被误读成"这个人没上网"
             head += (f"（另有 {result.person_name_missing} 条结果里没出现该姓名，"
                      f"多为机构页面，未参与归因）")
+    # getattr 兜底：web 层的假 result（SimpleNamespace）不带 robots/gov 字段
+    if getattr(result, "robots_mode", "") not in ("", "obey"):
+        head += f"\nrobots 档位 {result.robots_mode}"
+        if getattr(result, "robots_forced", 0):
+            head += f" · ⚠ 强制抓取 {result.robots_forced} 条（已留痕进报告）"
+    if getattr(result, "gov_blocked", 0):
+        head += f"\n政府站红线拦截 {result.gov_blocked} 条（请求未发）"
     return head + "\n\n" + _table(rows, ["通道", "类型", "请求", "解析", "去重", "状态", "停止原因"])
 
 
@@ -403,6 +418,8 @@ def cmd_page(
     limit: int | None = None,
     show: int = 0,
     no_robots: bool = False,
+    robots_mode: str | None = None,
+    robots_on_failure: str | None = None,
     per_domain: int | None = None,
     which: str = "auto",
 ) -> int:
@@ -419,7 +436,10 @@ def cmd_page(
         print(err, file=sys.stderr)
         return 2
 
-    policy = PagePolicy.from_config(cfg, limit=limit, obey_robots=not no_robots)
+    policy = PagePolicy.from_config(
+        cfg, limit=limit,
+        robots_mode=robots_mode or ("off" if no_robots else None),
+        robots_on_failure=robots_on_failure)
     if per_domain:
         policy.max_per_domain = per_domain
 
@@ -431,17 +451,20 @@ def cmd_page(
 
     print(f"[抓正文] {len(targets)} 条 · 单域 {policy.per_domain_qps:g} QPS · "
           f"单域上限 {policy.max_per_domain} · "
-          f"robots {'遵守' if policy.obey_robots else '不检查'} · "
-          f"fetcher={fetcher.name} · 超时 {policy.timeout}s\n")
+          f"robots {policy.robots_mode}"
+          + (f"/{policy.robots_on_failure}" if policy.robots_mode != "off" else "")
+          + f" · fetcher={fetcher.name} · 超时 {policy.timeout}s\n")
 
     headers = default_headers(cfg.defaults)
     robots = None
-    if policy.obey_robots:
+    if policy.robots_mode != "off":
         from kwsearch.fetch.robots import RobotsCache
 
         # 隐身档的 robots.txt 走轻量抓取器：为一行规则启动浏览器是纯浪费
         robots_fetcher = getattr(fetcher, "robots_fetcher", None) or fetcher
-        robots = RobotsCache(robots_fetcher, headers.get("User-Agent", "*"), timeout=10)
+        robots = RobotsCache(robots_fetcher, headers.get("User-Agent", "*"), timeout=10,
+                            mode=policy.robots_mode,
+                            on_failure=policy.robots_on_failure)
 
     batch = fetch_pages(
         targets, policy,
@@ -475,15 +498,18 @@ def cmd_page(
 
     if robots is not None and robots.stats:
         st = robots.stats
+        forced = st.get("forced", 0)
         print(f"robots：{st.get('hosts', 0)} 个站点"
               f"（有规则 {st.get('with_rules', 0)} · 无规则 {st.get('no_rules', 0)}"
               f" · 不可达 {st.get('unreachable', 0)}）"
-              f" · 拒绝请求 {st.get('denied', 0)} 次")
+              f" · 拒绝请求 {st.get('denied', 0)} 次"
+              + (f" · ⚠ 强制抓取 {forced} 次（无视规则，已留痕）" if forced else ""))
 
     fails = batch.failures()
     if fails:
         print("失败分布：" + "  ".join(f"{k}({v})" for k, v in fails.items()))
-        print("  硬失败 = 被挡（robots/403/挑战页/超时）；软失败 = 打开了但交不出正文")
+        print("  硬失败 = 被挡（robots/403/挑战页/超时）；软失败 = 打开了但交不出正文；"
+              "gov_blocked = 政府站红线，请求未发")
 
     if show:
         for p in batch.pages:
@@ -506,6 +532,8 @@ def cmd_extract(
     limit: int | None = None,
     show: int = 400,
     no_robots: bool = False,
+    robots_mode: str | None = None,
+    robots_on_failure: str | None = None,
     which: str = "auto",
 ) -> int:
     """S3b 验收入口：抓一页 → 抽正文 → 抽时间，三件事的结果并排看。
@@ -523,7 +551,10 @@ def cmd_extract(
         print(err, file=sys.stderr)
         return 2
 
-    policy = PagePolicy.from_config(cfg, limit=limit, obey_robots=not no_robots)
+    policy = PagePolicy.from_config(
+        cfg, limit=limit,
+        robots_mode=robots_mode or ("off" if no_robots else None),
+        robots_on_failure=robots_on_failure)
     try:
         fetcher = build_fetcher(which)
     except RuntimeError as e:
@@ -916,7 +947,14 @@ def main(argv: list[str] | None = None) -> int:
     pr.add_argument("--stealth", action="store_true",
                     help="正文抓取改用 Scrapling 隐身浏览器（可过 Cloudflare 挑战；"
                          "需 pip install 'scrapling[fetchers]' && scrapling install；"
-                         "默认关闭，robots/不登录/不代理/不存全文的边界不变）")
+                         "默认关闭，反爬能力为可选项）")
+    pr.add_argument("--robots-mode", default=None, choices=["obey", "record", "off"],
+                    help="robots.txt 档位：obey=遵守（默认）| record=查但不拦（留痕）"
+                         "| off=完全不查。默认听配置 crawl.robots_mode")
+    pr.add_argument("--no-robots", action="store_true",
+                    help="等价 --robots-mode off：不检查 robots.txt")
+    pr.add_argument("--robots-on-failure", default=None, choices=["deny", "allow"],
+                    help="robots.txt 拉不到时：deny=保守禁止（默认）| allow=放行（留痕）")
     # ---- 人名模式（见 person.py）：查询侧只打裸姓名，收窄在结果侧做 ----
     pr.add_argument("--person", action="store_true",
                     help="人名模式：只打裸姓名，按机构/方向锚点在结果内归因，产出候选人卡片")
@@ -978,7 +1016,11 @@ def main(argv: list[str] | None = None) -> int:
     ppage.add_argument("--show", type=int, default=0, metavar="N",
                        help="额外打印每条正文前 N 字（看抽取质量用）")
     ppage.add_argument("--no-robots", action="store_true",
-                       help="不检查 robots.txt（默认遵守 crawl.robots_obey）")
+                       help="等价 --robots-mode off（默认遵守）")
+    ppage.add_argument("--robots-mode", default=None, choices=["obey", "record", "off"],
+                       help="robots.txt 档位：obey|record|off（默认听配置）")
+    ppage.add_argument("--robots-on-failure", default=None, choices=["deny", "allow"],
+                       help="robots.txt 拉不到时：deny（默认）| allow")
     ppage.add_argument("--fetcher", default="auto",
                        choices=["auto", "curl_cffi", "httpx", "scrapling"],
                        help="scrapling = 隐身浏览器档（需 scrapling[fetchers]）")
@@ -994,7 +1036,11 @@ def main(argv: list[str] | None = None) -> int:
     pext.add_argument("--limit", type=int, default=None, metavar="N", help="本次最多抽几条")
     pext.add_argument("--show", type=int, default=400, metavar="N",
                       help="每条打印正文前 N 字，0 = 只出表格")
-    pext.add_argument("--no-robots", action="store_true", help="不检查 robots.txt")
+    pext.add_argument("--no-robots", action="store_true", help="等价 --robots-mode off")
+    pext.add_argument("--robots-mode", default=None, choices=["obey", "record", "off"],
+                      help="robots.txt 档位：obey|record|off（默认听配置）")
+    pext.add_argument("--robots-on-failure", default=None, choices=["deny", "allow"],
+                      help="robots.txt 拉不到时：deny（默认）| allow")
     pext.add_argument("--fetcher", default="auto",
                       choices=["auto", "curl_cffi", "httpx", "scrapling"],
                       help="scrapling = 隐身浏览器档（需 scrapling[fetchers]）")
@@ -1025,6 +1071,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.cmd == "channels":
             return cmd_channels(cfg)
         if args.cmd == "run":
+            robots_mode = "off" if args.no_robots else args.robots_mode
             return cmd_run(
                 cfg, args.keyword, args.mode, args.timespan, args.dry,
                 db_path=args.db, max_docs=args.max_docs, expand=args.expand,
@@ -1034,6 +1081,8 @@ def main(argv: list[str] | None = None) -> int:
                 stealth=args.stealth,
                 person=(parse_person(args.keyword, args.org, args.field, args.role)
                         if args.person else None),
+                robots_mode=robots_mode,
+                robots_on_failure=args.robots_on_failure,
             )
         if args.cmd == "db":
             return cmd_db(cfg, args.action, args.db, assume_yes=args.yes)
@@ -1049,12 +1098,16 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_page(
                 cfg, args.urls, db_path=args.db, task=args.task,
                 limit=args.limit, show=args.show, no_robots=args.no_robots,
+                robots_mode=args.robots_mode,
+                robots_on_failure=args.robots_on_failure,
                 per_domain=args.per_domain, which=args.fetcher,
             )
         if args.cmd == "extract":
             return cmd_extract(
                 cfg, args.urls, db_path=args.db, task=args.task,
                 limit=args.limit, show=args.show, no_robots=args.no_robots,
+                robots_mode=args.robots_mode,
+                robots_on_failure=args.robots_on_failure,
                 which=args.fetcher,
             )
         if args.cmd == "report":

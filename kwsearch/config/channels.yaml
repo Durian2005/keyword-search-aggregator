@@ -35,8 +35,9 @@ defaults:
   # Scrapling 隐身抓取档（可选，默认关闭）
   # 启用 = 正文抓取改用指纹伪装的真实浏览器，可过 Cloudflare Turnstile 挑战。
   # 安装：pip install 'scrapling[fetchers]' && scrapling install
-  # 三条不变的红线：robots.txt 照常遵守（且走轻量档取）、不携带账号 Cookie、
-  # 不接代理池、不存全文。另见 README「使用边界」——禁止用于恶意行为。
+  # 红线（2026-10-22 修订）：项目唯一红线 = 不抓政府网站（filter.block_host_suffixes
+  # 硬拦截，与本档无关）。旧红线（登录态/代理池/存全文/恶意行为禁令）已作废。
+  # robots 放不放行由 crawl.robots_mode 决定（默认 obey），本档只改"怎么发请求"。
   # 三个开关等价：本段 enabled: true / CLI --stealth / probe·page·extract 的
   # --fetcher scrapling。默认全部关闭，不开就和以前完全一样。
   # --------------------------------------------------------------------------
@@ -386,7 +387,14 @@ crawl:
   per_domain_qps: 1              # 单域名每秒请求数上限
   max_depth: 2                   # 只有 deep 模式的种子域遍历才用到
   max_pages_per_domain: 200
-  robots_obey: true              # 关掉要在这里写明理由，别默默关
+  # ---- robots 档位（2026-10-22 全案）--------------------------------------
+  # robots_mode: obey（默认，遵守 Disallow）| record（查但不拦，强制抓取留痕）
+  #              | off（完全不查）。CLI --robots-mode / 交互页可覆盖。
+  # robots_on_failure: robots.txt 拉不到（5xx/网络错误）时 deny（默认，保守禁止）
+  #              | allow（放行，留痕）。
+  # robots_obey: false 是历史写法，等价 robots_mode: off，继续兼容。
+  robots_mode: obey
+  robots_on_failure: deny
   respect_meta_noindex: true
 
 # ============================================================================
@@ -430,10 +438,14 @@ cluster:
   min_body_chars: 200
 
 # ============================================================================
-#  过滤与脱敏（红线落地的地方，别删）
+#  过滤与脱敏（政府站红线 + 报告质量规则落地的地方，别删）
 # ============================================================================
 filter:
-  # 命中即脱敏，绝不原样入库：这是"公开信息聚合"和"人肉搜索"的分界线
+  # ---- 项目唯一红线（2026-10-22 用户修订）：不抓政府网站 -------------------
+  # 后缀命中即丢（过滤层）+ 请求不发（抓取层），无开关可绕，命中记 gov_blocked。
+  block_host_suffixes: [".gov.cn"]
+  # 命中即脱敏，绝不原样入库（报告质量规则，不再是红线）：手机号/身份证/邮箱
+  # 不打码的话报告就成了通讯录。能力保留，性质从"红线"降为"质量规则"。
   pii_patterns:
     phone_cn: "\\b1[3-9]\\d{9}\\b"
     id_card_cn: "\\b\\d{17}[\\dXx]\\b"

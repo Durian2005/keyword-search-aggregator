@@ -262,7 +262,6 @@ td.dim{color:#4a6070}
         <summary>高级选项</summary>
         <div class="inner">
           <label class="check"><input type="checkbox" id="fetch_body" checked> 抓取正文</label>
-          <label class="check"><input type="checkbox" id="stealth"> 隐身抓取（Scrapling 浏览器档，可过 Cloudflare 挑战，需安装 <code>scrapling[fetchers]</code>）</label>
           <div class="field">
             <label for="max_docs">入库上限</label>
             <input type="number" id="max_docs" min="1" max="5000" placeholder="默认取配置" style="width:130px">
@@ -271,6 +270,28 @@ td.dim{color:#4a6070}
             <label for="expand">查询变体数</label>
             <input type="number" id="expand" min="1" max="20" placeholder="默认取配置" style="width:130px">
           </div>
+        </div>
+      </details>
+      <details class="adv">
+        <summary>反爬与合规（可选项，默认全部保守）</summary>
+        <div class="inner">
+          <div class="field">
+            <label for="robots_mode">robots.txt 档位</label>
+            <select id="robots_mode">
+              <option value="obey" selected>遵守（默认）</option>
+              <option value="record">record：查但不拦（⚠ 无视 Disallow 抓取，留痕）</option>
+              <option value="off">off：完全不查（⚠ 无规则依据，留痕）</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="robots_on_failure">robots.txt 拉不到时</label>
+            <select id="robots_on_failure">
+              <option value="deny" selected>保守禁止（默认）</option>
+              <option value="allow">放行（留痕）</option>
+            </select>
+          </div>
+          <label class="check"><input type="checkbox" id="stealth"> 反爬：隐身抓取（Scrapling 浏览器档，可过 Cloudflare 挑战，需安装 <code>scrapling[fetchers]</code>）</label>
+          <p class="hint">以上全部默认关闭/遵守。项目红线只有一条：<b>不抓政府网站</b>（.gov.cn 硬拦截，无法关闭）。</p>
         </div>
       </details>
     </form>
@@ -410,6 +431,8 @@ $("go").addEventListener("click", async () => {
     orgs: $("orgs").value, fields: $("fields").value, roles: $("roles").value,
     fetch_body: $("fetch_body").checked,
     stealth: $("stealth").checked,
+    robots_mode: $("robots_mode").value,
+    robots_on_failure: $("robots_on_failure").value,
     max_docs: $("max_docs").value || null,
     expand: $("expand").value || null,
   };

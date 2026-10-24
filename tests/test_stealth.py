@@ -352,7 +352,7 @@ class TestBuildFetcherStealth(unittest.TestCase):
 class TestFetchPagesWithStealth(unittest.TestCase):
     """批量抓取与隐身档的两个交互：robots 走轻量档、批末关浏览器。"""
 
-    POLICY = PagePolicy(timeout=5, per_domain_qps=0, obey_robots=False)
+    POLICY = PagePolicy(timeout=5, per_domain_qps=0, robots_mode="off")
 
     def _html(self) -> str:
         return "<html><body><p>" + "正" * 300 + "</p></body></html>"
@@ -417,7 +417,7 @@ class TestFetchPagesWithStealth(unittest.TestCase):
             def robots_fetcher(self):
                 return _RobotsFake()
 
-        policy = PagePolicy(timeout=5, per_domain_qps=0, obey_robots=True)
+        policy = PagePolicy(timeout=5, per_domain_qps=0, robots_mode="obey")
         batch = fetch_pages(["https://a.cn/x"], policy, fetcher=_HeavyFake(),
                             headers={"User-Agent": "x"})
         # robots 放行 + 正文抓取失败（HeavyFake 故意抛）→ 失败分类是 conn，

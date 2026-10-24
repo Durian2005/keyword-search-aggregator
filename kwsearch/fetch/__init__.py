@@ -7,14 +7,14 @@
                   显式 opt-in（--stealth / defaults.stealth.enabled / --fetcher scrapling）
                   才出现在候选链里，可过 Cloudflare 挑战
 
-⚠️ 使用边界（2026-10-21 用户修订，替代早前"三不"口径）：
-    - **禁止将本产品用于任何恶意行为**：未授权批量抓取、凭证爆破、薅券、
-      DDoS、侵犯他人权益等。隐身档是"像普通浏览器一样访问公开页面"的能力，
-      不是攻击工具 —— 是否越界取决于使用它的人。
-    - 仍然不做：抓登录态（不携带任何账号 Cookie）、引代理池（ProxyRotator
-      不接）、存全文/二次分发。
-    - **仍然遵守 robots.txt**：隐身档只换"怎么发请求"，不换"允不允许发"
-      （BaseFetcher.robots_fetcher 让 robots.txt 走轻量档，不启动浏览器）。
+⚠️ 红线（2026-10-22 用户修订，替代 2026-10-21 口径）：
+    - **项目唯一红线 = 不抓政府网站**（.gov.cn 后缀硬拦截，见 sanitize.is_blocked_host；
+      过滤层 + 抓取层双保险，无开关可绕）。
+    - robots.txt 的遵守/绕过是显式能力（`crawl.robots_mode: obey|record|off`，
+      默认 obey），record/off 档的强制抓取全留痕；隐身档只换"怎么发请求"，
+      不换"允不允许发"（放不放行由 robots 档位决定，与抓取器无关）。
+    - 旧红线（不抓登录态 / 不引代理池 / 不存全文 / 禁止恶意行为）已作废；
+      当前实现仍是无登录态、无代理池、默认只存摘要 —— 那是现状，不再是禁令。
 
 ⚠️ Windows + 中文目录：curl_cffi 打不开非 ASCII 路径下的 CA 文件（前作 坑 17）。
    本项目目录同样含中文，所以 verify 一律走 fetch.ca.ca_bundle_arg()，

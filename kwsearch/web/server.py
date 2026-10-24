@@ -99,6 +99,11 @@ def make_default_runner(cfg: object, db_path: str, out_dir: Path) -> Callable:
             for w in anchor_warnings(person):
                 log(f"  ! {w}")
 
+        if payload.robots_mode in ("record", "off"):
+            log(f"  ⚠ robots 档位 = {payload.robots_mode}（无视/跳过 robots.txt 规则，逐条留痕）")
+        if payload.stealth:
+            log("  ⚠ 隐身抓取已开启（Scrapling 浏览器档）")
+
         result = run_task(
             cfg,  # type: ignore[arg-type]
             payload.keyword,
@@ -109,6 +114,8 @@ def make_default_runner(cfg: object, db_path: str, out_dir: Path) -> Callable:
             fetch_body=payload.fetch_body,
             stealth=payload.stealth,
             person=person,
+            robots_mode=payload.robots_mode,
+            robots_on_failure=payload.robots_on_failure,
         )
         for line in format_result_lines(result):
             log(line)

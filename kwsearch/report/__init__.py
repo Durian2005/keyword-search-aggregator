@@ -68,6 +68,8 @@ _ALERT_CN = {
     "dropped": "命中丢弃规则",
     "pii_masked": "已脱敏",
     "robots_disallow": "robots 禁止",
+    "robots_forced": "无视 robots 规则强制抓取",
+    "gov_blocked": "政府网站（红线拦截）",
     "js_required": "需要 JS 渲染",
     "no_fingerprint": "无正文指纹（未参与归并）",
     "person_name_missing": "人名未出现在页面",
@@ -334,6 +336,18 @@ def _header(task: Mapping[str, Any]) -> str:
 def _banners(task: Mapping[str, Any], totals: Mapping[str, Any],
              channels: Sequence[Mapping[str, Any]]) -> str:
     out: list[str] = []
+    # robots 档位提示放最前：读者必须先知道"这批数据是怎么抓的"再看内容
+    tstats = task.get("stats") or {}
+    rmode = str(tstats.get("robots_mode") or "obey")
+    rforced = int(tstats.get("robots_forced") or 0)
+    if rmode != "obey" or rforced:
+        out.append(
+            '<div class="banner warn"><b>robots 档位：' + _esc(rmode) + "</b>"
+            "<span>本次抓取" + ("无视了 robots.txt 的 Disallow 规则" if rmode == "record"
+            else "完全未查询 robots.txt") +
+            (f"，强制抓取 {rforced} 条；" if rforced else "；") +
+            "逐域依据见「robots 覆盖」，所有绕过均已留痕。</span></div>"
+        )
     if task.get("truncated"):
         out.append(
             '<div class="banner warn"><b>结果不完整</b>'
@@ -509,6 +523,71 @@ def _coverage(channels: Sequence[Mapping[str, Any]]) -> str:
       <tbody>{''.join(rows)}</tbody>
     </table>
   </div>
+</section>"""
+
+
+_ROBOTS_MODE_CN = {
+    "obey": "obey · 遵守 robots.txt（Disallow 即拒抓）",
+    "record": "record · 查 robots 但不拦（⚠ 无视 Disallow 强制抓取）",
+    "off": "off · 完全不查询 robots.txt（⚠ 无规则依据）",
+}
+_ROBOTS_FAIL_CN = {"deny": "拉不到即禁", "allow": "拉不到即放行（留痕）"}
+
+
+def _robots(tstats: Mapping[str, Any]) -> str:
+    """robots 策略 + 逐域覆盖清单（2026-10-22 全案：绕过必须留痕）。
+
+    默认 obey 且零强制、零红线拦截时不渲染 —— 保持报告首屏干净；
+    只要动过档位或有过强制/拦截，整节出现，逐域列出依据。
+    """
+    mode = str(tstats.get("robots_mode") or "obey")
+    on_failure = str(tstats.get("robots_on_failure") or "deny")
+    forced = int(tstats.get("robots_forced") or 0)
+    gov = int(tstats.get("gov_blocked") or 0)
+    hosts: Sequence[Mapping[str, Any]] = tstats.get("robots_hosts") or []
+    if not hosts and mode == "obey" and not forced and not gov:
+        return ""
+
+    head = (
+        f'<p class="hint">本次档位：<b>{_esc(_ROBOTS_MODE_CN.get(mode, mode))}</b>'
+        f' · 失败语义：{_esc(_ROBOTS_FAIL_CN.get(on_failure, on_failure))}'
+        + (f' · <b class="bad">无视规则强制抓取 {_num(forced)} 条</b>' if forced else "")
+        + (f' · 政府站红线拦截 {_num(gov)} 条（请求未发）' if gov else "")
+        + "</p>"
+    )
+    rows: list[str] = []
+    for h in hosts:
+        h_forced = int(h.get("forced") or 0)
+        h_denied = int(h.get("denied") or 0)
+        if h_forced:
+            mark = '<span class="tag bad">强制抓取</span>'
+        elif h_denied:
+            mark = '<span class="tag warn">已拒绝</span>'
+        else:
+            mark = '<span class="tag ok">合规</span>'
+        rows.append(
+            "<tr>"
+            f'<td><code>{_esc(h.get("host"))}</code></td>'
+            f'<td class="dim">{_esc(h.get("status"))}</td>'
+            f'<td class="num">{_num(h_denied)}</td>'
+            f'<td class="num">{_num(h_forced)}</td>'
+            f"<td>{mark}</td>"
+            "</tr>"
+        )
+    table = (
+        f'<div class="panel"><table>'
+        f'<thead><tr><th>站点</th><th>robots.txt</th>'
+        f'<th class="num">拒绝</th><th class="num">强制</th><th>结论</th></tr></thead>'
+        f'<tbody>{"".join(rows)}</tbody></table></div>'
+        if rows else
+        '<div class="panel"><div class="empty">本次未访问任何站点的 robots.txt'
+        '（档位 off 或没有正文抓取）。</div></div>'
+    )
+    return f"""
+<section>
+  <h2>robots 覆盖<span class="sub">逐域结论 · 绕过全部留痕</span></h2>
+  {head}
+  {table}
 </section>"""
 
 
@@ -876,8 +955,10 @@ def _alerts(alerts: Sequence[Mapping[str, Any]]) -> str:
     rows = []
     for (channel, kind), details in grouped.items():
         cls = "bad" if kind in {"blocked", "challenge", "captcha", "rate_limit",
-                                "unknown_structure", "parse_fail", "fetch_fail"} \
+                                "unknown_structure", "parse_fail", "fetch_fail",
+                                "robots_forced"} \
             else ("warn" if kind in {"limit_reached", "dropped", "robots_disallow",
+                                     "gov_blocked",
                                      "person_org_unmatched", "person_name_missing",
                                      "person_no_anchor"} else "")
         shown = details[:3]
@@ -913,7 +994,8 @@ def _footer(task: Mapping[str, Any]) -> str:
     <p>本报告仅聚合公开可检索的标题与摘要，不存储、不分发原文全文；点击标题跳转原文。</p>
     <ol>
       <li>入库前已对手机号、身份证号、邮箱做脱敏，原始值不落库。</li>
-      <li>不抓取需登录内容，不绕过验证码 / Cloudflare，不使用代理池。</li>
+      <li><b>红线（2026-10-22 修订）：不抓政府网站</b>（.gov.cn 后缀硬拦截，请求不发，见告警与 robots 覆盖）。</li>
+      <li>robots.txt 的遵守/绕过档位与逐域结论见「robots 覆盖」一节；绕过全部留痕，不做隐形处理。</li>
       <li>被限流、被拒绝、页面结构变更的站点，如实记录在“覆盖率自评”与“告警”中。</li>
       <li>“无日期 / 相对日期”的时间不可当作真实发布时间使用。</li>
     </ol>
@@ -966,6 +1048,7 @@ def render_html(data: Mapping[str, Any]) -> str:
 {_banners(task, totals, channels)}
 {_overview(totals, task)}
 {_coverage(channels)}
+{_robots(tstats)}
 {_queries(queries)}
 {_domains(domains, max_per_domain)}
 {_timeline(timeline)}

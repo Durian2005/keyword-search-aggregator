@@ -43,7 +43,9 @@ class RunPayload:
     fields: tuple[str, ...] = ()
     roles: tuple[str, ...] = ()
     fetch_body: bool | None = None      # None = 听配置的
-    stealth: bool = False               # Scrapling 隐身浏览器档（默认关）
+    stealth: bool = False               # Scrapling 隐身浏览器档（默认关，反爬可选项）
+    robots_mode: str = "obey"           # obey | record | off（默认遵守）
+    robots_on_failure: str = "deny"     # deny | allow（默认保守禁止）
     max_docs: int | None = None
     expand: int | None = None
 
@@ -93,6 +95,13 @@ class RunPayload:
         if not isinstance(stealth, bool):
             raise ValueError("stealth 必须是 true/false")
 
+        robots_mode = data.get("robots_mode") or "obey"
+        if robots_mode not in ("obey", "record", "off"):
+            raise ValueError("robots_mode 必须是 obey / record / off")
+        robots_on_failure = data.get("robots_on_failure") or "deny"
+        if robots_on_failure not in ("deny", "allow"):
+            raise ValueError("robots_on_failure 必须是 deny / allow")
+
         return cls(
             keyword=keyword,
             person=bool(data.get("person")),
@@ -101,6 +110,8 @@ class RunPayload:
             roles=_anchors("roles"),
             fetch_body=fetch_body,
             stealth=stealth,
+            robots_mode=str(robots_mode),
+            robots_on_failure=str(robots_on_failure),
             max_docs=_int_or_none("max_docs"),
             expand=_int_or_none("expand"),
         )

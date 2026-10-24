@@ -69,7 +69,7 @@ def _policy(**kw) -> PagePolicy:
     base = dict(
         timeout=5, per_domain_qps=1000, max_per_domain=99,
         min_body_chars=200, challenge_keywords=("安全验证", "请输入验证码"),
-        obey_robots=False, retry=RetryPolicy(max_attempts=1),
+        robots_mode="off", retry=RetryPolicy(max_attempts=1),
     )
     base.update(kw)
     return PagePolicy(**base)

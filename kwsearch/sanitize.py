@@ -6,11 +6,13 @@
 
 三条规则来自 channels.yaml 的 filter 段：
 
-  pii_patterns   命中即脱敏。**这不是可选项**：手机号、身份证、邮箱一旦原样入库，
-                 报告就变成了人肉搜索工具，"公开信息聚合"的定性当场作废。
+  pii_patterns   命中即脱敏。手机号、身份证、邮箱原样入库会把报告变成
+                 人肉搜索工具 —— 这是**报告质量**规则，2026-10-22 起不再是红线。
   drop_url_patterns  .zip/.exe/下载页 —— 不是"信息"，抓了也无用，还容易踩版权
   max_per_domain   单域配额。不加这条，一个知乎/CSDN 就能占满整份报告，
                    读者会误以为"全网都在讨论"，其实只是某个站的站内搜索排名好。
+  block_host_suffixes  **项目唯一红线（2026-10-22 用户修订）：不抓政府网站**。
+                   默认 [".gov.cn"]，命中即丢 + 抓取层同步硬拦（双保险）。
   列表页/站点首页  内置规则（不走配置）：栏目列表页点进去是一屏文章目录，
                    站点首页点进去是站门口，都不是"一条结果"。百度 site: 查询
                    尤其爱返回这些（列表页里链着目标文章，就被搜索引擎算相关）。
@@ -65,6 +67,34 @@ _FALLBACK_PATTERNS: dict[str, str] = {
     "email": r"\b[\w.+-]+@[\w-]+\.[\w.]+\b",
 }
 
+# ---------------------------------------------------------------- 政府站红线
+# 项目唯一红线（2026-10-22 用户修订）：**不抓政府网站**。
+# 判定只看 host 后缀，宁可误杀不可漏放 —— .gov.cn 下的任何站点都不碰。
+# 历史红线（登录态/代理池/存全文/恶意行为禁令）同日作废，见 fetch/robots.py 顶部。
+DEFAULT_BLOCK_HOST_SUFFIXES: tuple[str, ...] = (".gov.cn",)
+
+
+def is_blocked_host(host: str, suffixes: tuple[str, ...] | list[str] | None = None) -> bool:
+    """host 是否命中红线后缀（政府网站）。大小写不敏感，允www. 前缀。
+
+    双保险用法：Sanitizer.check_url 丢弃结果 + fetch 层拒绝发请求。
+    """
+    h = (host or "").strip().lower()
+    if not h:
+        return False
+    if h.startswith("www."):
+        h = h[4:]
+    for suf in (suffixes if suffixes is not None else DEFAULT_BLOCK_HOST_SUFFIXES):
+        s = str(suf).strip().lower()
+        if not s:
+            continue
+        if not s.startswith("."):
+            s = "." + s
+        bare = s.lstrip(".")
+        if h == bare or h.endswith(s):
+            return True
+    return False
+
 # ---------------------------------------------------------------- 列表页判定
 # 栏目列表页与站点首页的 URL 形态。用户点开一条结果要看到的是正文，而这些页面
 # 点进去是一屏文章目录（甚至就是站门口）。百度 `site:官网域` 查询尤其爱返回它们：
@@ -108,7 +138,8 @@ def is_list_url(url: str) -> bool:
 class Sanitizer:
     """按 filter 配置做脱敏与丢弃判定。线程内复用，无状态（除配置）。"""
 
-    __slots__ = ("_rules", "_drop_domains", "_drop_url_re", "max_per_domain")
+    __slots__ = ("_rules", "_drop_domains", "_drop_url_re", "max_per_domain",
+                 "block_suffixes")
 
     def __init__(self, spec: Mapping[str, Any] | None = None) -> None:
         spec = spec or {}
@@ -132,6 +163,12 @@ class Sanitizer:
         self._drop_url_re = [
             re.compile(str(p), re.I) for p in (spec.get("drop_url_patterns") or ()) if str(p)
         ]
+        # 政府网站红线后缀。配置写了用配置的，没写用内置默认（.gov.cn）。
+        raw_suffixes = spec.get("block_host_suffixes")
+        self.block_suffixes: tuple[str, ...] = tuple(
+            str(s).strip() for s in (raw_suffixes if raw_suffixes is not None
+                                    else DEFAULT_BLOCK_HOST_SUFFIXES) if str(s).strip()
+        )
         # 0 / 负值 = 不限。默认 30 来自配置，不是硬编码。
         self.max_per_domain = max(0, int(spec.get("max_per_domain") or 0))
 
@@ -159,9 +196,12 @@ class Sanitizer:
         只看 URL 本身和域名，不看内容 —— 内容级的判断（风控页、空壳页）属于抽取层。
         """
         d = (domain or "").strip().lower()
+        if d.startswith("www."):
+            d = d[4:]
+        # 红线在最前面：政府网站连列表页/黑名单的讨论都轮不到，直接拒
+        if is_blocked_host(d or urlsplit(url).netloc, self.block_suffixes):
+            return "政府网站（红线：不抓）"
         if d:
-            if d.startswith("www."):
-                d = d[4:]
             for bad in self._drop_domains:
                 if d == bad or d.endswith("." + bad):
                     return f"域名在黑名单（{bad}）"
@@ -173,4 +213,4 @@ class Sanitizer:
         return None
 
 
-__all__ = ["Sanitizer", "is_list_url"]
+__all__ = ["DEFAULT_BLOCK_HOST_SUFFIXES", "Sanitizer", "is_blocked_host", "is_list_url"]
