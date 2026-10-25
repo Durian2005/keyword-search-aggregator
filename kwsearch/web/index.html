@@ -6,11 +6,15 @@
 <title>kwsearch · 交互页面</title>
 <style>
 /* 深色终端风：近黑底 + 霓虹绿 + 等宽字体 + 扫描线。
-   语义色三档且不与绿撞色：ok=霓虹绿 / warn=琥珀 / danger=红。 */
+   语义色三档且不与绿撞色：ok=霓虹绿 / warn=琥珀 / danger=红。
+   2026-10-24：骨架线改深朱红（用户要求「战斗感」）。刻意压暗到 #4a1220 ——
+   它只做分隔线，亮度必须低于正文，否则满屏红线会吃掉可读性；
+   亮红只留给状态色（danger）和开关特效。 */
 :root{
   --bg:#070b10; --bg-2:#0a0f16; --panel:#0d141d; --panel-2:#101a25;
   --ink:#d7e8dd; --ink-2:#a8c3b3; --muted:#5d768a;
-  --line:#1a2a3a; --line-2:#141f2b;
+  --line:#4a1220; --line-2:#2a0c14;
+  --line-hot:rgba(255,77,94,.55);      /* 边框高亮 / 特效描边 */
   --accent:#00ff9c; --accent-soft:rgba(0,255,156,.10);
   --warn:#ffb224; --warn-soft:rgba(255,178,36,.12);
   --danger:#ff4d5e; --danger-soft:rgba(255,77,94,.12);
@@ -23,11 +27,12 @@ html{-webkit-text-size-adjust:100%}
 body{
   margin:0; color:var(--ink);
   background:
-    radial-gradient(1200px 600px at 70% -10%, rgba(0,255,156,.05), transparent 60%),
-    linear-gradient(rgba(26,42,58,.32) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(26,42,58,.32) 1px, transparent 1px),
+    radial-gradient(1200px 600px at 70% -10%, rgba(255,45,85,.05), transparent 60%),
+    radial-gradient(900px 520px at 6% 108%, rgba(255,45,85,.045), transparent 65%),
+    linear-gradient(rgba(96,22,34,.32) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(96,22,34,.32) 1px, transparent 1px),
     var(--bg);
-  background-size:auto, 44px 44px, 44px 44px, auto;
+  background-size:auto, auto, 44px 44px, 44px 44px, auto;
   font:14px/1.7 var(--mono);
   font-feature-settings:"tnum" 1;
 }
@@ -46,10 +51,11 @@ a:hover{text-decoration:underline;text-shadow:0 0 8px rgba(0,255,156,.5)}
   border-bottom:1px solid var(--line);
   padding:30px 0 24px; position:relative; overflow:hidden;
 }
-.top::before{ /* 顶部霓虹细线 */
+.top::before{ /* 顶部霓虹细线：红—绿—红，红骨架里的唯一一条高亮 */
   content:""; position:absolute; left:0; right:0; top:0; height:2px;
-  background:linear-gradient(90deg, transparent, var(--accent), transparent);
-  filter:drop-shadow(0 0 6px var(--accent));
+  background:linear-gradient(90deg, transparent, var(--danger) 22%, var(--accent) 50%,
+             var(--danger) 78%, transparent);
+  filter:drop-shadow(0 0 6px rgba(255,77,94,.6));
 }
 .kicker{margin:0 0 6px;font-size:12px;letter-spacing:.22em;text-transform:uppercase;color:var(--muted)}
 .kicker::before{content:"> ";color:var(--accent)}
@@ -73,7 +79,8 @@ a:hover{text-decoration:underline;text-shadow:0 0 8px rgba(0,255,156,.5)}
 section{margin:22px 0 0}
 .panel{background:linear-gradient(180deg, var(--panel), var(--bg-2));
   border:1px solid var(--line);border-radius:var(--radius);
-  box-shadow:0 10px 30px rgba(0,0,0,.35)}
+  box-shadow:0 10px 30px rgba(0,0,0,.35), 0 0 0 1px rgba(255,77,94,.05),
+             inset 0 1px 0 rgba(255,77,94,.07)}
 h2{font-size:14px;margin:0 0 2px;letter-spacing:.08em;color:var(--ink)}
 h2::before{content:"// ";color:var(--accent);opacity:.8}
 h2 .sub{font-weight:400;color:var(--muted);font-size:12.5px;margin-left:8px}
@@ -216,6 +223,93 @@ td.dim{color:#4a6070}
 .tag.warn{background:var(--warn-soft);color:var(--warn);border-color:rgba(255,178,36,.35)}
 .tag.bad{background:var(--danger-soft);color:var(--danger);border-color:rgba(255,77,94,.35)}
 .foot{color:#3f5568;font-size:12px;margin:26px 0 34px;text-align:center;letter-spacing:.08em}
+
+/* ── 可选能力开关：划过弹窗 ─────────────────────────────
+   纯装饰层：fixed + pointer-events:none，不参与布局、不吃点击。
+   只动 transform / opacity（合成层动画），不碰 width/left/top —— 每帧不重排。
+   开（armed）= 红刃自右掠过；关 = 青锋自左收回：同一条动画线，方向与配色对称，
+   所以"取消勾选"也有对应的回程动画，不会一个有一个没有。
+   触发边界由 JS 管：只有用户在「反爬与合规」组里操作时才播。
+   （z-index 9000 < 扫描线 9999，特效不会被扫描线盖住，也不遮弹窗 1000。） */
+#fx-layer{position:fixed;inset:0;z-index:9000;pointer-events:none;overflow:hidden}
+.fx-card{
+  position:absolute;left:50%;top:20%;
+  display:flex;align-items:center;gap:14px;
+  min-width:min(540px,86vw);max-width:86vw;padding:15px 20px;
+  border-radius:12px;opacity:0;
+  transform:translate(-50%,0) translateX(118vw);
+  background:linear-gradient(135deg, rgba(30,7,12,.97), rgba(12,4,7,.97));
+  border:1px solid var(--line-hot);
+  box-shadow:0 0 0 1px rgba(255,77,94,.10), 0 0 46px rgba(255,45,85,.30),
+             0 24px 60px rgba(0,0,0,.65);
+  will-change:transform,opacity;
+}
+.fx-card .fx-ico{
+  flex:0 0 40px;width:40px;height:40px;border-radius:10px;
+  display:grid;place-items:center;font-size:19px;line-height:1;
+  color:#ffd9e1;background:rgba(255,45,85,.13);
+  border:1px solid rgba(255,77,94,.42);
+  box-shadow:inset 0 0 18px rgba(255,45,85,.30);
+}
+.fx-card .fx-body{min-width:0}
+.fx-card .fx-title{display:block;font-size:14px;font-weight:700;color:#ffdbe2;
+  letter-spacing:.06em;text-shadow:0 0 14px rgba(255,45,85,.55)}
+.fx-card .fx-note{display:block;margin-top:3px;font-size:12px;color:#c9a9b1}
+/* 扫光：一道斜向高光掠过卡片（伪元素，零布局成本） */
+.fx-card::after{
+  content:"";position:absolute;inset:0;border-radius:inherit;pointer-events:none;
+  background:linear-gradient(105deg, transparent 32%, rgba(255,255,255,.16) 45%,
+             rgba(255,150,175,.30) 50%, rgba(255,255,255,.10) 55%, transparent 68%);
+  transform:translateX(-130%);opacity:0;
+}
+.fx-card.on{animation:fx-cross-r .96s cubic-bezier(.2,.9,.25,1) forwards}
+.fx-card.on.back{animation-name:fx-cross-l}
+.fx-card.on::after{animation:fx-shine 1.05s ease-out .1s 2}
+.fx-card.on .fx-ico{animation:fx-pulse .96s ease-in-out}
+@keyframes fx-cross-r{
+  0%  {transform:translate(-50%,0) translateX(118vw) rotate(-1.5deg);opacity:0}
+  15% {transform:translate(-50%,0) translateX(0)     rotate(0);      opacity:1}
+  74% {transform:translate(-50%,0) translateX(0)     rotate(0);      opacity:1}
+  100%{transform:translate(-50%,0) translateX(-118vw) rotate(1.5deg);opacity:0}
+}
+@keyframes fx-cross-l{
+  0%  {transform:translate(-50%,0) translateX(-118vw) rotate(1.5deg);opacity:0}
+  15% {transform:translate(-50%,0) translateX(0)      rotate(0);     opacity:1}
+  74% {transform:translate(-50%,0) translateX(0)      rotate(0);     opacity:1}
+  100%{transform:translate(-50%,0) translateX(118vw)  rotate(-1.5deg);opacity:0}
+}
+@keyframes fx-shine{
+  0%{transform:translateX(-130%);opacity:0}
+  20%{opacity:1}
+  100%{transform:translateX(130%);opacity:0}
+}
+@keyframes fx-pulse{
+  0%,100%{box-shadow:inset 0 0 18px rgba(255,45,85,.30)}
+  45%{box-shadow:inset 0 0 26px rgba(255,45,85,.85), 0 0 24px rgba(255,45,85,.55)}
+}
+/* 关（收手）态：换青绿，动画形态与开完全对称 */
+.fx-card.back{
+  background:linear-gradient(135deg, rgba(5,20,15,.97), rgba(3,10,8,.97));
+  border-color:rgba(0,255,156,.45);
+  box-shadow:0 0 0 1px rgba(0,255,156,.08), 0 0 44px rgba(0,255,156,.18),
+             0 24px 60px rgba(0,0,0,.65);
+}
+.fx-card.back .fx-ico{color:#cafff0;background:rgba(0,255,156,.10);
+  border-color:rgba(0,255,156,.40);box-shadow:inset 0 0 18px rgba(0,255,156,.22)}
+.fx-card.back .fx-title{color:#d8fff1;text-shadow:0 0 14px rgba(0,255,156,.45)}
+.fx-card.back .fx-note{color:#a9c9bc}
+.fx-card.back::after{background:linear-gradient(105deg, transparent 32%,
+  rgba(255,255,255,.14) 45%, rgba(120,255,200,.28) 50%, rgba(255,255,255,.08) 55%, transparent 68%)}
+/* 系统级"减少动效"：不位移，只做短促淡入淡出 */
+@media (prefers-reduced-motion: reduce){
+  .fx-card.on,.fx-card.on.back{animation:fx-fade .45s ease-out forwards}
+  .fx-card.on::after,.fx-card.on .fx-ico{animation:none}
+  @keyframes fx-fade{
+    0%{transform:translate(-50%,0);opacity:0}
+    35%{transform:translate(-50%,0);opacity:1}
+    100%{transform:translate(-50%,0);opacity:0}
+  }
+}
 </style>
 </head>
 <body>
@@ -354,6 +448,17 @@ td.dim{color:#4a6070}
   <p class="foot">报告为单文件 HTML · 数据只落在本机 SQLite · 服务仅监听 127.0.0.1</p>
 </main>
 
+<!-- 可选能力开关的划过特效层：纯装饰，pointer-events:none，不参与布局也不吃点击 -->
+<div id="fx-layer" aria-hidden="true">
+  <div class="fx-card" id="fx-card">
+    <div class="fx-ico" id="fx-ico">⚔</div>
+    <div class="fx-body">
+      <b class="fx-title" id="fx-title"></b>
+      <span class="fx-note" id="fx-note"></span>
+    </div>
+  </div>
+</div>
+
 <script>
 "use strict";
 const $ = (id) => document.getElementById(id);
@@ -404,6 +509,74 @@ function renderTasks(list) {
 /* ── 提交 ───────────────────────────────────────────── */
 $("person").addEventListener("change", (e) =>
   $("person-row").classList.toggle("on", e.target.checked));
+
+/* ── 可选能力开关：划过弹窗 ────────────────────────────
+   触发边界（刻意收窄）：只有「反爬与合规」组里的三个开关变化才播 ——
+   隐身档勾选、robots 档位切到 record/off、拉不到时切到放行。
+   页面加载、恢复任务、提交表单，以及无关的勾选（人名模式 / 抓正文）都不播 ——
+   否则它就从"警示"退化成"装饰"，反而没人看。
+   开/关共用同一条动画：开 = 红刃自右掠过，关 = 青锋自左收回。
+   所以"取消勾选"也有对应动画，不会一个有、一个没有。 */
+const playFx = (() => {
+  const card = $("fx-card"), ico = $("fx-ico"),
+        title = $("fx-title"), note = $("fx-note");
+  // 只认主划过动画的结束（扫光/脉冲是附属动画，清理它们会打断主线的收尾）
+  card.addEventListener("animationend", (e) => {
+    if (/^fx-(cross|fade)/.test(e.animationName)) card.className = "fx-card";
+  });
+  return function fire(opt) {
+    card.className = "fx-card";      // 复位
+    void card.offsetWidth;           // 强制回流：同一帧内连点也能重启动画
+    ico.textContent = opt.icon;
+    title.textContent = opt.title;
+    note.textContent = opt.note;
+    card.className = "fx-card on" + (opt.armed ? "" : " back");
+  };
+})();
+
+/* 隐身档：勾选 = 武装，取消 = 收手（两者都播，形态对称） */
+$("stealth").addEventListener("change", (e) => {
+  if (e.target.checked) {
+    playFx({armed: true, icon: "⚔", title: "隐身档启动",
+      note: "浏览器指纹伪装，让它像普通浏览器一样访问公开页面；robots 判定不受影响"});
+  } else {
+    playFx({armed: false, icon: "◇", title: "隐身档关闭",
+      note: "回到普通抓取链路；已抓到的正文与连接不受影响"});
+  }
+});
+
+/* robots 档位：obey ↔ record / off */
+let robotsPrev = $("robots_mode").value;
+$("robots_mode").addEventListener("change", (e) => {
+  const v = e.target.value;
+  if (v === robotsPrev) return;      // 只认真正的变化，避免重复播
+  robotsPrev = v;
+  if (v === "record") {
+    playFx({armed: true, icon: "⚔", title: "robots 放行：record",
+      note: "查规则但不拦；每条无视 Disallow 的抓取都进报告「robots 覆盖」清单"});
+  } else if (v === "off") {
+    playFx({armed: true, icon: "⚔", title: "robots 关闭：off",
+      note: "完全不拉 robots.txt；报告里这些域会标注「无规则依据」"});
+  } else {
+    playFx({armed: false, icon: "◇", title: "回到遵守：obey",
+      note: "按 Disallow / Crawl-delay 停手，不再有强制抓取"});
+  }
+});
+
+/* robots.txt 拉不到时的失败语义：deny ↔ allow */
+let failPrev = $("robots_on_failure").value;
+$("robots_on_failure").addEventListener("change", (e) => {
+  const v = e.target.value;
+  if (v === failPrev) return;
+  failPrev = v;
+  if (v === "allow") {
+    playFx({armed: true, icon: "⚔", title: "失败放行",
+      note: "robots.txt 5xx / 网络错误时照抓并逐域留痕 —— 这和「遵守规则」不是一回事"});
+  } else {
+    playFx({armed: false, icon: "◇", title: "回到保守",
+      note: "robots.txt 拉不到就停手，不硬闯"});
+  }
+});
 
 function showAlert(kind, msg) {
   const a = $("form-alert");

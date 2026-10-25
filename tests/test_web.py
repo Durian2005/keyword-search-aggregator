@@ -252,7 +252,7 @@ class TestFormatResultLines(unittest.TestCase):
                 unique=9, error=None, blocked=0, stopped_reason=None)],
             task_id="t1", status="ok", truncated=False,
             kept=5, docs_new=5, unique=5, candidates=10, dropped_url=1,
-            dropped_cap=0, pii_masked=0, alerts=0, elapsed_ms=1234,
+            dropped_cap=0, dropped_dup=0, pii_masked=0, alerts=0, elapsed_ms=1234,
             resolved_list=0,
             person_cards=0, person_name_missing=0, person_tiers={},
         )
