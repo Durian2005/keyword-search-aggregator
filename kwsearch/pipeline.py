@@ -55,7 +55,7 @@ from kwsearch.fetch import FetchError
 from kwsearch.fetch import build_fetcher, default_headers
 from kwsearch.fetch.page import HostThrottle, PagePolicy, fetch_pages
 from kwsearch.fetch.robots import resolve_on_failure, resolve_robots_mode
-from kwsearch.models import Candidate, Doc, Mention
+from kwsearch.models import Candidate, ChannelResult, Doc, Mention
 from kwsearch.person import (
     TIER_CN,
     UNMATCHED_LABEL,
@@ -105,8 +105,12 @@ _TS_RANK = {
 
 
 def ts_rank(source: str) -> int:
-    """时间来源的可信度名次。未知来源排最后，但不高于 fallback。"""
-    return _TS_RANK.get(source, 7)
+    """时间来源的可信度名次。未知来源按 fallback 计（最不可信的那一档）。
+
+    不能写死数字：一旦有人在 _TS_RANK 里插一档，所有档位会整体后移，
+    而写死的 7 会悄悄变成"比 fallback 更不可信" —— 排序结论随之失真。
+    """
+    return _TS_RANK.get(source, _TS_RANK[TS_FALLBACK])
 
 
 # 报告里要标"时间不可信"的来源
@@ -260,7 +264,6 @@ def _screen_single_page(
 def _run_serp(
     ch: ChannelConfig,
     ctx: ChannelContext,
-    keyword: str,
     variants: list[QueryVariant],
     *,
     pattern,                       # re.Pattern | None
@@ -268,7 +271,12 @@ def _run_serp(
     sleep: Callable[[float], None],
     plan_hook: Callable[[list[Candidate]], Sequence[QueryVariant]] | None = None,
 ) -> tuple[ChannelRun, list[Candidate], list[dict]]:
-    """通用搜索通道：基词 + 变体矩阵，靠换说法扩量（它的翻页已废）。"""
+    """通用搜索通道：基词 + 变体矩阵，靠换说法扩量（它的翻页已废）。
+
+    签名里没有 keyword：查询词全在 variants 里（variants[0].q 就是基词）。
+    曾经留着一个 keyword 形参但函数体从不使用 —— 读代码的人会以为它参与了
+    过滤或 URL 渲染，白找一轮。
+    """
     fn = get_channel(ch.parser)
     t0 = time.perf_counter()
     merged, stats = expand_channel(
@@ -305,6 +313,39 @@ def _run_serp(
     return run, merged, logs
 
 
+def _paged_log(
+    ch: ChannelConfig,
+    result: ChannelResult,
+    *,
+    seq: int,
+    query: str,
+    url: str,
+    new: int,
+    degenerate: bool,
+) -> dict:
+    """一次翻页调用的账目（落 query 表的那一行）。
+
+    `_run_paged` 与 `_run_paged_multi` 的循环体共九成相同，只有"用什么词、停哪里"
+    不同 —— 账目字段必须逐字一致，抽在这里，免得哪天加了字段只补一处，
+    报告里两条路径的"覆盖率自评"就对不上了。
+
+    断言按"每一次调用"判断，不整批合并：合并会漏掉"某一页突然只剩 1 条"。
+    退化页与被拦页跳过断言 —— 它们本来就不该有正常结构。
+    """
+    return {
+        "seq": seq,
+        "url": url,
+        "query_text": query,
+        "got": 0 if degenerate else len(result.candidates),
+        "new": new,
+        "blocked": result.blocked,
+        "block_kind": result.block_kind,
+        "detail": result.detail or "",
+        "elapsed_ms": result.elapsed_ms,
+        "problems": [] if (degenerate or result.blocked) else check_assertions(result, ch),
+    }
+
+
 def _run_paged(
     ch: ChannelConfig,
     ctx: ChannelContext,
@@ -335,19 +376,14 @@ def _run_paged(
         degenerate = prev_sig is not None and bool(sig) and sig == prev_sig
         prev_sig = sig or prev_sig
 
-        logs.append({
-            "seq": i,
-            "url": ch.build_url(keyword, off, timespan),
-            "query_text": keyword,
-            "got": 0 if degenerate else len(r.candidates),
-            "new": 0,
-            "blocked": r.blocked,
-            "block_kind": r.block_kind,
-            "detail": r.detail or "",
-            "elapsed_ms": r.elapsed_ms,
-            # 断言按"每一页"判断：只有整批合并才判，会漏掉"某一页突然只剩 1 条"
-            "problems": [] if (degenerate or r.blocked) else check_assertions(r, ch),
-        })
+        logs.append(_paged_log(
+            ch, r,
+            seq=i,
+            query=keyword,
+            url=ch.build_url(keyword, off, timespan),
+            new=0,
+            degenerate=degenerate,
+        ))
 
         if r.blocked:
             run.blocked += 1
@@ -470,19 +506,14 @@ def _run_paged_multi(
                     new_here += 1
                 gained += new_here
 
-            logs.append({
-                "seq": seq,
-                "url": ch.build_url(v.q, off, timespan),
-                "query_text": v.q,
-                "got": 0 if degenerate else len(r.candidates),
-                "new": new_here,
-                "blocked": r.blocked,
-                "block_kind": r.block_kind,
-                "detail": r.detail or "",
-                "elapsed_ms": r.elapsed_ms,
-                # 断言按"每一次调用"判断：只有整批合并才判，会漏掉"某一页突然只剩 1 条"
-                "problems": [] if (degenerate or r.blocked) else check_assertions(r, ch),
-            })
+            logs.append(_paged_log(
+                ch, r,
+                seq=seq,
+                query=v.q,
+                url=ch.build_url(v.q, off, timespan),
+                new=new_here,
+                degenerate=degenerate,
+            ))
 
             if r.blocked:
                 run.blocked += 1
@@ -1025,13 +1056,13 @@ def run_task(
             #   其它        —— 服务端匹配可靠，换词只拿回重复 → _run_paged
             if ch.type == "serp" and ch.variants and (len(variants) > 1 or auto_probe):
                 run, cands, logs = _run_serp(
-                    ch, ctx, keyword, ch_variants,
+                    ch, ctx, ch_variants,
                     pattern=pattern, zero_gain_streak=zero_gain, sleep=sleep,
                     plan_hook=_plan_hook if auto_probe else None,
                 )
             elif org_site_q:
                 run, cands, logs = _run_serp(
-                    ch, ctx, keyword, ch_variants,
+                    ch, ctx, ch_variants,
                     pattern=pattern, zero_gain_streak=zero_gain, sleep=sleep,
                 )
             elif (ch.type == "site_search" and ch.variants

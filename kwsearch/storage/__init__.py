@@ -125,6 +125,11 @@ def table_counts(conn: sqlite3.Connection) -> dict[str, int]:
 class _WipeMixin:
     """清空相关操作。混在 Repository 上，保持 conn 单入口。"""
 
+    # 必须显式写空 __slots__：只要基类没声明它，子类的 __slots__ 就完全失效
+    # （实例照样带 __dict__）。Repository.__slots__ 原意是"只允许 conn 一个属性、
+    # 拼错属性名立刻 AttributeError"，基类这一行缺失会让那条保证悄悄消失。
+    __slots__ = ()
+
     conn: sqlite3.Connection
 
     def wipe_preview(self) -> dict[str, int]:
@@ -154,7 +159,7 @@ class _WipeMixin:
                 pass
         try:
             self.conn.execute("VACUUM")
-        except sqlite3.Error as e:           # noqa: BLE001 —— 收缩失败不该让清空失败
+        except sqlite3.Error as e:           # 具体异常，不是 blind except
             logger.warning("已清空数据，但 VACUUM 收缩文件失败: %s", e)
         return before
 
@@ -680,7 +685,9 @@ class Repository(_WipeMixin):
         with_time = self.conn.execute(
             "SELECT COUNT(*) FROM mention m JOIN doc d ON d.url_canon=m.url_canon"
             " WHERE m.task_id=? AND d.published_at IS NOT NULL", (task_id,)).fetchone()[0]
-        new_docs = self.conn.execute("SELECT COUNT(*) FROM doc").fetchone()[0]
+        # 变量名别叫 new_docs：返回里 "new_docs" 是**本任务新发现**（取自 stats_json），
+        # 而这个数是**全库累计**。两者曾经共用一个名字，读代码时极易张冠李戴。
+        db_total = self.conn.execute("SELECT COUNT(*) FROM doc").fetchone()[0]
 
         # 人名模式的候选人卡片（普通任务里为空表，报告据此决定要不要出这一块）
         person_cards = [dict(r) for r in self.conn.execute(
@@ -742,7 +749,7 @@ class Repository(_WipeMixin):
                 "with_time": with_time,
                 "no_time": doc_count - with_time,
                 "new_docs": int(stats_json.get("docs_new", 0)),
-                "db_docs": new_docs,
+                "db_docs": db_total,
                 "clusters": len(clusters),
                 "groups": groups,
                 "merged": doc_count - groups,

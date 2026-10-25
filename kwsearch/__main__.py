@@ -135,14 +135,25 @@ def cmd_run(
         if reason:
             plan.append([c.id, "-", "跳过", reason])
             continue
-        # 变体只用于 serp：通用搜索引擎靠换说法扩量（翻页已废）；
-        # 站点检索/公开 API 的服务端匹配是可靠的，换词只会拿回高度重复的结果，
-        # 它们的扩量手段是翻页（B站 20 条/页）。两类通道的扩量方式不同，不能一套配置打天下。
-        queries = [v.q for v in variants] if (c.type == "serp" and len(variants) > 1) else [keyword]
-        for q in queries:
-            for off in c.offsets():
-                url = c.build_url(q, off, timespan)
-                plan.append([c.id, _clip(q, 20), "待发", url])
+        # 计划表必须与 pipeline 的三条真实分支一一对应，否则 --dry 会骗人：
+        #   serp        —— 变体矩阵，每个说法只打一次（翻页对它们已失效）
+        #   site_search —— 基词翻满页 + 变体各只打第一页（_run_paged_multi）
+        #   其它        —— 只打基词，靠翻页扩量
+        # ch.variants=false 的通道（如百度：第二发就是验证码）不论哪一类都只打基词。
+        # 曾经这里只认 serp 吃变体，site_search 支持变体之后表格仍只列基词，
+        # 与实际请求数差出一倍多 —— "计划最多 N 个请求"那句话直接失真。
+        targets: list[tuple[str, int]] = []
+        if c.type == "serp" and c.variants and len(variants) > 1:
+            targets = [(v.q, c.paging.start) for v in variants]
+        elif (c.type == "site_search" and c.variants
+              and len(variants) > 1 and c.paging.mode != "none"):
+            offsets = c.offsets()
+            targets = [(variants[0].q, off) for off in offsets]
+            targets += [(v.q, offsets[0]) for v in variants[1:]]
+        else:
+            targets = [(keyword, off) for off in c.offsets()]
+        for q, off in targets:
+            plan.append([c.id, _clip(q, 20), "待发", c.build_url(q, off, timespan)])
 
     total = sum(1 for r in plan if r[2] == "待发")
     if dry:
@@ -154,6 +165,14 @@ def cmd_run(
               f"全局并发 {cfg.crawl.get('concurrency', 4)}）")
         print("注意：实际执行时会按 zero_gain_streak 早停、被拦即停，"
               f"所以真实请求数通常低于 {total}")
+        # profile=auto 时上面只列得出基词：变体要等基词结果出来、探测完类型才定。
+        # 不说明的话，"共 N 个请求待发"会被当成上界，而它只是下界。
+        profiles = dict(cfg.expand or {}).get("profiles") or {}
+        n_var = max((len(v or []) for v in profiles.values()), default=0)
+        if (str((cfg.expand or {}).get("profile", "auto")) == "auto"
+                and person is None and n_var):
+            print(f"       profile=auto 会先打基词、按结果类型决定是否追加变体"
+                  f"（最多 +{n_var} 个查询），所以这也是个下界。")
         print("\n--dry：只渲染 URL，未发任何请求。")
         return 0
 
