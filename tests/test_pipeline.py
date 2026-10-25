@@ -88,6 +88,56 @@ def fake_single(keyword: str, offset: int, ctx) -> ChannelResult:  # noqa: ANN00
     return _mk(_SERP_ITEMS[:2], "fake_single", keyword)
 
 
+# ---- 站内检索的变体矩阵（2026-10-25）--------------------------------------
+# 每次调用给一条全新 URL：这样"打了多少次、每次都换页/换词"可以直接从结果条数
+# 与 query 表读出来，不会被去重算法干扰。
+_SITE_CALLS = {"n": 0}
+
+
+def fake_site_multi(keyword: str, offset: int, ctx) -> ChannelResult:  # noqa: ANN001
+    """站内检索：基词翻满页、变体各只打第一页 —— 每次调用返回一条互不重复的条目。"""
+    _SITE_CALLS["n"] += 1
+    n = _SITE_CALLS["n"]
+    return _mk([
+        (f"https://s{n}.example.com/{n}", f"红黑树 站内第 {n} 条",
+         "红黑树是一种自平衡二叉查找树", f"s{n}.example.com"),
+    ], "fake_site_multi", keyword)
+
+
+def fake_site_relaxed(keyword: str, offset: int, ctx) -> ChannelResult:  # noqa: ANN001
+    """只有「红黑树 原理」这一个变体被降级，其余正常。
+
+    验的是"降级只停当前变体" —— 所以必须有一个降级、一个不降级，
+    否则分不清是"停了这个变体"还是"停了整条通道"。
+    """
+    if keyword.strip() == "红黑树 原理":
+        return ChannelResult(channel="fake_site_relaxed", query=keyword, candidates=[],
+                             raw_count=0, block_kind="relaxed", detail="fake 降级")
+    _SITE_CALLS["n"] += 1
+    n = _SITE_CALLS["n"]
+    return _mk([
+        (f"https://r{n}.example.com/{n}", "红黑树 站内结果",
+         "红黑树是一种自平衡二叉查找树", f"r{n}.example.com"),
+    ], "fake_site_relaxed", keyword)
+
+
+def fake_site_blocked(keyword: str, offset: int, ctx) -> ChannelResult:  # noqa: ANN001
+    """基词第 2 页被拦：验"被拦全局停、连变体都不再打"。"""
+    if offset >= 2:
+        return ChannelResult(channel="fake_site_blocked", query=keyword, candidates=[],
+                             raw_count=0, blocked=True, block_kind="http_412",
+                             detail="fake 412")
+    return _mk([
+        ("https://k1.example.com/1", "红黑树 站内结果",
+         "红黑树是一种自平衡二叉查找树", "k1.example.com"),
+    ], "fake_site_blocked", keyword)
+
+
+discover._REGISTRY["fake_site_multi"] = fake_site_multi
+discover._REGISTRY["fake_site_relaxed"] = fake_site_relaxed
+discover._REGISTRY["fake_site_blocked"] = fake_site_blocked
+
+
 # 搜狗微信场景：中转链 `link?url=<token>` 的 token 每次请求都轮换，
 # URL 每次都变，但 dedupe_key（公众号+标题+日期）恒定。
 _ROTATE = {"n": 0}
@@ -221,6 +271,21 @@ class _FakeFetcher(BaseFetcher):
 
 # --------------------------------------------------------------- 配置
 
+# expand 段的默认值（可用 cfg(expand=...) 覆盖）。抽出来是为了让
+# "站内检索吃变体"那组测试能自己指定几个后缀，而不必复制整份 _BASE。
+_EXPAND_DEFAULT = """  enabled: true
+  max_queries: 3
+  suffixes: ["原理"]
+  zero_gain_streak: 2
+  require_keyword: true"""
+
+# 两个后缀：用来验"某个变体被降级后，后面的变体照打"。
+_EXPAND_TWO = """  enabled: true
+  max_queries: 4
+  suffixes: ["原理", "实现"]
+  zero_gain_streak: 3
+  require_keyword: true"""
+
 _BASE = """
 version: 1
 defaults:
@@ -230,11 +295,7 @@ defaults:
 channels:
 {channels}
 expand:
-  enabled: true
-  max_queries: 3
-  suffixes: ["原理"]
-  zero_gain_streak: 2
-  require_keyword: true
+{expand}
 filter:
   pii_patterns: {{}}
   drop_url_patterns: ["\\\\.(zip|exe)$"]
@@ -316,6 +377,39 @@ _SINGLE_CH = """
     paging: {mode: none}
     throttle: {min_interval_s: 0}
     assertions: {min_items: 1, required_fields: [url, title]}
+"""
+
+# 站内检索（B站 / 搜狗微信同款形态）：max_pages=2，用来验"基词翻满、变体各只一页"
+_SITE_MULTI_CH = """
+  - id: fake_site_multi
+    type: site_search
+    parser: fake_site_multi
+    url_template: "https://fake.test/sm?q={q}&page={offset}"
+    paging: {mode: offset, param: page, start: 1, step: 1, max_pages: 2}
+    throttle: {min_interval_s: 0}
+    assertions: {min_items: 1, required_fields: [url, title]}
+"""
+
+# 变体会被降级：min_items 放 0，因为降级页本来就返回 0 条（不该记断言失败）
+_SITE_RELAXED_CH = """
+  - id: fake_site_relaxed
+    type: site_search
+    parser: fake_site_relaxed
+    url_template: "https://fake.test/sr?q={q}&page={offset}"
+    paging: {mode: offset, param: page, start: 1, step: 1, max_pages: 2}
+    throttle: {min_interval_s: 0}
+    assertions: {min_items: 0, required_fields: [url, title]}
+"""
+
+# 第 2 页就被拦（B站 412 同款）
+_SITE_BLOCKED_CH = """
+  - id: fake_site_blocked
+    type: site_search
+    parser: fake_site_blocked
+    url_template: "https://fake.test/sb?q={q}&page={offset}"
+    paging: {mode: offset, param: page, start: 1, step: 1, max_pages: 3}
+    throttle: {min_interval_s: 0}
+    assertions: {min_items: 0, required_fields: [url, title]}
 """
 
 _PERSON_CH = """
@@ -462,14 +556,15 @@ class RunCase(unittest.TestCase):
 
     def cfg(self, channels: str, max_docs: int = 20, *,
             drop_zero_hit: bool = True, max_per_domain: int = 2,
-            fetch_body: bool = False, crawl: str = "{}"):
+            fetch_body: bool = False, crawl: str = "{}",
+            expand: str = _EXPAND_DEFAULT):
         p = self.dir / "channels.yaml"
         p.write_text(_BASE.format(
             channels=channels, max_docs=max_docs,
             drop_zero="true" if drop_zero_hit else "false",
             max_per_domain=max_per_domain,
             fetch_body="true" if fetch_body else "false",
-            crawl=crawl,
+            crawl=crawl, expand=expand,
         ), encoding="utf-8")
         return load_config(p)
 
@@ -626,11 +721,67 @@ class TestBlocked(RunCase):
 class TestPagingDegraded(RunCase):
     def test_same_page_stops_paging(self) -> None:
         r = self.run_kw(self.cfg(_PAGED_CH))
-        queries = self.rows("SELECT * FROM query WHERE channel='fake_paged'")
-        # max_pages=4，但第 2 页就与第 1 页完全相同 → 只应请求 2 次
-        self.assertEqual(len(queries), 2)
+        queries = self.rows("SELECT * FROM query WHERE channel='fake_paged' ORDER BY seq")
+        # max_pages=4，基词第 2 页就与第 1 页完全相同 → 基词只请求 2 次。
+        # 第 3 次是变体（"红黑树 原理"）的第 1 页：站点检索接上变体矩阵后，
+        # 基词的翻页退化只停基词，不妨碍变体各打一页（2026-10-25）。
+        self.assertEqual(len(queries), 3)
+        self.assertEqual([q["query_text"] for q in queries[:2]], ["红黑树", "红黑树"])
+        self.assertEqual(queries[2]["query_text"], "红黑树 原理")
         run = r.per_channel[0]
         self.assertIn("分页失效", run.stopped_reason)
+
+
+class TestSiteSearchVariants(RunCase):
+    """站内检索（B站 / 搜狗微信）的变体矩阵：基词翻满、变体各只打一页。
+
+    2026-10-25 之前这类通道只打基词一次（pipeline 的判定写死 type == "serp"），
+    而它们恰恰是最能出量的两个通道 —— 变体矩阵对它们完全没生效。
+    """
+
+    def test_base_pages_full_and_variants_one_page_each(self) -> None:
+        r = self.run_kw(self.cfg(_SITE_MULTI_CH, expand=_EXPAND_TWO, max_per_domain=10))
+        qs = self.rows("SELECT * FROM query WHERE channel='fake_site_multi' ORDER BY seq")
+        # 基词 2 页（max_pages=2）+ 2 个变体各 1 页 = 4 次调用
+        self.assertEqual([q["query_text"] for q in qs],
+                         ["红黑树", "红黑树", "红黑树 原理", "红黑树 实现"])
+        # 每次调用一条唯一条目 → 4 条候选全部留下
+        self.assertEqual(r.candidates, 4)
+        self.assertEqual(r.unique, 4)
+
+    def test_variant_relaxed_does_not_kill_channel(self) -> None:
+        r = self.run_kw(self.cfg(_SITE_RELAXED_CH, expand=_EXPAND_TWO))
+        qs = self.rows("SELECT * FROM query WHERE channel='fake_site_relaxed' ORDER BY seq")
+        # 基词 2 页 + 变体1（被降级，只停它自己）+ 变体2 照打 = 4 次
+        self.assertEqual(len(qs), 4)
+        self.assertEqual([q["query_text"] for q in qs],
+                         ["红黑树", "红黑树", "红黑树 原理", "红黑树 实现"])
+        self.assertEqual(qs[2]["block_kind"], "relaxed")
+        # 变体2 仍然拿到了结果 —— 这才证明"降级只停当前变体"
+        self.assertEqual(qs[3]["got_count"], 1)
+        self.assertGreaterEqual(r.kept, 3)
+        # 降级不是故障：不许把整个任务判成失败
+        self.assertNotEqual(r.status, "failed")
+
+    def test_blocked_stops_whole_channel(self) -> None:
+        r = self.run_kw(self.cfg(_SITE_BLOCKED_CH, expand=_EXPAND_TWO))
+        qs = self.rows("SELECT * FROM query WHERE channel='fake_site_blocked' ORDER BY seq")
+        # 基词第 2 页被拦 → 立刻停，连变体都不再打
+        self.assertEqual(len(qs), 2)
+        self.assertTrue(qs[1]["blocked"])
+        self.assertNotIn("红黑树 原理", [q["query_text"] for q in qs])
+        kinds = {row["kind"] for row in self.rows(
+            "SELECT kind FROM alert WHERE channel='fake_site_blocked'")}
+        self.assertIn("blocked", kinds)
+
+    def test_variants_off_keeps_single_query(self) -> None:
+        """expand.enabled=false（或 --no-expand）时必须退回单次翻页，不许打变体。"""
+        cfg = self.cfg(_SITE_MULTI_CH, max_per_domain=10,
+                       expand="  enabled: false")
+        r = self.run_kw(cfg)
+        qs = self.rows("SELECT * FROM query WHERE channel='fake_site_multi'")
+        self.assertEqual([q["query_text"] for q in qs], ["红黑树", "红黑树"])  # 只有基词翻 2 页
+        self.assertEqual(r.candidates, 2)
 
 
 class TestZeroHit(RunCase):

@@ -31,7 +31,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable, Sequence
 
-from kwsearch.aggregate import host_of, relate
+from kwsearch.aggregate import canonicalize, host_of, relate
 from kwsearch.aggregate.cluster import (
     DEFAULT_HAMMING,
     DEFAULT_MIN_BODY,
@@ -371,6 +371,140 @@ def _run_paged(
     run.elapsed_ms = int((time.perf_counter() - t0) * 1000)
     if not run.stopped_reason:
         run.stopped_reason = f"已抓 {len(offsets)} 页"
+    return run, out, logs
+
+
+def _run_paged_multi(
+    ch: ChannelConfig,
+    ctx: ChannelContext,
+    variants: list[QueryVariant],
+    *,
+    timespan: str | None,
+    max_pages: int,
+    zero_gain_streak: int,
+    sleep: Callable[[float], None],
+) -> tuple[ChannelRun, list[Candidate], list[dict]]:
+    """站内检索的变体矩阵：基词翻满、变体各只打第一页。
+
+    分工：`_run_serp` 是"翻页已废，只能换说法"（Bing）；`_run_paged` 是
+    "服务端匹配可靠，换词只会拿回重复"（GDELT / 单发配额通道）。站内检索
+    （B站 / 搜狗微信）两种手段都有效，所以这里组合：**基词翻页拿"深"，
+    变体拿"广"**。
+
+    为什么变体不翻页：请求数会变成「变体数 × 页数」（B站 6 个变体 × 5 页 =
+    30 发），而这类通道的配额按请求数衰减（B站 412 滚动配额、搜狗风控）。
+    变体的价值就在换词，翻页预算全留给基词收益更高也更安全。
+
+    与 `_run_paged` 的三处差别：
+    - 页签名（degenerate 判定）**按变体重置**：换词后的第 1 页不该跟上一个
+      变体的最后一页比，否则会误判成"分页失效"
+    - `relaxed` / `boilerplate` 只停**当前变体**，不终止整个通道 —— 一个说法
+      搜不到，不代表别的说法也搜不到（这正是变体的意义）；只有被拦
+      （412 / 验证码）才全局停，因为继续打只会加重风控
+    - 跨变体共享 `seen` 去重，重复计入 `duplicated`
+
+    不做逐条过滤：站内检索的每条都是服务端认为相关的，按标题筛会杀掉改写
+    标题（与 `_run_paged` 同一口径），兜底交给入库前的 `drop_zero_hit`。
+    """
+    fn = get_channel(ch.parser)
+    t0 = time.perf_counter()
+    offsets = ch.offsets()[:max(1, max_pages)]
+
+    out: list[Candidate] = []
+    logs: list[dict] = []
+    seen: set[str] = set()
+    run = ChannelRun(channel=ch.id, type=ch.type)
+    seq = 0
+    streak = 0
+    notes: list[str] = []
+    first_call = True
+
+    for vi, v in enumerate(variants):
+        if not first_call:
+            sleep(ch.throttle_min_interval_s)
+        first_call = False
+        # 基词翻满页，变体只打第一页（理由见 docstring）
+        pages = offsets if vi == 0 else offsets[:1]
+        prev_sig: frozenset[str] | None = None
+        gained = 0
+        hard_stop = False
+
+        for pi, off in enumerate(pages, start=1):
+            if pi > 1:
+                sleep(ch.throttle_min_interval_s)
+            r = fn(v.q, off, ctx)
+            seq += 1
+            run.queries += 1
+            run.got += len(r.candidates)
+
+            sig = page_signature(r)
+            degenerate = prev_sig is not None and bool(sig) and sig == prev_sig
+            prev_sig = sig or prev_sig
+
+            new_here = 0
+            if not (r.blocked or degenerate):
+                for c in r.candidates:
+                    key = canonicalize(c.url_raw) or c.url_raw
+                    if key in seen:
+                        run.duplicated += 1
+                        continue
+                    seen.add(key)
+                    c.url_canon = key
+                    # 与 expand_channel 同口径：报告里要能追溯"哪个说法发现的"
+                    c.extra.update({
+                        "found_by": v.q,
+                        "strategy": v.strategy,
+                        "query_rank": c.rank,
+                        "domain": c.extra.get("domain") or host_of(c.url_raw),
+                    })
+                    out.append(c)
+                    new_here += 1
+                gained += new_here
+
+            logs.append({
+                "seq": seq,
+                "url": ch.build_url(v.q, off, timespan),
+                "query_text": v.q,
+                "got": 0 if degenerate else len(r.candidates),
+                "new": new_here,
+                "blocked": r.blocked,
+                "block_kind": r.block_kind,
+                "detail": r.detail or "",
+                "elapsed_ms": r.elapsed_ms,
+                # 断言按"每一次调用"判断：只有整批合并才判，会漏掉"某一页突然只剩 1 条"
+                "problems": [] if (degenerate or r.blocked) else check_assertions(r, ch),
+            })
+
+            if r.blocked:
+                run.blocked += 1
+                run.stopped_reason = (
+                    f"第 {seq} 次调用「{v.q}」被拦（{r.block_kind or '未知'}），立即停止")
+                hard_stop = True
+                break
+            if degenerate:
+                notes.append(f"「{v.q}」第 {pi} 页与上一页完全相同，分页失效")
+                break
+            if r.block_kind in ("relaxed", "boilerplate"):
+                what = "查询被降级" if r.block_kind == "relaxed" else "无结果兜底页"
+                notes.append(f"「{v.q}」{what}")
+                break
+            if r.block_kind and r.block_kind not in _BENIGN_BLOCK_KINDS:
+                notes.append(f"「{v.q}」结构异常（{r.block_kind}）")
+                run.error = notes[-1]
+                break
+
+        if hard_stop:
+            break
+        streak = 0 if gained else streak + 1
+        if streak >= zero_gain_streak:
+            notes.append(f"连续 {streak} 个变体零新增，提前收手")
+            break
+
+    run.unique = len(out)
+    run.elapsed_ms = int((time.perf_counter() - t0) * 1000)
+    if not run.stopped_reason:
+        run.stopped_reason = ("；".join(notes) if notes
+                              else f"变体 {len(variants)} 个已执行")
     return run, out, logs
 
 
@@ -788,11 +922,16 @@ def run_task(
 
     def _plan_hook(cands: list[Candidate]) -> list[QueryVariant]:
         """基词结果出来后判一次类型；结论全任务共用，不逐通道重复探测。"""
-        nonlocal probed
+        nonlocal probed, variants
         if probed is not None:
             return probed[1:]
         kind = probe_profile(cands) if cands else "generic"
         probed = expand_queries(keyword, spec, probe=cands)
+        # 必须写回全局 variants：后面的通道是重新读 variants 再挑自己那份的
+        # （ch_variants = [v for v in variants if v.for_channel(...)]），
+        # 只返回给 plan_hook 的调用方（Bing 自己）用，站内检索通道就永远只打基词
+        # —— 2026-10-24 实测「红黑树」B站/搜狗微信各只打一次，正是这个原因。
+        variants = probed
         if len(probed) > 1:
             say(f"  ⿻ 探测：基词结果判为 {kind}，加 {len(probed) - 1} 个变体")
         else:
@@ -867,6 +1006,11 @@ def run_task(
             # 走 _run_paged —— 变体矩阵对它是自杀而不是扩量。
             # 人名模式的百度站内检索是例外：它就打一个查询，但必须走 _run_serp
             # （_run_paged 只认 keyword，不会打 site: 变体）。
+            #
+            # 三类通道的扩量手段不同，别混：
+            #   serp        —— 翻页已废（Bing），只能换说法 → _run_serp
+            #   site_search —— 翻页与换词都有效 → _run_paged_multi（基词翻页 + 变体各一页）
+            #   其它        —— 服务端匹配可靠，换词只拿回重复 → _run_paged
             if ch.type == "serp" and ch.variants and (len(variants) > 1 or auto_probe):
                 run, cands, logs = _run_serp(
                     ch, ctx, keyword, ch_variants,
@@ -877,6 +1021,13 @@ def run_task(
                 run, cands, logs = _run_serp(
                     ch, ctx, keyword, ch_variants,
                     pattern=pattern, zero_gain_streak=zero_gain, sleep=sleep,
+                )
+            elif (ch.type == "site_search" and ch.variants
+                  and len(ch_variants) > 1 and ch.paging.mode != "none"):
+                run, cands, logs = _run_paged_multi(
+                    ch, ctx, ch_variants, timespan=timespan,
+                    max_pages=int(ch.paging.max_pages),
+                    zero_gain_streak=zero_gain, sleep=sleep,
                 )
             else:
                 run, cands, logs = _run_paged(
