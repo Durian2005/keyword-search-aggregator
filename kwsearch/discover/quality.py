@@ -203,6 +203,74 @@ def check_relaxed(
     )
 
 
+# ---------------------------------------------------------------- 兜底页判定
+# 2026-10-23 实测：搜狗微信对"微信生态里搜不到"的词（生僻历史/时政词）会返回一个
+# **无结果兜底页**，但页面里照样挂着 `ul.news-list > li > div.txt-box` 的结构 ——
+# 解析器按既定口径把它当成 9 条"结果"，标题取到站点名「搜狗搜索」，正文仅 130 字符。
+#
+# `check_relaxed` 拦不住它：兜底页的提示语里通常**原样写着查询词**
+# （"抱歉，没有找到与「×××」相关的文章"），语义体检反而判成"相关"。
+#
+# 所以需要一条**不依赖查询词**的结构判据。正常搜索结果页几乎不可能出现
+# "整页标题完全相同"，兜底页则必然如此（或标题干脆就是站点名）。
+
+_SITE_NAMES = frozenset({"搜狗搜索", "搜狗微信", "微信搜索", "搜狗"})
+_MIN_SAME_TITLES = 3      # 标题全同时至少这么多条才判（2 条可能是转载，不误杀）
+
+
+@dataclass(frozen=True, slots=True)
+class BoilerplateCheck:
+    """一次兜底页体检的结果。is_boilerplate=True 时调用方应整页丢弃。"""
+
+    is_boilerplate: bool
+    basis: str = ""          # site_name | same_titles | ""
+    detail: str = ""
+    titles: int = 0          # 参与判定的候选数
+    unique: int = 0          # 去重后的标题数
+
+
+def check_boilerplate(candidates: Sequence[Candidate]) -> BoilerplateCheck:
+    """判断"这一页是不是无结果兜底页"（结构判据，不看查询词）。
+
+    两条判据，任一命中即判：
+
+        站点名   所有候选标题都是站点名本身（"搜狗搜索"/"微信搜索"…）
+                 —— 没有任何一篇文章的标题会叫站点名，这是硬特征
+        全同      标题去重后只剩 1 个、且条数 ≥ 3
+                 —— 搜索引擎不可能把 3 段不同的内容起同一个标题；
+                    条数门槛是为了不误杀"同一篇稿件被两家转载"的 2 条情形
+
+    与 `check_relaxed` 的分工：那条判"对方把查询降级成了别的词"（内容跑偏但真实），
+    这条判"对方压根没给内容"（结构是假的）。两者都可能让 candidates 为空，
+    但告警文案要分开写，排查时才知道是风控还是改版。
+    """
+    if not candidates:
+        return BoilerplateCheck(False)
+
+    titles = [(c.title or "").strip().casefold() for c in candidates]
+    if not all(titles):
+        return BoilerplateCheck(False)
+
+    if all(t in _SITE_NAMES for t in titles):
+        return BoilerplateCheck(
+            True, "site_name",
+            detail=(f"{len(titles)} 条结果标题全是站点名「{candidates[0].title.strip()}」，"
+                    f"判定为无结果兜底页"),
+            titles=len(titles), unique=1,
+        )
+
+    unique = len(set(titles))
+    if unique == 1 and len(titles) >= _MIN_SAME_TITLES:
+        return BoilerplateCheck(
+            True, "same_titles",
+            detail=(f"{len(titles)} 条结果标题完全相同"
+                    f"（「{candidates[0].title.strip()[:30]}」），判定为兜底页"),
+            titles=len(titles), unique=unique,
+        )
+
+    return BoilerplateCheck(False, titles=len(titles), unique=unique)
+
+
 def needles_of(query: str) -> list[str]:
     """把查询展开成"任一条结果该含什么"的判定原语。
 
@@ -254,8 +322,10 @@ def keep_related(
 
 
 __all__ = [
+    "BoilerplateCheck",
     "RelaxCheck",
     "bigrams",
+    "check_boilerplate",
     "check_relaxed",
     "keep_related",
     "needles_of",

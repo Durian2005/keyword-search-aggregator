@@ -350,11 +350,13 @@ def _run_paged(
             run.stopped_reason = f"第 {i} 页与上一页完全相同，判定分页失效，已停止"
             break
 
-        if r.block_kind == "relaxed":
-            # 请求成功、解析也成功，只是对方把查询降级成了更宽泛的词
-            # （见 discover/quality.py）。这不是故障 —— 不设 run.error，
-            # 但继续翻页/换页只会拿回同样的字面结果，就地停。
-            run.stopped_reason = f"第 {i} 页查询被降级：{r.detail or '结果与查询无关'}"
+        if r.block_kind in ("relaxed", "boilerplate"):
+            # 请求成功、解析也成功，但拿回来的东西不可信：
+            #   relaxed    —— 对方把查询降级成了更宽泛的词（见 discover/quality.py）
+            #   boilerplate —— 对方返回无结果兜底页，列表结构在但内容是假的
+            # 都不是故障（不设 run.error），但继续翻页只会拿回同样的东西，就地停。
+            what = "查询被降级" if r.block_kind == "relaxed" else "无结果兜底页"
+            run.stopped_reason = f"第 {i} 页{what}：{r.detail or '内容不可信'}"
             break
 
         if r.block_kind and r.block_kind not in _BENIGN_BLOCK_KINDS:
@@ -925,9 +927,11 @@ def run_task(
         # 整条通道一条没解析出来：这既可能是"真没结果"，也可能是选择器失效。
         # 两者的区别在 block_kind 里已经写过（challenge/unknown_structure），
         # 这里只兜住"通道返回 0 条但也没报错"的情况。
-        # relaxed 不算：它已经单独记过告警，再记一条"空结果"会让读者以为是两个问题。
-        had_relaxed = any(lg.get("block_kind") == "relaxed" for lg in logs)
-        if not cands and not had_relaxed and not run.error and not run.blocked and run.got == 0:
+        # relaxed / boilerplate 不算：它们已经单独记过告警，再记一条"空结果"
+        # 会让读者以为是两个问题。
+        had_discard = any(lg.get("block_kind") in ("relaxed", "boilerplate")
+                          for lg in logs)
+        if not cands and not had_discard and not run.error and not run.blocked and run.got == 0:
             repo.add_alert(task_id, ch.id, "empty_result",
                            run.stopped_reason or "通道未解析出任何条目")
 

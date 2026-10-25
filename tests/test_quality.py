@@ -20,6 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from kwsearch.discover.bing import parse_serp  # noqa: E402
 from kwsearch.discover.quality import (  # noqa: E402
     bigrams,
+    check_boilerplate,
     check_relaxed,
     keep_related,
     needles_of,
@@ -341,6 +342,50 @@ class TestParseSerpRelaxed(unittest.TestCase):
     def test_empty_page_still_empty_not_relaxed(self) -> None:
         r = parse_serp("<html><body>没有与此相关的结果</body></html>", 1, query="张军")
         self.assertEqual(r.block_kind, "empty")
+
+
+class TestBoilerplate(unittest.TestCase):
+    """兜底页判定（2026-10-23 实测样本：搜狗微信对搜不到的词返回站点名标题）。"""
+
+    def test_site_name_titles(self) -> None:
+        # 9 条结果标题全是「搜狗搜索」—— 没有任何一篇文章会叫站点名
+        chk = check_boilerplate(_cands(*["搜狗搜索"] * 9))
+        self.assertTrue(chk.is_boilerplate)
+        self.assertEqual(chk.basis, "site_name")
+        self.assertIn("兜底页", chk.detail)
+
+    def test_site_name_case_and_space_insensitive(self) -> None:
+        chk = check_boilerplate(_cands(" 搜狗搜索 ", "搜狗微信", "微信搜索"))
+        self.assertTrue(chk.is_boilerplate)
+        self.assertEqual(chk.basis, "site_name")
+
+    def test_same_titles(self) -> None:
+        chk = check_boilerplate(_cands(*["同一篇稿件转载"] * 4))
+        self.assertTrue(chk.is_boilerplate)
+        self.assertEqual(chk.basis, "same_titles")
+
+    def test_two_same_titles_not_boilerplate(self) -> None:
+        # 2 条同标题可能真是"同一篇被两家转载"，不误杀（门槛是 3）
+        chk = check_boilerplate(_cands("同一篇稿件", "同一篇稿件"))
+        self.assertFalse(chk.is_boilerplate)
+
+    def test_distinct_titles_pass(self) -> None:
+        chk = check_boilerplate(_cands("标题一", "标题二", "标题三", "标题四", "标题五"))
+        self.assertFalse(chk.is_boilerplate)
+        self.assertEqual(chk.unique, 5)
+
+    def test_empty_title_never_judged(self) -> None:
+        # 标题缺失是解析层该记账的事，不在这里判兜底页（否则会把残缺页误杀）
+        chk = check_boilerplate(_cands("标题一", ""))
+        self.assertFalse(chk.is_boilerplate)
+
+    def test_no_candidates(self) -> None:
+        self.assertFalse(check_boilerplate([]).is_boilerplate)
+
+    def test_boilerplate_independent_of_query(self) -> None:
+        # 同样的页面，带不带查询词结论一致 —— 这是结构判据的意义所在
+        chk = check_boilerplate(_cands(*["搜狗搜索"] * 5))
+        self.assertTrue(chk.is_boilerplate)
 
 
 if __name__ == "__main__":

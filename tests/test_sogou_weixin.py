@@ -104,6 +104,52 @@ class TestSogouWeixinParse(unittest.TestCase):
         self.assertEqual(r.block_kind, "relaxed")
         self.assertEqual(r.candidates, [])
 
+    def test_boilerplate_page_dropped(self) -> None:
+        # 2026-10-23 实测样本：搜不到时搜狗返回的兜底页 —— 列表结构完整，
+        # 但 9 条"结果"标题全是站点名。整页必须丢。
+        blocks = "".join(
+            _article(n, "搜狗搜索", "", "某公众号", ts=None) for n in range(9)
+        )
+        page = f'<html><body><ul class="news-list">{blocks}</ul></body></html>'
+        r = parse_serp(page, 1, channel_id="sogou_weixin")
+        self.assertEqual(r.block_kind, "boilerplate")
+        self.assertEqual(r.candidates, [])
+        self.assertEqual(r.raw_count, 9)
+        self.assertIn("整页丢弃", r.detail)
+
+    def test_boilerplate_beats_relaxed_when_snippet_echoes_query(self) -> None:
+        # 真实兜底页的提示语里写着查询词（"没有找到与「××」相关的文章"），
+        # 语义体检会误判成"相关" —— 这正是当初 11 条假阳性入库的原因。
+        # 结构判据不看查询词，所以能拦住。
+        query = "生僻历史词条"
+        snippet = f"抱歉，没有找到与「{query}」相关的文章"
+        blocks = "".join(
+            _article(n, "搜狗搜索", snippet, "某公众号", ts=None) for n in range(9)
+        )
+        page = f'<html><body><ul class="news-list">{blocks}</ul></body></html>'
+        r = parse_serp(page, 1, channel_id="sogou_weixin", query=query)
+        self.assertEqual(r.block_kind, "boilerplate")
+        self.assertEqual(r.candidates, [])
+
+    def test_same_titles_page_dropped(self) -> None:
+        # 兜底页的另一种长相：标题不是站点名，但整页反复给同一条
+        blocks = "".join(
+            _article(n, "某活动通知", "活动详情", "某公众号") for n in range(4)
+        )
+        page = f'<html><body><ul class="news-list">{blocks}</ul></body></html>'
+        r = parse_serp(page, 1, channel_id="sogou_weixin", query="某活动")
+        self.assertEqual(r.block_kind, "boilerplate")
+
+    def test_two_articles_same_title_kept(self) -> None:
+        # 2 条同标题（同一篇被两家转载）不该被误杀
+        blocks = "".join(
+            _article(n, "红黑树入门", "红黑树是一种自平衡二叉查找树", "某公众号")
+            for n in range(2)
+        )
+        page = f'<html><body><ul class="news-list">{blocks}</ul></body></html>'
+        r = parse_serp(page, 1, channel_id="sogou_weixin", query="红黑树")
+        self.assertEqual(len(r.candidates), 2)
+        self.assertIsNone(r.block_kind)
 
 if __name__ == "__main__":
     unittest.main()

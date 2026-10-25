@@ -33,7 +33,7 @@ from urllib.parse import urljoin
 
 from kwsearch.discover import register
 from kwsearch.discover.base import ChannelContext
-from kwsearch.discover.quality import check_relaxed
+from kwsearch.discover.quality import check_boilerplate, check_relaxed
 from kwsearch.fetch import FetchError, fetch_with_retry
 from kwsearch.htmlx import Node, find, find_all, parse_html, raw_text, text
 from kwsearch.models import Candidate, ChannelResult
@@ -156,6 +156,20 @@ def parse_serp(
                      ("无时间", no_time)):
         if n:
             detail_bits.append(f"{label} {n}")
+
+    # 兜底页（结构判据，不看查询词）：搜狗对"搜不到"的词会返回挂着正常列表结构、
+    # 实际是站点名/重复标题的兜底页。必须放在 check_relaxed 之前 —— 兜底页的
+    # 提示语里原样写着查询词，语义体检会误判成"相关"（2026-10-23 实测 11 条假阳性）。
+    if out:
+        bp = check_boilerplate(out)
+        if bp.is_boilerplate:
+            logger.warning("sogou_weixin 兜底页（basis=%s）：%s", bp.basis, bp.detail)
+            return ChannelResult(
+                channel=channel_id, query="", candidates=[],
+                raw_count=len(blocks),
+                blocked=False, block_kind="boilerplate",
+                detail=f"{bp.detail}；已解析到 {len(out)} 条但均非真实文章，整页丢弃",
+            )
 
     if query:
         chk = check_relaxed(out, query)

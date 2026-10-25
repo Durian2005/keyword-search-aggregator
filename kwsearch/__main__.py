@@ -824,6 +824,8 @@ def cmd_discover(
                 state = "无结果"
             elif r.block_kind == "relaxed":
                 state = "查询被降级"
+            elif r.block_kind == "boilerplate":
+                state = "无结果兜底页"
             elif r.block_kind:
                 state = "结构异常"
             else:
