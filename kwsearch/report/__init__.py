@@ -547,8 +547,11 @@ def _robots(tstats: Mapping[str, Any]) -> str:
     on_failure = str(tstats.get("robots_on_failure") or "deny")
     forced = int(tstats.get("robots_forced") or 0)
     gov = int(tstats.get("gov_blocked") or 0)
+    resolved = int(tstats.get("links_resolved") or 0)
     hosts: Sequence[Mapping[str, Any]] = tstats.get("robots_hosts") or []
-    if not hosts and mode == "obey" and not forced and not gov:
+    # 解链也触发本节：它是索引层动作，必须让读者看到"它为什么不在这张表里"，
+    # 否则报告里出现一堆 mp.weixin.qq.com 链接、表里却零强制，反而像漏登了。
+    if not hosts and mode == "obey" and not forced and not gov and not resolved:
         return ""
 
     head = (
@@ -556,7 +559,19 @@ def _robots(tstats: Mapping[str, Any]) -> str:
         f' · 失败语义：{_esc(_ROBOTS_FAIL_CN.get(on_failure, on_failure))}'
         + (f' · <b class="bad">无视规则强制抓取 {_num(forced)} 条</b>' if forced else "")
         + (f' · 政府站红线拦截 {_num(gov)} 条（请求未发）' if gov else "")
+        + (f' · 索引层解链 {_num(resolved)} 条（只换地址，未取正文）' if resolved else "")
         + "</p>"
+    )
+    # 分层口径必须写进报告，不能只写在 README 里：读者看到的只是"某站 robots 是
+    # Disallow: /，但报告里却有它的链接"，不说清就会被当成隐形绕过。
+    scope = (
+        '<p class="hint"><b>本节只判定「正文抓取」。</b>'
+        "「索引获取」不在判定范围：各通道的搜索结果页请求、以及搜狗中转链解链"
+        "（只把失效的中转地址换成永久地址，<b>不落库任何页面内容</b>）都属于索引层。"
+        "原因很直接 —— 主流搜索引擎与聚合接口对 <code>User-agent: *</code> 普遍写"
+        "<code>Disallow: /</code>（百度、B 站、搜狗微信实测均如此），索引层若一并遵守，"
+        "这个工具一条请求都发不出去。需要正文时仍逐域按上面的档位判定，"
+        "被 <code>Disallow</code> 拦下的条数会显示在「拒绝」列。</p>"
     )
     rows: list[str] = []
     for h in hosts:
@@ -588,8 +603,9 @@ def _robots(tstats: Mapping[str, Any]) -> str:
     )
     return f"""
 <section>
-  <h2>robots 覆盖<span class="sub">逐域结论 · 绕过全部留痕</span></h2>
+  <h2>robots 覆盖<span class="sub">逐域结论 · 绕过全部留痕 · 只判正文层</span></h2>
   {head}
+  {scope}
   {table}
 </section>"""
 
@@ -999,6 +1015,7 @@ def _footer(task: Mapping[str, Any]) -> str:
       <li>入库前已对手机号、身份证号、邮箱做脱敏，原始值不落库。</li>
       <li><b>红线（2026-10-22 修订）：不抓政府网站</b>（.gov.cn 后缀硬拦截，请求不发，见告警与 robots 覆盖）。</li>
       <li>robots.txt 的遵守/绕过档位与逐域结论见「robots 覆盖」一节；绕过全部留痕，不做隐形处理。</li>
+      <li>robots 只判「正文层」：搜索结果页与中转链解链属索引层，不查 robots（否则搜索引擎的 <code>Disallow: /</code> 会让工具无法发出任何请求）。解链只换地址、不取内容，正文仍逐域判定。</li>
       <li>被限流、被拒绝、页面结构变更的站点，如实记录在“覆盖率自评”与“告警”中。</li>
       <li>“无日期 / 相对日期”的时间不可当作真实发布时间使用。</li>
     </ol>

@@ -473,7 +473,9 @@ def fake_relay_link(keyword: str, offset: int, ctx) -> ChannelResult:  # noqa: A
             snippet="红黑树是一种自平衡二叉查找树",
             channel="fake_relay_link", rank=1, published_hint="2026-10-01",
             dedupe_key="relay-article-key-1",
-            extra={"domain": "mp.weixin.qq.com"},
+            # 通道解链成功时会打这个标记（真实实现见 sogou_weixin.resolve_candidates）
+            extra={"domain": "mp.weixin.qq.com",
+                   "link_resolved": _RELAY["url"].startswith("https://mp.")},
         ),
     ], raw_count=1)
 
@@ -725,10 +727,14 @@ class TestRelayLinkUpgrade(RunCase):
         first = self.run_kw(self.cfg(_RELAY_CH))
         self.assertEqual(first.docs_new, 1)
         self.assertIn("weixin.sogou.com/link", self.rows("SELECT url_canon FROM doc")[0]["url_canon"])
+        self.assertEqual(first.links_resolved, 0)     # 第一跑没解链
 
         _RELAY["url"] = "https://mp.weixin.qq.com/s?signature=ABC&src=11&ver=7048"
         second = self.run_kw(self.cfg(_RELAY_CH))
         self.assertEqual(second.docs_new, 0)          # 升级，不是新发现
+        # 解链属索引层：单独计数，且不冒充 robots 强制抓取
+        self.assertEqual(second.links_resolved, 1)
+        self.assertEqual(second.robots_forced, 0)
         docs = self.rows("SELECT url_canon FROM doc")
         self.assertEqual(len(docs), 1)                # 迁移而不是多一行
         self.assertEqual(docs[0]["url_canon"], _RELAY["url"])

@@ -323,6 +323,28 @@ class TestReportRobots(unittest.TestCase):
         html = render_html(self._data({"robots_mode": "obey"}))
         self.assertIn("不抓政府网站", html)
 
+    def test_section_explains_layer_split_and_counts_resolve(self) -> None:
+        """解链属索引层：报告必须写明"本节只判正文层"，并单独计数。
+
+        否则读者看到"某站 robots 全禁、报告里却有它的链接"会当成隐形绕过。
+        """
+        from kwsearch.report import render_html
+        html = render_html(self._data({
+            "robots_mode": "obey", "robots_forced": 0, "gov_blocked": 0,
+            "robots_hosts": [], "links_resolved": 7,
+        }))
+        self.assertIn("<h2>robots 覆盖", html)          # 有解链就要出现本节
+        self.assertIn("只判正文层", html)
+        self.assertIn("不落库任何页面内容", html)        # 解链只换地址
+        self.assertIn("索引层解链 7 条", html)
+        self.assertNotIn("强制抓取 0 条", html)          # 索引层不算强制抓取
+
+    def test_section_hidden_when_obey_clean_and_no_resolve(self) -> None:
+        from kwsearch.report import render_html
+        html = render_html(self._data({"robots_mode": "obey", "robots_hosts": [],
+                                       "links_resolved": 0}))
+        self.assertNotIn("<h2>robots 覆盖", html)
+
 
 # ---------------------------------------------------------------------------
 #  交互页面输入

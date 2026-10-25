@@ -159,6 +159,11 @@ class RunResult:
     robots_mode: str = ""          # 本次生效档位：obey | record | off
     robots_stats: dict = field(default_factory=dict)   # 计数 + mode/on_failure
     robots_hosts: list[dict] = field(default_factory=list)
+    # 索引层动作，与 robots_forced（正文层）分开记：
+    # 解链只把"几分钟就失效的中转链"换成永久 mp 地址，**不取正文内容**，
+    # 所以它不属于 robots 的判定范围（正文仍由 fetch_pages 逐域判定）。
+    # 混进 robots_forced 会让报告误报成"强制抓取"，那是另一种性质的行为。
+    links_resolved: int = 0         # 本次解出永久地址的候选数（含跨变体缓存复用）
     alerts: int = 0
     elapsed_ms: int = 0
     # S3d 正文富化
@@ -1139,6 +1144,8 @@ def run_task(
         result.candidates += run.got or len(cands)
         result.filtered += run.filtered
         result.per_channel.append(run)
+        # 解链属于索引层（只换 URL、不取正文），单独计数，不并入 robots_forced
+        result.links_resolved += sum(1 for c in cands if c.extra.get("link_resolved"))
 
         # 全局去重：跨通道也会重叠（同一篇文章既在 SERP 也在 B站）
         added = 0
@@ -1485,6 +1492,7 @@ def run_task(
         # 两个键与计数键混放，消费方按类型取（report._robots 已这样写）
         "robots": result.robots_stats,
         "robots_hosts": result.robots_hosts,
+        "links_resolved": result.links_resolved,
     }
     repo.finish_task(task_id, result.status, result.truncated, stats_payload)
 
