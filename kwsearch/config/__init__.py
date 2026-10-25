@@ -70,6 +70,9 @@ class ChannelConfig:
     # 为什么需要这个开关：百度第二次请求就出图形验证码（实测 2026-10-21），
     # 变体矩阵对它不是扩量而是自杀。这类"单次配额"通道必须显式关掉。
     variants: bool = True
+    # 中转链解链参数（enabled / max_links / delay_s / stop_after_fail）。
+    # 空 dict = 不解链，候选保留通道给的原始 URL。见 sogou_weixin 的同名配置。
+    resolve: dict[str, Any] = field(default_factory=dict)
     robots_checked: str = ""
     robots_note: str = ""
 
@@ -165,6 +168,7 @@ def _build_channel(raw: dict[str, Any], idx: int) -> ChannelConfig:
         assertions=assertions,
         fetch_over=dict(fetch_over),
         variants=bool(raw.get("variants", True)),
+        resolve=dict(raw.get("resolve") or {}),
         robots_checked=str(raw.get("robots_checked", "")),
         robots_note=str(raw.get("robots_note", "")),
     )

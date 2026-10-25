@@ -264,6 +264,47 @@ class Repository(_WipeMixin):
         ).fetchone()
         return str(row[0]) if row else None
 
+    def rekey_doc(self, old_url: str, new_url: str) -> bool:
+        """把一行的主键从 old_url 改成 new_url（连带 mention）。返回 True = 已迁移。
+
+        唯一用途：搜狗中转链 → 永久 mp 链接（2026-10-25）。库里早期存的是
+        `weixin.sogou.com/link?url=<token>`，几分钟后就失效；后来解链成功拿到了
+        mp.weixin.qq.com 的永久地址。业务键相同说明是同一篇文章，但 url_canon
+        不同 —— 不回写的话，**解链成果会被"复用旧 url"的逻辑原地吞掉**，
+        历史行永远修不好，报告里还是死链。
+
+        为什么返回 bool 而不是抛：new_url 可能已经单独存在于库里（例如先跑新版
+        再跑旧版留下的），主键冲突时不该炸掉整个任务，调用方退回旧 url 即可。
+        """
+        if not old_url or not new_url or old_url == new_url:
+            return False
+        exists = self.conn.execute(
+            "SELECT 1 FROM doc WHERE url_canon=? LIMIT 1", (new_url,)
+        ).fetchone()
+        if exists:
+            return False
+        try:
+            # 必须延迟外键检查：mention.url_canon REFERENCES doc(url_canon)，
+            # 而连接开着 PRAGMA foreign_keys=ON（立即检查）。直接 UPDATE 主键会
+            # 撞 "FOREIGN KEY constraint failed" —— 改父表时子表还指着旧值。
+            # defer 到 commit 时整体校验：那时父表和子表都已经是新值，一致通过。
+            self.conn.execute("PRAGMA defer_foreign_keys = ON")
+            self.conn.execute("UPDATE doc SET url_canon=? WHERE url_canon=?",
+                              (new_url, old_url))
+            # url_raw 若还指着旧的失效链接，一起换掉 —— 报告里的"原始链接"也修好
+            self.conn.execute(
+                "UPDATE doc SET url_raw=? WHERE url_canon=? AND url_raw=?",
+                (new_url, new_url, old_url))
+            self.conn.execute("UPDATE mention SET url_canon=? WHERE url_canon=?",
+                              (new_url, old_url))
+            self.conn.commit()          # 外键一致性在这里才真正校验
+        except sqlite3.IntegrityError:      # 并发/顺序导致的偶发冲突
+            self.conn.rollback()
+            return False
+        finally:
+            self.conn.execute("PRAGMA defer_foreign_keys = OFF")
+        return True
+
     def upsert_doc(self, doc: Doc) -> bool:
         """写入/更新一篇文档。返回 True = 库里原本没有（本任务的新发现）。
 

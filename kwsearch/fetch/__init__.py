@@ -146,7 +146,18 @@ class BaseFetcher(ABC):
 
 
 class CurlCffiFetcher(BaseFetcher):
-    """curl_cffi：TLS/HTTP2 指纹伪装，仅几 MB，无需浏览器。M1 主力。"""
+    """curl_cffi：TLS/HTTP2 指纹伪装，仅几 MB，无需浏览器。M1 主力。
+
+    **持有一个 Session 而不是每次新建**（2026-10-25）：
+        搜狗的 `link?url=` 中转页要用同一次会话里种下的 SUID/SNUID cookie 才肯
+        返回真实链接，无 cookie 直接 302 到 /antispider/。curl_cffi 的 `get()`
+        是"一次性"的（每次新建 curl handle、不共享 cookie jar），所以这里改为
+        懒建 Session 并复用。
+
+        cookie jar 按域隔离，不会把 Bing 的 cookie 带到搜狗去。唯一的行为变化是
+        "同一任务内同一域的 cookie 会累积" —— 这恰恰是浏览器会做的事，也更像真人。
+        close() 后自动重建，不会出现"用已关闭的 session"这种状态。
+    """
 
     name = "curl_cffi"
 
@@ -156,13 +167,27 @@ class CurlCffiFetcher(BaseFetcher):
         self._req = _req
         self._impersonate = impersonate
         self._verify = ca_bundle_arg()
+        self._session = None
+
+    def _ensure_session(self):  # noqa: ANN202 —— 返回 curl_cffi 的 Session，延迟导入
+        if self._session is None:
+            self._session = self._req.Session(impersonate=self._impersonate)
+        return self._session
+
+    def close(self) -> None:
+        sess, self._session = self._session, None
+        if sess is None:
+            return
+        try:
+            sess.close()
+        except Exception:  # noqa: BLE001 —— 关闭失败不该影响任务收尾
+            logger.debug("curl_cffi session 关闭异常", exc_info=True)
 
     def fetch(self, url: str, headers: dict[str, str], timeout: int = 20) -> FetchResult:
         t0 = time.perf_counter()
-        resp = self._req.get(
+        resp = self._ensure_session().get(
             url,
             headers=headers,
-            impersonate=self._impersonate,
             timeout=timeout,
             verify=self._verify,
             allow_redirects=True,

@@ -460,6 +460,36 @@ _ROTATING_CH = """
     assertions: {min_items: 1, required_fields: [url, title]}
 """
 
+# 中转链 → 永久链接的升级场景（搜狗解链之后才可能出现）
+_RELAY = {"url": "https://weixin.sogou.com/link?url=TOK1"}
+
+
+def fake_relay_link(keyword: str, offset: int, ctx) -> ChannelResult:  # noqa: ANN001
+    """第一次跑给中转链，第二次跑（解链成功）给 mp 永久链接，业务键不变。"""
+    return ChannelResult(channel="fake_relay_link", query=keyword, candidates=[
+        Candidate(
+            url_raw=_RELAY["url"],
+            title="红黑树 原理详解",
+            snippet="红黑树是一种自平衡二叉查找树",
+            channel="fake_relay_link", rank=1, published_hint="2026-10-01",
+            dedupe_key="relay-article-key-1",
+            extra={"domain": "mp.weixin.qq.com"},
+        ),
+    ], raw_count=1)
+
+
+discover._REGISTRY["fake_relay_link"] = fake_relay_link
+
+_RELAY_CH = """
+  - id: fake_relay_link
+    type: serp
+    parser: fake_relay_link
+    url_template: "https://fake.test/relay?q={q}"
+    paging: {mode: none}
+    throttle: {min_interval_s: 0}
+    assertions: {min_items: 1, required_fields: [url, title]}
+"""
+
 _BLOCKED_SERP_CH = """
   - id: fake_blocked_serp
     type: serp
@@ -674,6 +704,103 @@ class TestDedupeKeyAcrossRuns(RunCase):
         self.run_kw(self.cfg(_ROTATING_CH))
         row = self.rows("SELECT dedupe_key FROM doc")[0]
         self.assertEqual(row["dedupe_key"], "fixed-article-key-1")
+
+
+class TestRelayLinkUpgrade(RunCase):
+    """解链成功后，库里那条失效中转链要**就地升级**成永久链接（2026-10-25）。
+
+    不做这件事的后果很隐蔽：业务键命中后代码"复用旧 url_canon"，刚解出来的
+    永久链接会被原地丢掉，历史行永远是死链 —— 看日志一切正常，点报告全是验证页。
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        _RELAY["url"] = "https://weixin.sogou.com/link?url=TOK1"
+
+    def tearDown(self) -> None:
+        _RELAY["url"] = "https://weixin.sogou.com/link?url=TOK1"
+        super().tearDown()
+
+    def test_permanent_link_replaces_dead_relay(self) -> None:
+        first = self.run_kw(self.cfg(_RELAY_CH))
+        self.assertEqual(first.docs_new, 1)
+        self.assertIn("weixin.sogou.com/link", self.rows("SELECT url_canon FROM doc")[0]["url_canon"])
+
+        _RELAY["url"] = "https://mp.weixin.qq.com/s?signature=ABC&src=11&ver=7048"
+        second = self.run_kw(self.cfg(_RELAY_CH))
+        self.assertEqual(second.docs_new, 0)          # 升级，不是新发现
+        docs = self.rows("SELECT url_canon FROM doc")
+        self.assertEqual(len(docs), 1)                # 迁移而不是多一行
+        self.assertEqual(docs[0]["url_canon"], _RELAY["url"])
+        mention = {r["url_canon"] for r in self.rows("SELECT url_canon FROM mention")}
+        self.assertEqual(mention, {_RELAY["url"]})    # mention 一起迁走
+
+    def test_keeps_relay_when_target_already_exists(self) -> None:
+        # 目标永久链接已经在库里（先跑新版、再跑旧版的顺序）：迁移必然冲突，
+        # 这时不许炸、也不许多出一行，老老实实退回旧 url
+        self.run_kw(self.cfg(_RELAY_CH))
+        _RELAY["url"] = "https://mp.weixin.qq.com/s?signature=ABC&src=11&ver=7048"
+        self.run_kw(self.cfg(_RELAY_CH))
+        self.assertEqual(len(self.rows("SELECT url_canon FROM doc")), 1)
+
+    def test_non_relay_duplicate_still_reuses_old_url(self) -> None:
+        # 普通 URL 变化（非中转链）不该被当成可升级：保持原行为
+        self.run_kw(self.cfg(_ROTATING_CH))
+        self.run_kw(self.cfg(_ROTATING_CH))
+        self.assertEqual(len(self.rows("SELECT url_canon FROM doc")), 1)
+
+
+class TestRepoRekeyDoc(RunCase):
+    """storage.rekey_doc 本身：迁移 doc + mention，冲突时返回 False 不抛。"""
+
+    def _repo(self):
+        from kwsearch.storage import Repository, init_db
+
+        if not hasattr(self, "_r"):
+            self._r = Repository(init_db(self.db))   # init_db 才建表，connect 不建
+        return self._r
+
+    def tearDown(self) -> None:
+        # Windows 上未关闭的 sqlite 句柄会让临时目录删不掉（WinError 32）
+        repo = getattr(self, "_r", None)
+        if repo is not None:
+            repo.conn.close()
+        super().tearDown()
+
+    def test_rekey_moves_row_and_mentions(self) -> None:
+        from kwsearch.models import Doc, Mention
+
+        repo = self._repo()
+        tid = repo.start_task("红黑树")
+        old = "https://weixin.sogou.com/link?url=T1"
+        repo.upsert_doc(Doc(url_canon=old, url_raw=old, domain="mp.weixin.qq.com",
+                            title="某篇红黑树文章", channel="sogou_weixin",
+                            dedupe_key="k1"))
+        repo.upsert_mention(Mention(task_id=tid, url_canon=old, hit_title=1))
+
+        new = "https://mp.weixin.qq.com/s?signature=ABC&src=11"
+        self.assertTrue(repo.rekey_doc(old, new))
+
+        rows = self.rows("SELECT url_canon, url_raw, dedupe_key FROM doc")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["url_canon"], new)
+        self.assertEqual(rows[0]["url_raw"], new)       # 原始链接一起换掉
+        self.assertEqual(rows[0]["dedupe_key"], "k1")   # 业务键不动
+        self.assertEqual({r["url_canon"] for r in self.rows("SELECT url_canon FROM mention")},
+                         {new})
+
+    def test_rekey_refuses_when_target_exists(self) -> None:
+        from kwsearch.models import Doc
+
+        repo = self._repo()
+        old = "https://weixin.sogou.com/link?url=T1"
+        new = "https://mp.weixin.qq.com/s?signature=A"
+        for u in (old, new):
+            repo.upsert_doc(Doc(url_canon=u, url_raw=u, domain="mp.weixin.qq.com",
+                                title=u, channel="sogou_weixin"))
+        repo.conn.commit()      # upsert_doc 不自己提交，留给调用方批量收尾
+        self.assertFalse(repo.rekey_doc(old, new))
+        self.assertEqual(len(self.rows("SELECT url_canon FROM doc")), 2)   # 一行不丢
 
 
 class TestSanitizeInPipeline(RunCase):

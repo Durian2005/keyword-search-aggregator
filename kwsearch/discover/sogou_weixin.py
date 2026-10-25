@@ -18,24 +18,28 @@
     时间    : `span.s2` 里是 `document.write(timeConvert('1577765720'))`
               —— unix 秒。**显式按 UTC+8 换算**（不用本地时区，否则单测结果
               随机器时区漂移）；日期精度到天，与 bing/gdelt 的 published_hint 口径一致
-    链接    : href 是 `/link?url=...` 搜狗中转。不逐条解跳转（那等于每结果多一次
-              请求，正中风控下怀）：URL 保留搜狗链（浏览器打开会 302 到
-              mp.weixin.qq.com），但 extra.domain 记**真实内容域**
-              mp.weixin.qq.com —— 否则"来源分布"会被单一中转域名垄断，
-              单域配额也会错杀。
+    链接    : href 是 `/link?url=...` 搜狗中转。**不再原样存进库**：token 逐请求
+              轮换且几分钟即失效，存下来点开就是验证页（2026-10-25）。改为在同一个
+              session 里立刻跟随中转页，解出永久有效的 mp.weixin.qq.com 链接；
+              解不出才退回中转链，并记 `link_resolved: false`。
+              extra.domain 仍记真实内容域 mp.weixin.qq.com —— 否则"来源分布"会被
+              单一中转域名垄断，单域配额也会错杀。
 """
 from __future__ import annotations
 
 import hashlib
 import logging
 import re
+import time
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from typing import Callable
 from urllib.parse import urljoin
 
 from kwsearch.discover import register
 from kwsearch.discover.base import ChannelContext
 from kwsearch.discover.quality import check_boilerplate, check_relaxed
-from kwsearch.fetch import FetchError, fetch_with_retry
+from kwsearch.fetch import BaseFetcher, FetchError, fetch_with_retry
 from kwsearch.htmlx import Node, find, find_all, parse_html, raw_text, text
 from kwsearch.models import Candidate, ChannelResult
 
@@ -98,6 +102,181 @@ def _dedupe_key(account: str, title: str, date_iso: str) -> str:
     raw = "|".join(("sogou_weixin", (account or "").strip().casefold(),
                     (title or "").strip().casefold(), date_iso or ""))
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:20]
+
+
+# ============================================================================
+# 中转链解链（2026-10-25）
+# ============================================================================
+# 为什么必须做：SERP 的 href 是 `/link?url=<token>`，token 逐请求轮换、且几分钟
+# 就死。实测把库里的中转链拿出来再请求，直接 302 到 `/antispider/`（页面标题
+# "搜狗搜索"）—— 报告里 54 条公众号链接全点不开，正文一条也抓不到。
+#
+# 怎么解：中转页把真实地址拆成若干段 `url += '...'` 藏在脚本里，段间插 `@` 干扰。
+# 前提是**同一次会话**：先打 SERP 会种下 SUID/SNUID，带着 cookie 请求中转页才
+# 返回 200；没有 cookie 的单次请求一律撞 antispider。所以这依赖 fetcher 持有
+# 持久 Session（见 fetch/__init__.py 的 CurlCffiFetcher）。
+_FRAG_RE = re.compile(r"url\s*\+=\s*'([^']*)'")
+_MP_PREFIX = "https://mp.weixin.qq.com/"
+
+
+def join_relay_fragments(html: str) -> str | None:
+    """把中转页脚本里的地址片段拼成真实链接；拼不出合法 mp 链接返回 None。
+
+    ⚠️ 只做 `&amp;` → `&` 一处替换，**绝不能 html.unescape()**：
+       真实地址里 `&timestamp=` 的 `&times` 会被 HTML 实体解析器啃成 `×`，
+       拼出来是 `×tamp=1792...`，mp 服务端不认，页面回 200 但没有 js_content
+       （2026-10-25 实测踩过一次，查了半小时）。
+    """
+    frags = _FRAG_RE.findall(html or "")
+    if not frags:
+        return None
+    raw = "".join(frags).replace("@", "").replace("&amp;", "&").strip()
+    if not raw.startswith(_MP_PREFIX) or "signature=" not in raw:
+        return None
+    return raw
+
+
+def _is_relay(url: str) -> bool:
+    return "/link?url=" in (url or "")
+
+
+@dataclass(slots=True, frozen=True)
+class ResolvePolicy:
+    """解链节奏。默认关闭 —— 空配置的通道不该凭空多发请求。"""
+
+    enabled: bool = False
+    max_links: int = 4       # 每次 SERP 最多解几条
+    delay_s: float = 2.5     # 条间间隔
+    stop_after_fail: int = 2  # 连续失败几条就收手
+
+    @classmethod
+    def from_mapping(cls, raw: dict | None) -> "ResolvePolicy":
+        raw = raw or {}
+        return cls(
+            enabled=bool(raw.get("enabled", False)),
+            # 负数没有意义：max_links<=0 等价于关闭，这里夹到 0 让调用方统一判
+            max_links=max(0, int(raw.get("max_links", 4))),
+            delay_s=max(0.0, float(raw.get("delay_s", 2.5))),
+            stop_after_fail=max(1, int(raw.get("stop_after_fail", 2))),
+        )
+
+
+@dataclass(slots=True)
+class ResolveStats:
+    """解链结果，只用于 detail 记账（报告里要说清"为什么这篇还是中转链"）。"""
+
+    tried: int = 0
+    ok: int = 0
+    failed: int = 0
+    reused: int = 0          # 同一篇文章在别的变体里已经解过，直接复用
+    stopped: str = ""
+
+    def note(self) -> str:
+        if not self.tried and not self.reused:
+            return ""
+        parts = [f"解链 {self.ok}/{self.tried}"]
+        if self.reused:
+            parts.append(f"复用 {self.reused}")
+        if self.failed:
+            parts.append(f"失败 {self.failed}")
+        if self.stopped:
+            parts.append(self.stopped)
+        return "；".join(parts)
+
+
+# 解链结果缓存：键是业务键（公众号+标题+日期），值是永久链接。
+# 为什么要跨调用共享：一次任务会拿同一个词打 6 个变体，同一篇文章常常在
+# 2~3 个变体里都出现（实测「红黑树」60 条解析里 30 条是同文换链）。不缓存的话
+# 同一篇要解 2~3 次，纯浪费搜狗的风控额度 —— 而那正是最稀缺的资源。
+# 只缓存成功结果：失败的这一篇在别的变体里大概率还是失败，但换个时间可能就好了，
+# 不该被一次失败永久拉黑。
+# 容量上限防止长驻进程（web serve）无限增长；满了就整体清空，不做 LRU ——
+# 这东西重算一次只多一个请求，不值得为它写淘汰逻辑。
+_RESOLVE_CACHE: dict[str, str] = {}
+_CACHE_MAX = 512
+
+
+def _cache_get(key: str) -> str | None:
+    return _RESOLVE_CACHE.get(key) if key else None
+
+
+def _cache_put(key: str, url: str) -> None:
+    if not key:
+        return
+    if len(_RESOLVE_CACHE) >= _CACHE_MAX:
+        _RESOLVE_CACHE.clear()
+    _RESOLVE_CACHE[key] = url
+
+
+def resolve_candidates(
+    cands: list[Candidate],
+    fetcher: BaseFetcher,
+    headers: dict[str, str],
+    *,
+    referer: str,
+    timeout: int,
+    policy: ResolvePolicy,
+    sleep: Callable[[float], None] = time.sleep,
+) -> ResolveStats:
+    """就地把中转链换成真实 mp 链接。成功改写 url_raw，失败保留原链并记账。
+
+    这里的 sleep 是**页内节奏**（同一次通道调用里连续解几条），不是驱动层的
+    通道限速 —— base.py 禁止通道自己限速指的是"两次通道调用之间"，那仍归驱动层。
+    """
+    stats = ResolveStats()
+    if not policy.enabled or policy.max_links <= 0:
+        return stats
+
+    streak = 0
+    for c in cands:
+        if not _is_relay(c.url_raw):
+            continue
+
+        # 先查缓存：同一篇文章可能已经在上一个变体里解过了
+        key = c.dedupe_key or c.url_raw
+        cached = _cache_get(key)
+        if cached:
+            c.url_raw = cached
+            c.extra["link_resolved"] = True
+            stats.reused += 1
+            continue
+
+        if stats.tried >= policy.max_links:
+            stats.stopped = f"已达上限 {policy.max_links} 条"
+            break
+
+        stats.tried += 1
+        real = _resolve_one(fetcher, c.url_raw, {**headers, "Referer": referer}, timeout)
+        if real:
+            c.url_raw = real
+            c.extra["link_resolved"] = True
+            stats.ok += 1
+            _cache_put(key, real)
+            streak = 0
+        else:
+            # 保留中转链：它至少是个可读的来源凭据，比丢条目强
+            c.extra["link_resolved"] = False
+            stats.failed += 1
+            streak += 1
+            if streak >= policy.stop_after_fail:
+                stats.stopped = f"连续失败 {streak} 条，提前收手"
+                break
+        sleep(policy.delay_s)
+    return stats
+
+
+def _resolve_one(fetcher: BaseFetcher, relay_url: str,
+                 headers: dict[str, str], timeout: int) -> str | None:
+    """解一条。任何异常都算失败 —— 解链是"锦上添花"，不该让整页结果作废。"""
+    try:
+        res = fetcher.fetch(relay_url, headers, timeout)
+    except Exception as e:  # noqa: BLE001 —— 含 FetchError / 连接错误
+        logger.debug("搜狗中转链解链异常 %s: %s", relay_url[:80], e)
+        return None
+    if res.status != 200:
+        logger.debug("搜狗中转链解链 %s 返回 %s", relay_url[:80], res.status)
+        return None
+    return join_relay_fragments(res.body)
 
 
 def parse_serp(
@@ -244,6 +423,19 @@ def sogou_weixin(keyword: str, offset: int, ctx: ChannelContext) -> ChannelResul
     result.channel = ctx.channel.id
     result.query = keyword
     result.elapsed_ms = res.elapsed_ms
+
+    # 解链放在整页体检（兜底页/降级）之后：那一页本来就要整页丢弃，
+    # 就别再为它多发 max_links 个请求、多担一份风控风险。
+    if result.candidates:
+        stats = resolve_candidates(
+            result.candidates, ctx.fetcher, ctx.headers,
+            referer=url, timeout=ctx.timeout,
+            policy=ResolvePolicy.from_mapping(ctx.channel.resolve),
+        )
+        note = stats.note()
+        if note:
+            result.detail = "；".join(p for p in (result.detail, note) if p)
+
     if not result.candidates and result.block_kind == "challenge":
         result.detail += f"；URL={url}"
     return result

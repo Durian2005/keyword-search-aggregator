@@ -173,6 +173,18 @@ channels:
       max_pages: 1                 # 风控敏感，只取第一页 10 条
     throttle:
       min_interval_s: 10
+    # 中转链解链（2026-10-25）。
+    # SERP 给的 href 是 /link?url=<token>，token 逐请求轮换、几分钟即失效；
+    # 库里存的是它，所以报告里公众号条目点开是验证页，正文一条也抓不到。
+    # 实测：无 cookie 直连 /link 必 302 到 /antispider/；而在种下 SUID/SNUID 的
+    # **同一次会话**里立刻跟随，中转页会 200 并把真实链接拆成 11 段 `url += '...'`
+    # 藏在脚本里，拼起来就是永久有效的 mp.weixin.qq.com 链接。
+    # 代价是每条结果多一个请求，所以按条限流、连续失败就收手。
+    resolve:
+      enabled: true
+      max_links: 4          # 每次 SERP 最多解 4 条（6 变体 ≈ 24 次/任务）
+      delay_s: 2.5          # 条间间隔，逐条请求比翻页更容易触发风控
+      stop_after_fail: 2    # 连续失败 2 条就收手，剩下的保留中转链
     assertions:
       min_items: 3
       required_fields: [url, title]

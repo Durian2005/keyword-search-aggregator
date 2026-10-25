@@ -198,6 +198,15 @@ def _time_source_of(c: Candidate) -> str:
     return TS_API
 
 
+def _is_dead_relay(url: str) -> bool:
+    """搜狗中转链（`weixin.sogou.com/link?url=<token>`）—— 几分钟后必失效的地址。
+
+    只认这一个形态，不写成通用的 `"/link?"` 判断：别的站也可能有同名路径，
+    误判会让正常的永久链接被当成"可以替换掉的旧链"。
+    """
+    return "weixin.sogou.com/link?url=" in (url or "")
+
+
 def _term_pattern(keyword: str) -> "re.Pattern[str] | None":
     """关键词过滤用的正则：**词元 OR**，不是整串包含。
 
@@ -1306,8 +1315,15 @@ def run_task(
             existing = repo.resolve_dedup_key(c.dedupe_key)
             if existing and existing != doc.url_canon:
                 result.dropped_dup += 1
-                doc.url_canon = existing
-                mention.url_canon = existing
+                # 一个例外：旧行是已失效的搜狗中转链，而本次解出了永久 mp 链接。
+                # 这时"复用旧 url"会把解链成果原地吞掉，历史死链永远修不好 ——
+                # 前提是迁移成功（主键无冲突），否则老老实实退回旧 url。
+                migrated = (_is_dead_relay(existing)
+                            and not _is_dead_relay(doc.url_canon)
+                            and repo.rekey_doc(existing, doc.url_canon))
+                if not migrated:
+                    doc.url_canon = existing
+                    mention.url_canon = existing
 
         if repo.upsert_doc(doc):
             result.docs_new += 1

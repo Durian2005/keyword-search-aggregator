@@ -11,8 +11,18 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from kwsearch.config import ChannelConfig, PagingConfig  # noqa: E402
 from kwsearch.discover import get_channel, get_parser  # noqa: E402
-from kwsearch.discover.sogou_weixin import parse_serp  # noqa: E402
+from kwsearch.discover.base import ChannelContext  # noqa: E402
+from kwsearch.discover.sogou_weixin import (  # noqa: E402
+    _RESOLVE_CACHE,
+    ResolvePolicy,
+    join_relay_fragments,
+    parse_serp,
+    resolve_candidates,
+)
+from kwsearch.fetch import FetchResult, RetryPolicy  # noqa: E402
+from kwsearch.models import Candidate  # noqa: E402
 
 
 def _article(n: int, title: str, snippet: str, account: str,
@@ -185,6 +195,252 @@ class TestSogouWeixinParse(unittest.TestCase):
         c = self._one("/link?url=T1&amp;type=2", title="招生咨询 13812345678")
         self.assertNotIn("13812345678", c.dedupe_key)
         self.assertEqual(len(c.dedupe_key), 20)
+
+
+# ============================================================================
+# 中转链解链（2026-10-25）
+# ============================================================================
+_REAL = ("https://mp.weixin.qq.com/s?src=11&timestamp=1792940236&ver=7048"
+         "&signature=abcDEF123ghiJKL")
+
+
+def _relay_page(real: str = _REAL, *, width: int = 20) -> str:
+    """合成中转页：真实地址拆成多段 `url += '...'`，段尾插 @ 干扰（真实结构）。"""
+    frags = [real[i:i + width] for i in range(0, len(real), width)]
+    body = "\n".join(f"url += '{f}@';" for f in frags)
+    return f"<!doctype html><html><head><title>搜狗微信</title></head><body>" \
+           f"<script>var url = '';\n{body}\nwindow.location.replace(url);</script>" \
+           f"</body></html>"
+
+
+_CHALLENGE = "<!doctype html><html><head><title>搜狗搜索</title></head>" \
+             "<body><div id='seccodeImage'></div></body></html>"
+
+
+class _FakeFetcher:
+    """按 URL 返回预置响应；记录调用顺序。单测零真实请求。"""
+
+    def __init__(self, pages: dict[str, tuple[int, str]]) -> None:
+        self.pages = pages
+        self.calls: list[str] = []
+
+    def fetch(self, url: str, headers: dict, timeout: int = 20) -> FetchResult:
+        self.calls.append(url)
+        status, body = self.pages.get(url, (404, ""))
+        raw = body.encode("utf-8")
+        return FetchResult(status=status, body=body, content_type="text/html; charset=utf-8",
+                           final_url=url, elapsed_ms=1, fetcher="fake",
+                           content_bytes=len(raw), raw=raw)
+
+    def close(self) -> None:
+        pass
+
+
+def _cand(url: str = "https://weixin.sogou.com/link?url=FAKE0&type=2") -> Candidate:
+    return Candidate(url_raw=url, title="某篇红黑树文章", channel="sogou_weixin",
+                     rank=1, extra={"domain": "mp.weixin.qq.com"})
+
+
+class TestJoinRelayFragments(unittest.TestCase):
+    def test_joins_and_strips_at_sign(self) -> None:
+        self.assertEqual(join_relay_fragments(_relay_page()), _REAL)
+
+    def test_keeps_timestamp_intact(self) -> None:
+        # 回归：曾用 html.unescape() 把 `&times` 啃成 `×`，链接直接废掉
+        got = join_relay_fragments(_relay_page())
+        self.assertIn("&timestamp=", got)
+        self.assertNotIn("×tamp", got)
+
+    def test_handles_html_escaped_amp(self) -> None:
+        page = _relay_page().replace("&", "&amp;")
+        self.assertEqual(join_relay_fragments(page), _REAL)
+
+    def test_rejects_challenge_page(self) -> None:
+        self.assertIsNone(join_relay_fragments(_CHALLENGE))
+
+    def test_rejects_non_mp_target(self) -> None:
+        page = _relay_page("https://example.com/a?x=1")
+        self.assertIsNone(join_relay_fragments(page))
+
+    def test_rejects_mp_without_signature(self) -> None:
+        # 没有 signature 的 mp 地址是失效的，认了反而更糟（点开是错误页）
+        self.assertIsNone(join_relay_fragments(_relay_page("https://mp.weixin.qq.com/s?src=11")))
+
+    def test_empty_input(self) -> None:
+        self.assertIsNone(join_relay_fragments(""))
+
+
+class TestResolvePolicy(unittest.TestCase):
+    def test_off_by_default(self) -> None:
+        p = ResolvePolicy.from_mapping({})
+        self.assertFalse(p.enabled)
+        self.assertEqual(p.max_links, 4)
+
+    def test_clamps_negative_max(self) -> None:
+        p = ResolvePolicy.from_mapping({"enabled": True, "max_links": -5})
+        self.assertEqual(p.max_links, 0)
+
+    def test_stop_after_fail_at_least_one(self) -> None:
+        p = ResolvePolicy.from_mapping({"stop_after_fail": 0})
+        self.assertEqual(p.stop_after_fail, 1)
+
+
+class TestResolveCandidates(unittest.TestCase):
+    def setUp(self) -> None:
+        _RESOLVE_CACHE.clear()      # 模块级缓存，测试之间必须隔离
+
+    def _policy(self, **kw) -> ResolvePolicy:
+        base = {"enabled": True, "max_links": 4, "delay_s": 0, "stop_after_fail": 2}
+        base.update(kw)
+        return ResolvePolicy.from_mapping(base)
+
+    def test_replaces_relay_with_real_link(self) -> None:
+        c = _cand()
+        f = _FakeFetcher({c.url_raw: (200, _relay_page())})
+        stats = resolve_candidates([c], f, {}, referer="https://weixin.sogou.com/weixin?q=x",
+                                   timeout=5, policy=self._policy(), sleep=lambda _s: None)
+        self.assertEqual(c.url_raw, _REAL)
+        self.assertIs(c.extra["link_resolved"], True)
+        self.assertEqual((stats.tried, stats.ok, stats.failed), (1, 1, 0))
+
+    def test_keeps_relay_when_challenged(self) -> None:
+        c = _cand()
+        f = _FakeFetcher({c.url_raw: (200, _CHALLENGE)})
+        stats = resolve_candidates([c], f, {}, referer="x", timeout=5,
+                                   policy=self._policy(), sleep=lambda _s: None)
+        self.assertIn("weixin.sogou.com/link", c.url_raw)     # 原链保留，条目没丢
+        self.assertIs(c.extra["link_resolved"], False)
+        self.assertEqual(stats.failed, 1)
+
+    def test_keeps_relay_on_http_error(self) -> None:
+        c = _cand()
+        f = _FakeFetcher({})                                   # 一律 404
+        resolve_candidates([c], f, {}, referer="x", timeout=5,
+                           policy=self._policy(), sleep=lambda _s: None)
+        self.assertIn("weixin.sogou.com/link", c.url_raw)
+
+    def test_respects_max_links(self) -> None:
+        cands = [_cand(f"https://weixin.sogou.com/link?url=FAKE{i}") for i in range(5)]
+        f = _FakeFetcher({c.url_raw: (200, _relay_page()) for c in cands})
+        stats = resolve_candidates(cands, f, {}, referer="x", timeout=5,
+                                   policy=self._policy(max_links=2),
+                                   sleep=lambda _s: None)
+        self.assertEqual(stats.ok, 2)
+        self.assertEqual(len(f.calls), 2)
+        self.assertIn("上限", stats.stopped)
+
+    def test_stops_after_consecutive_failures(self) -> None:
+        cands = [_cand(f"https://weixin.sogou.com/link?url=FAKE{i}") for i in range(5)]
+        f = _FakeFetcher({})                                   # 全失败
+        stats = resolve_candidates(cands, f, {}, referer="x", timeout=5,
+                                   policy=self._policy(stop_after_fail=2),
+                                   sleep=lambda _s: None)
+        self.assertEqual(stats.failed, 2)
+        self.assertEqual(len(f.calls), 2)                      # 第 3 条就不再发了
+        self.assertIn("连续失败", stats.stopped)
+
+    def test_skips_direct_links(self) -> None:
+        c = _cand("https://mp.weixin.qq.com/s?src=11&signature=x")
+        f = _FakeFetcher({})
+        stats = resolve_candidates([c], f, {}, referer="x", timeout=5,
+                                   policy=self._policy(), sleep=lambda _s: None)
+        self.assertEqual(f.calls, [])
+        self.assertEqual(stats.tried, 0)
+        self.assertEqual(stats.note(), "")
+
+    def test_disabled_makes_no_requests(self) -> None:
+        c = _cand()
+        f = _FakeFetcher({c.url_raw: (200, _relay_page())})
+        resolve_candidates([c], f, {}, referer="x", timeout=5,
+                           policy=ResolvePolicy(), sleep=lambda _s: None)
+        self.assertEqual(f.calls, [])
+        self.assertIn("weixin.sogou.com/link", c.url_raw)
+
+    def test_reuses_resolution_across_variants(self) -> None:
+        # 同一篇文章（业务键相同、但中转链 token 不同）在别的变体里再出现：
+        # 不该再发一次请求 —— 搜狗的风控额度是最稀缺的资源
+        a = _cand("https://weixin.sogou.com/link?url=VA")
+        b = _cand("https://weixin.sogou.com/link?url=VB")
+        a.dedupe_key = b.dedupe_key = "same-article"
+        f = _FakeFetcher({a.url_raw: (200, _relay_page())})
+
+        first = resolve_candidates([a], f, {}, referer="x", timeout=5,
+                                   policy=self._policy(), sleep=lambda _s: None)
+        self.assertEqual(first.ok, 1)
+
+        second = resolve_candidates([b], f, {}, referer="x", timeout=5,
+                                    policy=self._policy(), sleep=lambda _s: None)
+        self.assertEqual(len(f.calls), 1)          # 第二次没有真的发请求
+        self.assertEqual(b.url_raw, _REAL)         # 但链接照样换成永久地址
+        self.assertIs(b.extra["link_resolved"], True)
+        self.assertEqual(second.reused, 1)
+        self.assertIn("复用 1", second.note())
+
+    def test_failures_are_not_cached(self) -> None:
+        # 失败不缓存：换个时间同一篇可能就解得出，一次失败不能永久拉黑
+        a = _cand("https://weixin.sogou.com/link?url=VA")
+        a.dedupe_key = "k-fail"
+        f = _FakeFetcher({})
+        resolve_candidates([a], f, {}, referer="x", timeout=5,
+                           policy=self._policy(), sleep=lambda _s: None)
+        self.assertEqual(len(f.calls), 1)
+
+        b = _cand("https://weixin.sogou.com/link?url=VB")
+        b.dedupe_key = "k-fail"
+        f2 = _FakeFetcher({b.url_raw: (200, _relay_page())})
+        stats = resolve_candidates([b], f2, {}, referer="x", timeout=5,
+                                   policy=self._policy(), sleep=lambda _s: None)
+        self.assertEqual(stats.ok, 1)
+        self.assertEqual(b.url_raw, _REAL)
+
+
+class TestChannelResolvesEndToEnd(unittest.TestCase):
+    """通道整链：SERP → 解链 → 候选带着永久链接返回。"""
+
+    def setUp(self) -> None:
+        _RESOLVE_CACHE.clear()
+
+    def _ctx(self, fetcher, *, resolve: dict | None = None) -> ChannelContext:
+        ch = ChannelConfig(
+            id="sogou_weixin", name="搜狗微信", type="site_search",
+            parser="sogou_weixin",
+            url_template="https://weixin.sogou.com/weixin?type=2&page={offset}&query={q}",
+            headers={"Referer": "https://weixin.sogou.com/"},
+            paging=PagingConfig(mode="offset", start=1, step=1, max_pages=1),
+            throttle_min_interval_s=0,
+            resolve=resolve if resolve is not None else {
+                "enabled": True, "max_links": 4, "delay_s": 0, "stop_after_fail": 2},
+        )
+        return ChannelContext(channel=ch, defaults={}, extract={},
+                              fetcher=fetcher, policy=RetryPolicy(), timeout=5)
+
+    def test_candidates_carry_permanent_links(self) -> None:
+        serp_url = ("https://weixin.sogou.com/weixin?type=2&page=1&query="
+                    "%E7%BA%A2%E9%BB%91%E6%A0%91")
+        relay0 = "https://weixin.sogou.com/link?url=FAKE0&type=2&query=test"
+        relay1 = "https://weixin.sogou.com/link?url=FAKE1&type=2&query=test"
+        f = _FakeFetcher({
+            serp_url: (200, _PAGE),
+            relay0: (200, _relay_page(_REAL)),
+            relay1: (200, _relay_page(_REAL + "2")),
+        })
+        res = get_channel("sogou_weixin")("红黑树", 1, self._ctx(f))
+        self.assertEqual(len(res.candidates), 2)
+        for c in res.candidates:
+            self.assertTrue(c.url_raw.startswith("https://mp.weixin.qq.com/"))
+            self.assertIs(c.extra["link_resolved"], True)
+        # 业务键不因换链而变：跨跑批去重仍然有效
+        self.assertEqual(len({c.dedupe_key for c in res.candidates}), 2)
+        self.assertIn("解链 2/2", res.detail)
+
+    def test_falls_back_to_relay_when_resolve_disabled(self) -> None:
+        serp_url = ("https://weixin.sogou.com/weixin?type=2&page=1&query="
+                    "%E7%BA%A2%E9%BB%91%E6%A0%91")
+        f = _FakeFetcher({serp_url: (200, _PAGE)})
+        res = get_channel("sogou_weixin")("红黑树", 1,
+                                          self._ctx(f, resolve={"enabled": False}))
+        self.assertEqual(len(f.calls), 1)                      # 只打了 SERP
+        self.assertIn("weixin.sogou.com/link", res.candidates[0].url_raw)
 
 
 if __name__ == "__main__":
