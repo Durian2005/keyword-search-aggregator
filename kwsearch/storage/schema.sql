@@ -84,6 +84,12 @@ CREATE TABLE IF NOT EXISTS doc (
                                                -- 读写都要过 aggregate.cluster.to_signed64 / from_signed64
     cluster_id   INTEGER,                      -- ⚠️ 未使用：簇是任务维度的，权威映射见 cluster_member
     body_ref     TEXT,                         -- 全文落盘相对路径，NULL=未存
+    dedupe_key   TEXT,                         -- 跨跑批业务去重键（NULL=该通道不提供）
+                                               -- 搜狗微信的 URL 是 `link?url=<token>` 中转链，
+                                               -- token 每次请求都轮换 → 同一篇文章的 url_canon
+                                               -- 每次都不同，靠 URL 去重完全失效。通道可给一个
+                                               -- 与 URL 无关的稳定键（公众号+标题+日期 的哈希），
+                                               -- 入库时命中就复用旧行，不再新建 doc。
     first_seen   TEXT NOT NULL,
     last_seen    TEXT NOT NULL,
     extra_json   TEXT
@@ -92,6 +98,9 @@ CREATE INDEX IF NOT EXISTS idx_doc_domain    ON doc(domain, published_at DESC);
 CREATE INDEX IF NOT EXISTS idx_doc_published ON doc(published_at DESC);
 CREATE INDEX IF NOT EXISTS idx_doc_simhash   ON doc(simhash);
 CREATE INDEX IF NOT EXISTS idx_doc_cluster   ON doc(cluster_id);
+-- ⚠️ dedupe_key 的索引不写在这里：老库执行本脚本时还没有该列（补列在 init_db 里
+-- 的 _ensure_columns 之后才发生），建索引会直接报 no such column。
+-- 它由 init_db 在补列之后统一创建，见 storage/__init__.py 的 _ensure_indexes。
 
 -- ----------------------------------------------------------------------------
 -- 命中：关键词 × 文档。同一篇文档被多个通道发现也只留一行，分数取最大值

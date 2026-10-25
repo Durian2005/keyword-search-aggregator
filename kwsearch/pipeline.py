@@ -146,6 +146,7 @@ class RunResult:
     dropped_url: int = 0           # 命中丢弃规则
     dropped_zero: int = 0          # 标题/摘要里完全没命中关键词（通道兜底给的噪声）
     dropped_cap: int = 0           # 命中单域配额
+    dropped_dup: int = 0           # 业务键命中库里已有条目（同一篇文章换了 URL）
     resolved_list: int = 0         # 列表页解析出来的相关文章数（链接直指正文，不是目录）
     pii_masked: int = 0
     # robots 档位与红线（2026-10-22 全案）
@@ -1109,6 +1110,7 @@ def run_task(
             time_source=_time_source_of(c),
             channel=c.channel,
             body_chars=0,            # 抓正文失败时保持 0 = "没抓到"，语义明确
+            dedupe_key=c.dedupe_key,
         )
 
         # 正文抓到了：用页面自己的事实覆盖 SERP 的转述
@@ -1144,6 +1146,18 @@ def run_task(
                 repo.add_alert(task_id, c.channel, "pii_masked",
                                f"{doc.url_canon[:120]} 正文内 {n3 + n4} 处"
                                f"联系方式/证件号已脱敏")
+        # ---- 跨跑批去重（业务键）---------------------------------------------
+        # 搜狗微信这类通道的 URL 是 token 轮换的中转链，同一篇文章每次跑批都是新
+        # URL，只按 URL 去重等于没去重。命中业务键说明这篇已经在库里：复用旧
+        # url_canon、不新建 doc 行，也不算"新发现"（否则新增数会随跑批次数虚涨）。
+        # 必须放在 enriched 取值之后 —— 正文是按本次的 c.url_canon 抓的。
+        if c.dedupe_key:
+            existing = repo.resolve_dedup_key(c.dedupe_key)
+            if existing and existing != doc.url_canon:
+                result.dropped_dup += 1
+                doc.url_canon = existing
+                mention.url_canon = existing
+
         if repo.upsert_doc(doc):
             result.docs_new += 1
         repo.upsert_mention(mention)
@@ -1245,6 +1259,7 @@ def run_task(
         "dropped_url": result.dropped_url,
         "dropped_zero": result.dropped_zero,
         "dropped_cap": result.dropped_cap,
+        "dropped_dup": result.dropped_dup,
         "resolved_list": result.resolved_list,
         "pii_masked": result.pii_masked,
         "max_per_domain": cap_per_domain,

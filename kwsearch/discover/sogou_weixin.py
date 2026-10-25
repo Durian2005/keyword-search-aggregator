@@ -26,6 +26,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 from datetime import datetime, timedelta, timezone
@@ -78,6 +79,25 @@ def _time_of(block: Node) -> tuple[str | None, str]:
         iso = dt.isoformat(timespec="seconds")
         return iso[:10], iso
     return "", ""
+
+
+def _dedupe_key(account: str, title: str, date_iso: str) -> str:
+    """跨跑批去重键：公众号 + 标题 + 日期 的哈希（2026-10-24）。
+
+    为什么需要它：href 是 `link?url=<token>` 中转链，**token 每次请求都轮换**，
+    同一篇文章每次跑批都是新 URL —— 只按 URL 去重的话，每跑一次就多一堆
+    doc 行，"新增 N 条"也全是假的。
+
+    为什么取这三项：同一篇文章在这三项上稳定（标题由作者定、日期是发布时间、
+    公众号是发布者），而 URL 每次都变。日期拿不到时只用 公众号+标题，
+    仍能拦住绝大多数重复（同一公众号不会有同名的两篇文章）。
+
+    为什么存哈希不存原文：标题是页面原文，可能含手机号/邮箱；这个键要落进
+    doc 表，存哈希既能去重，又不额外多存一份未经脱敏的原文。
+    """
+    raw = "|".join(("sogou_weixin", (account or "").strip().casefold(),
+                    (title or "").strip().casefold(), date_iso or ""))
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:20]
 
 
 def parse_serp(
@@ -141,6 +161,8 @@ def parse_serp(
             channel=channel_id,
             rank=offset if offset >= 1 else 1,
             published_hint=date_iso or None,
+            # 跨跑批去重键：中转 URL 每次请求都变，靠它才能认出"同一篇文章"
+            dedupe_key=_dedupe_key(account, title, date_iso),
             extra={
                 # 真实内容域，不是中转域名（见模块 docstring）
                 "domain": "mp.weixin.qq.com",

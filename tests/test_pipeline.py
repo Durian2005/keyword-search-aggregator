@@ -88,6 +88,29 @@ def fake_single(keyword: str, offset: int, ctx) -> ChannelResult:  # noqa: ANN00
     return _mk(_SERP_ITEMS[:2], "fake_single", keyword)
 
 
+# 搜狗微信场景：中转链 `link?url=<token>` 的 token 每次请求都轮换，
+# URL 每次都变，但 dedupe_key（公众号+标题+日期）恒定。
+_ROTATE = {"n": 0}
+
+
+def fake_rotating(keyword: str, offset: int, ctx) -> ChannelResult:  # noqa: ANN001
+    _ROTATE["n"] += 1
+    tok = _ROTATE["n"]
+    return ChannelResult(channel="fake_rotating", query=keyword, candidates=[
+        Candidate(
+            url_raw=f"https://s.example.com/link?url=TOK{tok}",
+            title="红黑树 原理详解",
+            snippet="红黑树是一种自平衡二叉查找树",
+            channel="fake_rotating", rank=1, published_hint="2026-10-01",
+            dedupe_key="fixed-article-key-1",
+            extra={"domain": "s.example.com"},
+        ),
+    ], raw_count=1)
+
+
+discover._REGISTRY["fake_rotating"] = fake_rotating
+
+
 discover._REGISTRY["fake_serp"] = fake_serp
 discover._REGISTRY["fake_zero"] = fake_zero
 discover._REGISTRY["fake_blocked"] = fake_blocked
@@ -333,6 +356,16 @@ _PERSON_BAIDU_CH = """
 # serp 型但永远被拦：验机构探测"被拦即收手"。
 # 注意不能带 variants:false —— 单发配额通道不参与探测（那是另一条规则），
 # 这个通道要验的恰恰是"探测被拦"这条路径。
+_ROTATING_CH = """
+  - id: fake_rotating
+    type: serp
+    parser: fake_rotating
+    url_template: "https://fake.test/rot?q={q}"
+    paging: {mode: none}
+    throttle: {min_interval_s: 0}
+    assertions: {min_items: 1, required_fields: [url, title]}
+"""
+
 _BLOCKED_SERP_CH = """
   - id: fake_blocked_serp
     type: serp
@@ -511,6 +544,41 @@ class TestIdempotency(RunCase):
         b = self.rows("SELECT COUNT(*) AS n FROM mention WHERE task_id=?", second.task_id)[0]["n"]
         self.assertEqual(a, b)
         self.assertEqual(a, first.kept)      # 不是累加
+
+
+class TestDedupeKeyAcrossRuns(RunCase):
+    """同一篇文章换了 URL（搜狗的中转链 token 轮换）：跨跑批只能算一条。
+
+    没有 dedupe_key 的通道仍靠 URL 去重（TestIdempotency 已覆盖），
+    这里验的是"URL 变了但业务键没变"这一种。
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        _ROTATE["n"] = 0
+
+    def test_second_run_reuses_existing_doc(self) -> None:
+        cfg = self.cfg(_ROTATING_CH)
+        first = self.run_kw(cfg)
+        # 不管这一跑触发了几个变体（每次都换 URL），doc 表只应有一篇
+        self.assertEqual(first.docs_new, 1)
+
+        second = self.run_kw(cfg)
+        self.assertEqual(second.docs_new, 0)              # 不再算"新发现"
+        self.assertGreaterEqual(second.dropped_dup, 1)    # 业务键命中库里已有条目
+        self.assertGreaterEqual(second.kept, 1)           # 仍算本任务的一条结果
+
+        docs = self.rows("SELECT url_canon, dedupe_key FROM doc")
+        self.assertEqual(len(docs), 1)                    # 库里只有一行
+        self.assertEqual(docs[0]["dedupe_key"], "fixed-article-key-1")
+        # 所有 mention 指向同一篇（第二次没有新建 doc）
+        urls = self.rows("SELECT DISTINCT url_canon FROM mention")
+        self.assertEqual(len(urls), 1)
+
+    def test_dedupe_key_persisted_on_first_insert(self) -> None:
+        self.run_kw(self.cfg(_ROTATING_CH))
+        row = self.rows("SELECT dedupe_key FROM doc")[0]
+        self.assertEqual(row["dedupe_key"], "fixed-article-key-1")
 
 
 class TestSanitizeInPipeline(RunCase):

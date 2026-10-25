@@ -30,6 +30,9 @@ class Candidate:
     channel: str = ""               # 来源通道 id
     rank: int = 0                   # 该通道内的出现序号（1 起）
     published_hint: str | None = None   # 通道直接给的日期（Bing RSS 的 pubDate / B站 pubdate）
+    # 跨跑批业务去重键。URL 会轮换/带 token 的通道（如搜狗微信的中转链）用它：
+    # 与 URL 无关、同一篇文章每次解析都相同。空 = 该通道不提供，退回按 URL 去重。
+    dedupe_key: str = ""
     extra: dict[str, Any] = field(default_factory=dict)
 
     def to_json(self) -> str:
@@ -65,6 +68,8 @@ class Doc:
     simhash: int | None = None      # 64bit，聚合层算
     cluster_id: int | None = None
     body_ref: str | None = None     # 全文落盘相对路径，None = 未存
+    # 跨跑批业务去重键（见 schema.sql 该列注释）。空 = 该通道不提供。
+    dedupe_key: str = ""
     extra: dict[str, Any] = field(default_factory=dict)
 
 

@@ -210,6 +210,7 @@ def _run_summary(result) -> str:  # noqa: ANN001
         + f"\n入库 {result.kept}（新 {result.docs_new}） · 去重后 {result.unique}"
           f" · 原始 {result.candidates} · 丢弃 {result.dropped_url}"
           f" · 配额丢 {result.dropped_cap} · 脱敏 {result.pii_masked}"
+          + (f" · 同文换链 {result.dropped_dup}" if result.dropped_dup else "")
           + (f" · 列表页解析 {result.resolved_list} 篇"
              if result.resolved_list else "")
           + f" · 告警 {result.alerts} · {result.elapsed_ms} ms"

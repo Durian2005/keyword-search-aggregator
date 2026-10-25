@@ -298,7 +298,7 @@ python -m kwsearch run "张军" --person --org "某某大学计算机学院" \
 python -m unittest discover -s tests
 ```
 
-595 个用例，包含降级判定与兜底页判定的真实样本回归、GBK 站解码、robots 失败语义与三档绕过（record/off/失败放行、Request-rate）、政府站红线双保险、SimHash 阈值边界、正文模板剥离、人名锚点定档与时间线、报告转义等。样本里的人名与机构名已替换为中性占位，标题结构与判定结果不变。
+601 个用例，包含降级判定与兜底页判定的真实样本回归、跨跑批业务键去重、GBK 站解码、robots 失败语义与三档绕过（record/off/失败放行、Request-rate）、政府站红线双保险、SimHash 阈值边界、正文模板剥离、人名锚点定档与时间线、报告转义等。样本里的人名与机构名已替换为中性占位，标题结构与判定结果不变。
 
 ---
 

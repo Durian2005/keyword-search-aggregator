@@ -403,6 +403,9 @@ def _overview(totals: Mapping[str, Any], task: Mapping[str, Any]) -> str:
         ("零命中", tstats.get("dropped_zero")),
         ("规则丢弃", tstats.get("dropped_url")),
         ("单域配额", tstats.get("dropped_cap")),
+        # 同一篇文章换了 URL（搜狗微信的 token 中转链）：业务键命中的条数。
+        # 放进漏斗是为了让"原始 53 → 入库 51"这类差数有账可查。
+        ("同文换链", tstats.get("dropped_dup")),
         ("入库", totals.get("docs")),
     ]
     funnel = '<span class="arrow">→</span>'.join(

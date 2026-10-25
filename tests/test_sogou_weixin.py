@@ -151,5 +151,41 @@ class TestSogouWeixinParse(unittest.TestCase):
         self.assertEqual(len(r.candidates), 2)
         self.assertIsNone(r.block_kind)
 
+    # ---- 跨跑批去重键（2026-10-24）----------------------------------------
+    # 中转链的 token 每次请求都轮换，URL 去重失效；业务键必须与 URL 无关。
+
+    def _one(self, href: str, title: str = "红黑树入门",
+             account: str = "某公众号") -> object:
+        page = ('<html><body><ul class="news-list">'
+                + _article(0, title, "红黑树是一种自平衡二叉查找树", account, path=href)
+                + "</ul></body></html>")
+        return parse_serp(page, 1, channel_id="sogou_weixin", query="红黑树").candidates[0]
+
+    def test_dedupe_key_stable_when_token_rotates(self) -> None:
+        a = self._one("/link?url=TOKEN_AAA&amp;type=2")
+        b = self._one("/link?url=TOKEN_BBB&amp;type=2")
+        self.assertNotEqual(a.url_raw, b.url_raw)       # URL 确实变了
+        self.assertEqual(a.dedupe_key, b.dedupe_key)    # 业务键不变
+        self.assertTrue(a.dedupe_key)
+
+    def test_dedupe_key_differs_across_articles_and_accounts(self) -> None:
+        base = self._one("/link?url=T1&amp;type=2")
+        other_title = self._one("/link?url=T1&amp;type=2", title="另一篇文章")
+        other_account = self._one("/link?url=T1&amp;type=2", account="另一个公众号")
+        self.assertNotEqual(base.dedupe_key, other_title.dedupe_key)
+        self.assertNotEqual(base.dedupe_key, other_account.dedupe_key)
+
+    def test_dedupe_key_normalizes_case_and_space(self) -> None:
+        a = self._one("/link?url=T1&amp;type=2", title="Red Black Tree")
+        b = self._one("/link?url=T2&amp;type=2", title=" red black tree ")
+        self.assertEqual(a.dedupe_key, b.dedupe_key)
+
+    def test_dedupe_key_is_hash_not_plaintext(self) -> None:
+        # 标题是页面原文（可能含手机号），键要落进 doc 表 —— 必须是哈希，不含原文
+        c = self._one("/link?url=T1&amp;type=2", title="招生咨询 13812345678")
+        self.assertNotIn("13812345678", c.dedupe_key)
+        self.assertEqual(len(c.dedupe_key), 20)
+
+
 if __name__ == "__main__":
     unittest.main()

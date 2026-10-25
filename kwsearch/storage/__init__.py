@@ -36,7 +36,10 @@ _ADDITIVE_COLUMNS: dict[str, dict[str, str]] = {
     "cluster": {"max_hamming": "INTEGER", "method": "TEXT"},
     # body_core 是"剥掉转载模板后的正文长度"。老库补列后为 NULL，
     # 聚类时退回 body_chars（代表照旧能选，只是享受不到"不选二手站"这条改进）。
-    "doc": {"body_core": "INTEGER"},
+    "doc": {"body_core": "INTEGER",
+            # 跨跑批业务去重键（2026-10-24）。搜狗微信的 URL 是 token 轮换的中转链，
+            # 靠 url_canon 去重完全失效 —— 详见 schema.sql 里该列的注释。
+            "dedupe_key": "TEXT"},
     # P1 的候选人卡片多了三列：次要机构、活跃时间范围。老库补列后为 NULL。
     "person_card": {
         "also_orgs": "TEXT", "first_when": "TEXT", "last_when": "TEXT",
@@ -76,10 +79,22 @@ def init_db(db_path: str | Path) -> sqlite3.Connection:
     conn = connect(db_path)
     conn.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
     added = _ensure_columns(conn)
+    _ensure_indexes(conn)
     conn.commit()
     if added:
         logger.info("已给老库补列: %s", ", ".join(added))
     return conn
+
+
+def _ensure_indexes(conn: sqlite3.Connection) -> None:
+    """依赖"补列之后才存在的列"的索引，统一在这里建（幂等）。
+
+    不能写进 schema.sql：老库跑脚本时列还没补上，CREATE INDEX 会报 no such column。
+    """
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_doc_dedupe ON doc(dedupe_key)"
+        " WHERE dedupe_key IS NOT NULL"
+    )
 
 
 # ── 清空所有历史数据 ────────────────────────────────────────────────────────
@@ -235,6 +250,20 @@ class Repository(_WipeMixin):
 
     # ------------------------------------------------------------------- doc
 
+    def resolve_dedup_key(self, key: str) -> str | None:
+        """按业务去重键查库里已有的 url_canon（跨跑批去重）。没有返回 None。
+
+        只给"URL 会变"的通道用（当前只有搜狗微信的 token 中转链）：同一篇文章
+        每次解析出的 URL 都不同，URL 去重完全失效、每次跑批都算新发现。
+        命中说明这篇已经在库里，调用方应复用旧 url_canon，不要再插一行 doc。
+        """
+        if not key:
+            return None
+        row = self.conn.execute(
+            "SELECT url_canon FROM doc WHERE dedupe_key=? LIMIT 1", (key,)
+        ).fetchone()
+        return str(row[0]) if row else None
+
     def upsert_doc(self, doc: Doc) -> bool:
         """写入/更新一篇文档。返回 True = 库里原本没有（本任务的新发现）。
 
@@ -258,8 +287,8 @@ class Repository(_WipeMixin):
             self.conn.execute(
                 "INSERT INTO doc(url_canon, url_raw, domain, title, summary, published_at,"
                 " time_source, channel, http_status, content_type, body_chars, body_core,"
-                " simhash, cluster_id, body_ref, first_seen, last_seen, extra_json)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                " simhash, cluster_id, body_ref, dedupe_key, first_seen, last_seen, extra_json)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     url_canon, doc.url_raw or url_canon,
                     doc.domain or host_of(doc.url_raw or url_canon),
@@ -270,6 +299,7 @@ class Repository(_WipeMixin):
                     # bodies_done 的 "body_core IS NOT NULL" 也就不会造成反复重抓。
                     doc.body_core or None,
                     sim, doc.cluster_id, doc.body_ref,
+                    doc.dedupe_key or None,
                     doc.fetched_at, now,
                     json.dumps(doc.extra, ensure_ascii=False) if doc.extra else None,
                 ),
@@ -296,11 +326,11 @@ class Repository(_WipeMixin):
             "UPDATE doc SET last_seen=?, title=?, summary=?, published_at=?, time_source=?,"
             " http_status=COALESCE(http_status, ?), content_type=COALESCE(content_type, ?),"
             " body_chars=MAX(body_chars, ?), body_core=MAX(COALESCE(body_core, 0), ?),"
-            " simhash=COALESCE(simhash, ?)"
+            " simhash=COALESCE(simhash, ?), dedupe_key=COALESCE(dedupe_key, ?)"
             " WHERE url_canon=?",
             (now, title, summary, published_at, time_source,
              doc.http_status, doc.content_type, doc.body_chars,
-             doc.body_core or 0, sim, url_canon),
+             doc.body_core or 0, sim, doc.dedupe_key or None, url_canon),
         )
         return False
 
