@@ -44,6 +44,12 @@ _STATUS_CN = {
     "aborted": "已中止",
 }
 
+
+def status_cn(status: object) -> str:
+    """任务状态的中文名。CLI 的「最近任务」表格也用这个 —— 同一个状态在两个地方
+    一个显示 aborted 一个显示「已中止」，读的人会以为是两回事。"""
+    return _STATUS_CN.get(str(status), str(status))
+
 _TIME_SOURCE_CN = {
     "serp": "搜索结果页",
     "api": "接口字段",
@@ -313,7 +319,7 @@ footer .ver{font-family:var(--mono)}
 
 def _header(task: Mapping[str, Any]) -> str:
     kw = task.get("keyword", "")
-    status = _STATUS_CN.get(str(task.get("status")), task.get("status"))
+    status = status_cn(task.get("status"))
     bits = [
         f"任务 <code>{_esc(task.get('task_id'))}</code>",
         _esc(task.get("mode")),

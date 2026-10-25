@@ -495,6 +495,7 @@ function renderTasks(list) {
     const st = t.status === "ok" ? '<span class="tag ok">完成</span>'
       : t.status === "partial" ? '<span class="tag warn">部分完成</span>'
       : t.status === "failed" ? '<span class="tag bad">失败</span>'
+      : t.status === "aborted" ? '<span class="tag bad">已中止</span>'
       : '<span class="tag">' + esc(t.status) + "</span>";
     const rep = t.report_url
       ? '<a href="' + esc(t.report_url) + '" target="_blank" rel="noopener">查看报告</a>'

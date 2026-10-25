@@ -216,6 +216,30 @@ class Repository(_WipeMixin):
         )
         self.conn.commit()
 
+    def abandon_task(self, task_id: str, exc: BaseException) -> None:
+        """把因异常中断的任务标成 aborted（**不是** failed）。
+
+        为什么不用 failed：report 把 failed 渲染成「本次无结果 · 所有通道都没有产出
+        可用条目」，那是"跑完了但没东西"；这里是"没跑完"。混用会让读者把一次崩溃
+        读成一次限流，然后去调通道配置，调错方向。
+
+        `AND status='running'` 是防覆盖：收尾都写完之后才抛的情况（比如最后那行
+        汇总打印撞上 broken pipe）不该把一条已完成的任务改成"中止"。
+        本身失败只警告 —— 树已经倒了，不能为了修剪把原始异常吞掉。
+        """
+        detail = f"{type(exc).__name__}: {exc}"[:500]
+        try:
+            self.conn.execute(
+                "UPDATE task SET finished_at=?, status='aborted', truncated=0,"
+                " stats_json=? WHERE task_id=? AND status='running'",
+                (utcnow_iso(),
+                 json.dumps({"error": detail}, ensure_ascii=False), task_id),
+            )
+            self.conn.commit()
+        except sqlite3.Error as e:
+            logger.warning("标记任务 %s 为 aborted 失败（原始异常继续上抛）: %s",
+                           task_id, e)
+
     # ----------------------------------------------------------------- query
 
     def log_query(

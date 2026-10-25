@@ -270,7 +270,7 @@ def _write_report(db_path: str, task_id: str, out_dir: str,
 
 
 def cmd_report(cfg: AppConfig, task_id: str | None, out_dir: str, db_path: str) -> int:
-    from kwsearch.report import render
+    from kwsearch.report import render, status_cn
     from kwsearch.storage import connect, recent_tasks
 
     if not Path(db_path).exists():
@@ -287,7 +287,7 @@ def cmd_report(cfg: AppConfig, task_id: str | None, out_dir: str, db_path: str) 
                 return 2
             table = _table(
                 [[r["task_id"], _clip(r["keyword"], 24), r["mode"],
-                  r["started_at"][:16].replace("T", " "), r["status"],
+                  r["started_at"][:16].replace("T", " "), status_cn(r["status"]),
                   "截断" if r["truncated"] else ""]
                  for r in rows],
                 ["task_id", "关键词", "模式", "开始时间", "状态", ""],

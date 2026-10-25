@@ -915,7 +915,62 @@ def run_task(
 
     robots_mode / robots_on_failure：CLI/交互页显式覆盖配置档位
     （obey|record|off / deny|allow），None = 听配置 crawl.robots_mode。
+
+    这一层只管**任务行的生死**：开库 → 建 task → 干活 → 异常时把任务标成 aborted
+    → 关连接。真正的流程在 _run_task_body（600 行）。
+
+    为什么必须分成两层：收尾动作（写 finished_at、关连接）得在**异常路径上**也跑到。
+    中间抛错时若没人收尾，那行任务会永远停在 running，报告读不到 stats_json 就兜底
+    成空字典 —— docs_new=0、robots 档位回落默认值、漏斗数字全空。它不报错，只是
+    数字悄悄错了，是最难自己发现的那一类。
     """
+    conn = init_db(db_path)
+    repo = Repository(conn)
+    task_id = ""                  # 哨兵：start_task 自己就失败时没有任务行可标
+    try:
+        task_id = repo.start_task(keyword, mode, timespan)
+        return _run_task_body(
+            cfg, keyword,
+            mode=mode, timespan=timespan, conn=conn, repo=repo, task_id=task_id,
+            max_docs=max_docs, expand=expand, require=require, no_filter=no_filter,
+            progress=progress, sleep=sleep, fetcher=fetcher,
+            fetch_body=fetch_body, stealth=stealth, person=person,
+            robots_mode=robots_mode, robots_on_failure=robots_on_failure,
+        )
+    except BaseException as e:
+        # 接 BaseException 而不是 Exception：Ctrl+C 是"跑到一半没了"里最常见的一种，
+        # 只接 Exception 会让它成为唯一漏出这个兜底的路径。
+        # 守卫空 task_id：建任务就失败时没有行可标，但连接仍要在 finally 里关掉。
+        if task_id:
+            repo.abandon_task(task_id, e)
+        raise
+    finally:
+        conn.close()
+
+
+def _run_task_body(
+    cfg: AppConfig,
+    keyword: str,
+    *,
+    mode: str,
+    timespan: str | None,
+    conn,                          # noqa: ANN001 —— sqlite3.Connection，不为一行注解引顶层 import
+    repo: Repository,
+    task_id: str,
+    max_docs: int | None,
+    expand: int | None,
+    require: str | None,
+    no_filter: bool,
+    progress: Progress | None,
+    sleep: Callable[[float], None],
+    fetcher,                       # noqa: ANN001
+    fetch_body: bool | None,
+    stealth: bool | dict | None,
+    person: PersonQuery | None,
+    robots_mode: str | None,
+    robots_on_failure: str | None,
+) -> RunResult:
+    """run_task 的主体。连接与任务行由调用方持有，这里既不建也不关。"""
     say = progress or (lambda _m: None)
     t_start = time.perf_counter()
 
@@ -924,9 +979,6 @@ def run_task(
     max_minutes = float(limits.get("max_minutes", 60) or 60)
     deadline = t_start + max_minutes * 60
 
-    conn = init_db(db_path)
-    repo = Repository(conn)
-    task_id = repo.start_task(keyword, mode, timespan)
     sanitizer = Sanitizer(cfg.filter)
 
     spec = dict(cfg.expand or {})
@@ -1499,7 +1551,8 @@ def run_task(
     result.alerts = conn.execute(
         "SELECT COUNT(*) FROM alert WHERE task_id=?", (task_id,)).fetchone()[0]
     conn.commit()
-    conn.close()
+    # 不在这里 close：连接归 run_task 的 finally 管。这里若自己关，异常路径和正常路径
+    # 就有了两套资源归属规则，迟早有人只改一处。
 
     say(f"\n{result.status.upper()}  {result.kept} 条入库（新 {result.docs_new}）"
         f" / 去重后 {result.unique} / 原始 {result.candidates}"

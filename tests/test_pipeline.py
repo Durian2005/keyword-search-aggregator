@@ -6,10 +6,12 @@
 """
 from __future__ import annotations
 
+import sqlite3
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -1234,6 +1236,108 @@ class TestSingleQuotaChannel(RunCase):
         self.assertGreaterEqual(len(serp_qs), 2)      # 基词 + 变体
         self.assertEqual(len(single_qs), 1)           # 仍然只有基词
         self.assertTrue(all(q["query_text"] == "红黑树" for q in single_qs))
+
+
+class _ConnSpy:
+    """包一层真连接，只为了记下 close 到底有没有被调用。"""
+
+    def __init__(self, conn) -> None:
+        self._conn = conn
+        self.closed = False
+
+    def __getattr__(self, name):          # execute / commit / row_factory 全部透传
+        return getattr(self._conn, name)
+
+    def close(self) -> None:
+        self.closed = True
+        self._conn.close()
+
+
+class TestAbnormalExit(RunCase):
+    """run_task 的异常路径：任务行要有交代，连接要关，原始异常要接着抛。
+
+    这三条合起来才叫"收尾"：只标状态不关连接是漏资源，只关连接不标状态就是
+    #4 说的那个坑 —— 任务永远停在 running，报告 stats 兜底成全零。
+    """
+
+    def _crash(self, exc: BaseException):
+        import kwsearch.pipeline as P
+
+        real_init = P.init_db
+        spy = _ConnSpy(real_init(self.db))          # 顺手把表建好，再包一层
+        P.init_db = lambda _path: spy
+        try:
+            with mock.patch.object(P, "Sanitizer", side_effect=exc):
+                with self.assertRaises(type(exc)):
+                    self.run_kw(self.cfg(_SERP_CH))
+        finally:
+            P.init_db = real_init
+        return spy
+
+    def test_crash_marks_task_aborted(self) -> None:
+        spy = self._crash(RuntimeError("boom"))
+        row = self.rows("SELECT status, finished_at, stats_json FROM task")[0]
+        self.assertEqual(row["status"], "aborted")   # 不是 failed：failed 会被报告
+        self.assertIsNotNone(row["finished_at"])     # 读成"所有通道无产出"
+        self.assertIn("RuntimeError", row["stats_json"])
+        self.assertIn("boom", row["stats_json"])
+
+    def test_crash_closes_connection(self) -> None:
+        spy = self._crash(RuntimeError("boom"))
+        self.assertTrue(spy.closed)
+
+    def test_keyboard_interrupt_also_aborts(self) -> None:
+        # Ctrl+C 走的是 BaseException 分支；只接 Exception 的话它恰好是唯一的漏网路径
+        spy = self._crash(KeyboardInterrupt())
+        self.assertTrue(spy.closed)
+        self.assertEqual(self.rows("SELECT status FROM task")[0]["status"], "aborted")
+
+    def test_abandon_does_not_overwrite_finished_task(self) -> None:
+        # 收尾都写完才抛（例如末尾汇总打印撞上 broken pipe）：不许把完成改中止
+        from kwsearch.storage import init_db
+
+        conn = init_db(self.db)
+        repo = Repository(conn)
+        tid = repo.start_task("红黑树", "quick", None)
+        repo.finish_task(tid, "ok", False, {"docs_new": 3})
+        repo.abandon_task(tid, RuntimeError("late"))
+        conn.close()
+
+        row = self.rows("SELECT status, stats_json FROM task WHERE task_id=?", tid)[0]
+        self.assertEqual(row["status"], "ok")
+        self.assertIn("docs_new", row["stats_json"])
+
+    def test_start_task_failure_still_closes_conn(self) -> None:
+        # 连任务行都没建起来时，没有东西可标状态；但连接仍必须被关（否则每次失败泄漏一个句柄）
+        import kwsearch.pipeline as P
+
+        real_init, real_repo = P.init_db, P.Repository
+        spy = _ConnSpy(real_init(self.db))
+        P.init_db = lambda _path: spy
+
+        class _Repo:
+            def __init__(self, conn) -> None:
+                pass
+
+            def start_task(self, *a, **kw):
+                raise sqlite3.OperationalError("database is locked")
+
+        P.Repository = _Repo
+        try:
+            with self.assertRaises(sqlite3.OperationalError):
+                self.run_kw(self.cfg(_SERP_CH))
+        finally:
+            P.init_db, P.Repository = real_init, real_repo
+
+        self.assertTrue(spy.closed)
+        self.assertEqual(self.rows("SELECT COUNT(*) AS c FROM task")[0]["c"], 0)
+
+    def test_normal_run_still_closes_and_marks_ok(self) -> None:
+        # happy path 不能被这层壳改坏：状态照写、不再有第二处 close
+        self.run_kw(self.cfg(_SERP_CH))
+        row = self.rows("SELECT status, finished_at FROM task")[0]
+        self.assertNotEqual(row["status"], "aborted")
+        self.assertIsNotNone(row["finished_at"])
 
 
 if __name__ == "__main__":
