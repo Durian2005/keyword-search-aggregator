@@ -173,6 +173,9 @@ def enrich(
     policy = PagePolicy.from_config(cfg, limit=len(picked),
                                     robots_mode=robots_mode,
                                     robots_on_failure=robots_on_failure)
+    # 谁创建谁释放：调用方注入的 fetcher 可能在"列表页解析"之后还要接着用，
+    # 这里替它关掉会让下一阶段白白重开一次会话（隐身档要重启整个浏览器）。
+    own_fetcher = fetcher is None
     fetcher = fetcher or build_fetcher(str(cfg.defaults.get("fetcher", "auto")),
                                        stealth=stealth)
     batch = fetch_pages(
@@ -183,6 +186,7 @@ def enrich(
         progress=say,
         throttle=throttle,
         robots=robots,
+        close_fetcher=own_fetcher,
     )
     # 口径：skipped_robots 只数"真的被拦下没抓"的；record 档强制抓的另记 forced
     report.skipped_robots = sum(1 for p in batch.pages if p.failure == F_ROBOTS)

@@ -30,7 +30,7 @@ import logging
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 from kwsearch.fetch.ca import ca_bundle_arg
 from kwsearch.fetch.stealth import (
@@ -116,7 +116,7 @@ def _safe_text(resp) -> str:  # noqa: ANN001
     """拿文本，编码异常时退化到带替换的解码，不让一个坏字节炸掉整条链路。"""
     try:
         return resp.text
-    except Exception:  # UnicodeDecodeError / LookupError 等
+    except Exception:  # noqa: BLE001 —— UnicodeDecodeError / LookupError 等
         raw = getattr(resp, "content", b"") or b""
         return raw.decode("utf-8", errors="replace")
 
@@ -280,11 +280,16 @@ def fetch_with_retry(
     headers: dict[str, str],
     policy: RetryPolicy | None = None,
     timeout: int = 20,
+    sleep: Callable[[float], None] = time.sleep,
 ) -> FetchResult:
     """带指数退避的抓取。
 
     返回：200 的 FetchResult。
     抛出：FetchError（status/kind 已填好，调用方据此决定"熔断"还是"放弃"）。
+
+    sleep 可注入：退避是"真的等 1.5s / 3s"，单测里让它等于真 sleep 会把
+    "重试 3 次"的用例拖成秒级。类里的 HostThrottle、pipeline.run_task 都走
+    注入，这里补齐同一个约定。
     """
     policy = policy or RetryPolicy()
     last_err: Exception | None = None
@@ -305,7 +310,7 @@ def fetch_with_retry(
                 wait = policy.backoff_base * (2 ** (attempt - 1))
                 logger.warning("请求异常(%s) %s，%.1fs 后重试 (%d/%d): %s",
                                kind, url, wait, attempt, policy.max_attempts, e)
-                time.sleep(wait)
+                sleep(wait)
                 continue
             raise FetchError(f"重试 {policy.max_attempts} 次仍失败: {e}", kind=kind) from e
 
@@ -321,7 +326,7 @@ def fetch_with_retry(
             wait = policy.backoff_base * (2 ** (attempt - 1))
             logger.warning("HTTP %d %s，%.1fs 后重试 (%d/%d)",
                            res.status, url, wait, attempt, policy.max_attempts)
-            time.sleep(wait)
+            sleep(wait)
             continue
 
         raise FetchError(f"HTTP {res.status}", status=res.status, kind="http")

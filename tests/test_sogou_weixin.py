@@ -78,6 +78,20 @@ class TestSogouWeixinParse(unittest.TestCase):
     def test_missing_time_leaves_hint_none(self) -> None:
         r = parse_serp(_PAGE, 1, channel_id="sogou_weixin")
         self.assertIsNone(r.candidates[1].published_hint)
+
+    def test_rank_increases_within_page(self) -> None:
+        # 名次必须逐条递增。曾经写的是 rank=页码，一页 10 条全等于 1，
+        # relate() 的名次加成恒为最高值 → 公众号条目被系统性高估。
+        r = parse_serp(_PAGE, 1, channel_id="sogou_weixin")
+        self.assertEqual([c.rank for c in r.candidates], [1, 2])
+
+    def test_rank_continues_across_pages(self) -> None:
+        # 第 2 页第一条接着第 1 页往后数（每页 PAGE_SIZE 条），与 bilibili 同口径
+        from kwsearch.discover.sogou_weixin import PAGE_SIZE
+
+        r = parse_serp(_PAGE, 2, channel_id="sogou_weixin")
+        self.assertEqual([c.rank for c in r.candidates],
+                         [PAGE_SIZE + 1, PAGE_SIZE + 2])
         self.assertEqual(r.candidates[1].extra["published_iso"], "")
 
     def test_nav_li_ignored(self) -> None:

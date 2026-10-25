@@ -484,6 +484,45 @@ class TestFetchPages(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+#  fetcher 所有权
+# ---------------------------------------------------------------------------
+class _ClosableFetcher(FakeFetcher):
+    """带 close 的替身：用来验证"批末只关自己建的抓取器"。"""
+
+    def __init__(self, mapping: dict[str, FetchResult | Exception]) -> None:
+        super().__init__(mapping)
+        self.closed = 0
+
+    def close(self) -> None:
+        self.closed += 1
+
+
+class TestFetcherOwnership(unittest.TestCase):
+    """谁创建谁释放：注入的 fetcher 不该被 fetch_pages 关闭。
+
+    上游一个 fetcher 会横跨"列表页解析 → 正文抓取"两个阶段。第一阶段结束时
+    被这里关掉，轻量档要重开 Session、隐身档要重启整个浏览器 —— 抓正文的
+    性能会莫名其妙掉一半，而日志里只有一行 warning。
+    """
+
+    def _fetcher(self) -> _ClosableFetcher:
+        html = f"<html><body>{_LONG}</body></html>"
+        return _ClosableFetcher({"https://a.com/1": _res(html)})
+
+    def test_default_closes_self_built_fetcher(self) -> None:
+        f = self._fetcher()
+        fetch_pages(["https://a.com/1"], _policy(), fetcher=f)
+        self.assertEqual(f.closed, 1)
+
+    def test_injected_fetcher_is_left_open(self) -> None:
+        f = self._fetcher()
+        batch = fetch_pages(["https://a.com/1"], _policy(), fetcher=f,
+                            close_fetcher=False)
+        self.assertEqual(f.closed, 0)
+        self.assertEqual(batch.ok_count, 1)      # 不关闭不影响这一批的结果
+
+
+# ---------------------------------------------------------------------------
 #  配置
 # ---------------------------------------------------------------------------
 class TestPolicyFromConfig(unittest.TestCase):

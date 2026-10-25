@@ -132,6 +132,8 @@ class StealthFetcher:
             ) from e
         self._cfg = config or StealthConfig()
         self._session = None
+        # robots.txt 专用的轻量档。惰性建、关时释放 —— 见 robots_fetcher
+        self._robots = None
         self.fetches = 0
 
     # -- 会话生命周期 -------------------------------------------------------
@@ -148,8 +150,17 @@ class StealthFetcher:
         return self._session
 
     def close(self) -> None:
-        """关浏览器。幂等；失败只警告不抛 —— 收尾不该把数据冲掉。"""
+        """关浏览器与 robots 轻量档。幂等；失败只警告不抛 —— 收尾不该把数据冲掉。"""
         session, self._session = self._session, None
+        robots, self._robots = self._robots, None
+        # 轻量档是我们建的，连带释放它的 Session；robots_fetcher 退化返回 self 时不能自关
+        if robots is not None and robots is not self:
+            closer = getattr(robots, "close", None)
+            if callable(closer):
+                try:
+                    closer()
+                except Exception as e:  # noqa: BLE001 —— 收尾失败不影响主流程
+                    logger.warning("关闭 robots 轻量抓取器失败: %s", e)
         if session is None:
             return
         try:
@@ -190,17 +201,23 @@ class StealthFetcher:
     def robots_fetcher(self):
         """robots.txt 用轻量档取 —— 为一行规则启动一次浏览器是纯浪费。
 
-        fetch_pages 与 CLI 都走这个属性；取不到轻量档时返回自己（退化行为）。
+        **只建一次**：这个属性会被 fetch_pages、CLI 的 page 子命令各取一次。
+        每次访问都 build_fetcher 的话，每取一次就多一个从不关闭的 curl Session
+        （句柄 + cookie jar），长驻的 serve 进程里会慢慢攒。
+        取不到轻量档时返回自己（退化行为）。
         """
+        if self._robots is not None:
+            return self._robots
         from kwsearch.fetch import build_fetcher
 
         try:
-            return build_fetcher("curl_cffi")
+            self._robots = build_fetcher("curl_cffi")
         except RuntimeError:
             try:
-                return build_fetcher("httpx")
+                self._robots = build_fetcher("httpx")
             except RuntimeError:
-                return self
+                self._robots = self
+        return self._robots
 
 
 __all__ = ["StealthConfig", "StealthFetcher", "StealthUnavailable", "INSTALL_HINT"]

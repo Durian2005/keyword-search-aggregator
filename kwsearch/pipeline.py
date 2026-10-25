@@ -805,6 +805,8 @@ def _resolve_list_pages(
         policy = PagePolicy.from_config(cfg, limit=len(list_keys),
                                         robots_mode=robots_mode,
                                         robots_on_failure=robots_on_failure)
+        # 同 enrich：调用方注入的 fetcher 不归这里关闭，它后面还要抓正文
+        own_fetcher = fetcher is None
         f = fetcher or build_fetcher(str(cfg.defaults.get("fetcher", "auto")),
                                      stealth=_stealth_arg(cfg, stealth))
         batch = fetch_pages(
@@ -812,6 +814,7 @@ def _resolve_list_pages(
             headers=default_headers(cfg.defaults),
             progress=lambda m: say("    " + m),
             throttle=HostThrottle(qps, sleep=sleep),
+            close_fetcher=own_fetcher,
         )
     except Exception as e:                                   # noqa: BLE001
         # 解析起不来不该让任务失败：列表页维持原样会被 check_url 丢弃，照常出报告

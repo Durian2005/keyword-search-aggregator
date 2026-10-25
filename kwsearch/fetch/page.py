@@ -493,6 +493,7 @@ def fetch_pages(
     progress: Callable[[str], None] | None = None,
     throttle: HostThrottle | None = None,
     robots: RobotsCache | None = None,
+    close_fetcher: bool = True,
 ) -> PageBatch:
     """批量打开链接。串行执行 —— S3a 先求"准"，并发留给后面按需加。
 
@@ -500,6 +501,11 @@ def fetch_pages(
         policy.limit        本次最多抓几条
         policy.max_per_domain  单域名最多几条（防止一个站垄断样本）
         policy.obey_robots  每 host 拉一次 robots.txt
+
+    close_fetcher：批末是否关闭 fetcher。默认 True（调用方自建、自建自关）。
+    **调用方注入的 fetcher 必须传 False** —— 谁创建谁释放。否则上游一个 fetcher
+    横跨"列表页解析 → 正文抓取"两个阶段时，第一阶段结束时就被这里关掉了：
+    轻量档会自动重建 Session（多一次握手），隐身档则要重新启动整个浏览器。
     """
     say = progress or (lambda _m: None)
     t0 = time.perf_counter()
@@ -555,7 +561,8 @@ def fetch_pages(
     # 批末收尾：释放抓取器资源（隐身档开着浏览器，不关会一直占内存）。
     # BaseFetcher.close 默认无操作，轻量档调用它是空转；用 getattr 兜底
     # 是为了容忍鸭子类型的假实现（单测注入的那些没有 close）。
-    closer = getattr(fetcher, "close", None)
+    # 只在"这个 fetcher 是我们自己建的"时关（见 close_fetcher 的说明）。
+    closer = getattr(fetcher, "close", None) if close_fetcher else None
     if callable(closer):
         try:
             closer()

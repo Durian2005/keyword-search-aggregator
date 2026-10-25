@@ -417,7 +417,10 @@ class TestFetchPagesWithStealth(unittest.TestCase):
             def robots_fetcher(self):
                 return _RobotsFake()
 
-        policy = PagePolicy(timeout=5, per_domain_qps=0, robots_mode="obey")
+        # max_attempts=1：正文抓取是故意抛异常的，走默认 3 次会真的退避睡 1.5+3 秒，
+        # 把一条纯逻辑断言拖成 4 秒级用例。失败分类不受影响（仍是 conn）。
+        policy = PagePolicy(timeout=5, per_domain_qps=0, robots_mode="obey",
+                            retry=RetryPolicy(max_attempts=1))
         batch = fetch_pages(["https://a.cn/x"], policy, fetcher=_HeavyFake(),
                             headers={"User-Agent": "x"})
         # robots 放行 + 正文抓取失败（HeavyFake 故意抛）→ 失败分类是 conn，

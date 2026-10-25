@@ -47,6 +47,7 @@ logger = logging.getLogger(__name__)
 
 BASE = "https://weixin.sogou.com"
 TZ_CN = timezone(timedelta(hours=8))          # 显式 +8，不依赖机器时区
+PAGE_SIZE = 10                                # 实测固定 10 条/页（与 bing 同量级）
 
 # span.s2 里的时间：document.write(timeConvert('1577765720'))
 _TS_RE = re.compile(r"timeConvert\('(\d{9,11})'\)")
@@ -302,6 +303,11 @@ def parse_serp(
     seen: set[str] = set()
     out: list[Candidate] = []
     no_title = no_url = dup = no_time = 0
+    # 名次口径必须与 bing/baidu/bilibili 一致：base_rank 是本页第一条的**全局**
+    # 名次，页内逐条 +i。曾经这里写的是 `rank=offset`（页码），结果一页 10 条的
+    # rank 全等于 1，relate() 的 1/(1+log2(1+rank)) 名次加成恒为最高值 ——
+    # 公众号条目被系统性高估，在几十条搜狗结果灌进来的跑批里直接把排序带偏。
+    base_rank = (max(1, offset) - 1) * PAGE_SIZE + 1
 
     for i, block in enumerate(blocks):
         h3 = find(block, "h3")
@@ -338,7 +344,7 @@ def parse_serp(
             title=title,
             snippet=snippet,
             channel=channel_id,
-            rank=offset if offset >= 1 else 1,
+            rank=base_rank + i,
             published_hint=date_iso or None,
             # 跨跑批去重键：中转 URL 每次请求都变，靠它才能认出"同一篇文章"
             dedupe_key=_dedupe_key(account, title, date_iso),
