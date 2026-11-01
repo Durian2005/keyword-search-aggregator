@@ -117,6 +117,21 @@ def make_default_runner(cfg: object, db_path: str, out_dir: Path) -> Callable:
             robots_mode=payload.robots_mode,
             robots_on_failure=payload.robots_on_failure,
         )
+        if result.reuse:
+            # 复用：一个请求都没发。报告**不重新渲染**（没有新数据，覆盖只会带来风险），
+            # 直接把上一轮那份指给前端 —— 目录本来就是按关键词分的，路径一样。
+            # 收尾表也跳过：那上面会写"入库 0（新 0）"，可这次根本没抓，写 0 是误导。
+            hit = result.reuse
+            log(f"♻ 复用：{hit['age']}前跑过同一个词"
+                f"（任务 {hit['task_id']}，入库 {hit['docs']} 条），本次未发任何请求。")
+            from kwsearch.report import safe_dirname
+
+            rel = Path(safe_dirname(payload.keyword)) / "index.html"
+            if (out_dir / rel).exists():
+                return "/r/" + "/".join(urllib.parse.quote(p) for p in rel.parts)
+            log("（上一轮的报告文件已不在，需要新报告就关掉同词复用再跑一次）")
+            return None
+
         for line in format_result_lines(result):
             log(line)
 

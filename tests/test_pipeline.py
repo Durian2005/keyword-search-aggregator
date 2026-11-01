@@ -592,7 +592,8 @@ class RunCase(unittest.TestCase):
     def cfg(self, channels: str, max_docs: int = 20, *,
             drop_zero_hit: bool = True, max_per_domain: int = 2,
             fetch_body: bool = False, crawl: str = "{}",
-            expand: str = _EXPAND_DEFAULT, health: str = ""):
+            expand: str = _EXPAND_DEFAULT, health: str = "",
+            reuse: str = ""):
         p = self.dir / "channels.yaml"
         text = _BASE.format(
             channels=channels, max_docs=max_docs,
@@ -601,10 +602,12 @@ class RunCase(unittest.TestCase):
             fetch_body="true" if fetch_body else "false",
             crawl=crawl, expand=expand,
         )
-        # health 段按需追加在末尾（YAML 顶层键，不影响上面模板的格式化）。
+        # health / reuse 段按需追加在末尾（YAML 顶层键，不影响上面模板的格式化）。
         # 不放进 _BASE 是为了不给所有既有用例加一个必须传的占位符。
         if health:
             text += "\n" + health
+        if reuse:
+            text += "\n" + reuse
         p.write_text(text, encoding="utf-8")
         return load_config(p)
 
@@ -1571,6 +1574,76 @@ health:
         r = self.run_kw(self.cfg(_PAGED_CH))
         self.assertEqual(self._queries("fake_paged", r.task_id), [])
         self.assertIn("冷却中", self._run_of(r, "fake_paged").skipped)
+
+
+class TestReuseGate(RunCase):
+    """Phase 3：同词 TTL 内跑过就不重复花额度。
+
+    验证方式与 Phase 1/2 一致，看的是**硬证据**而不是文案：任务行有没有多出来、
+    query 表有没有新行。复用的核心承诺是"一个请求都不发"，只有这两处能证明。
+    """
+
+    def _count(self, sql: str) -> int:
+        return int(self.rows(sql)[0]["n"])
+
+    def test_default_off_still_runs(self) -> None:
+        """不传 --reuse 且配置没开 → 行为与 Phase 3 之前完全一致。"""
+        cfg = self.cfg(_PAGED_CH)
+        self.run_kw(cfg)
+        n1 = self._count("SELECT count(*) n FROM task")
+        self.run_kw(cfg)
+        self.assertEqual(self._count("SELECT count(*) n FROM task"), n1 + 1)
+
+    def test_reuse_sends_nothing(self) -> None:
+        cfg = self.cfg(_PAGED_CH)
+        self.run_kw(cfg)
+        queries_before = self._count("SELECT count(*) n FROM query")
+        tasks_before = self._count("SELECT count(*) n FROM task")
+
+        r = self.run_kw(cfg, reuse=True)
+
+        self.assertEqual(r.status, "reused")
+        self.assertIsNotNone(r.reuse)
+        self.assertGreater(r.reuse["docs"], 0)
+        # 不建任务行：复用不是一次任务，留一条"跑了但没发请求"的记录会骗人
+        self.assertEqual(self._count("SELECT count(*) n FROM task"), tasks_before)
+        self.assertEqual(self._count("SELECT count(*) n FROM query"), queries_before)
+
+    def test_refresh_forces_rerun(self) -> None:
+        """--refresh：配置里开着复用时也要能强制重跑。"""
+        cfg = self.cfg(_PAGED_CH, reuse="reuse:\n  enabled: true\n")
+        self.run_kw(cfg)
+        n1 = self._count("SELECT count(*) n FROM task")
+        self.run_kw(cfg, reuse=False)
+        self.assertEqual(self._count("SELECT count(*) n FROM task"), n1 + 1)
+
+    def test_config_enables_reuse(self) -> None:
+        cfg = self.cfg(_PAGED_CH, reuse="reuse:\n  enabled: true\n")
+        self.run_kw(cfg)
+        n1 = self._count("SELECT count(*) n FROM task")
+        r = self.run_kw(cfg)
+        self.assertEqual(r.status, "reused")
+        self.assertEqual(self._count("SELECT count(*) n FROM task"), n1)
+
+    def test_different_keyword_not_reused(self) -> None:
+        """不同词照常跑 —— 复用只针对同一个词。"""
+        cfg = self.cfg(_PAGED_CH)
+        self.run_kw(cfg, keyword="红黑树")
+        n1 = self._count("SELECT count(*) n FROM task")
+        r = self.run_kw(cfg, keyword="B树", reuse=True)
+        self.assertIsNone(r.reuse)
+        self.assertEqual(self._count("SELECT count(*) n FROM task"), n1 + 1)
+
+    def test_min_docs_threshold(self) -> None:
+        """上一轮入库条数不到 min_docs → 值得重来，不该复用。
+
+        用 min_docs=99 而不是"找一个真零入库的通道"：后者要依赖假通道的产出细节，
+        改一次假数据测试就失效；门槛本身就是这条规则的入口，直接压它更稳。
+        """
+        cfg = self.cfg(_PAGED_CH, reuse="reuse:\n  enabled: true\n  min_docs: 99\n")
+        self.run_kw(cfg)
+        r = self.run_kw(cfg)
+        self.assertIsNone(r.reuse)
 
 
 if __name__ == "__main__":

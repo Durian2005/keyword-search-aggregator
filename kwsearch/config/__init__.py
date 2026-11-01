@@ -113,6 +113,8 @@ class AppConfig:
     # 通道健康度策略（冷却曲线 / 每日预算）。空 dict = 用 health.py 的默认值，
     # 且**不限预算** —— 也就是"只管冷却"。见 kwsearch/health.py 的 HealthPolicy。
     health: dict[str, Any] = field(default_factory=dict)
+    # 同词增量复用（默认关闭）。见 kwsearch/reuse.py 的 ReusePolicy。
+    reuse: dict[str, Any] = field(default_factory=dict)
 
     def channel(self, cid: str) -> ChannelConfig:
         for c in self.channels:
@@ -206,4 +208,5 @@ def load_config(path: str | os.PathLike[str] | None = None) -> AppConfig:
         expand=dict(data.get("expand") or {}),
         cluster=dict(data.get("cluster") or {}),
         health=dict(data.get("health") or {}),
+        reuse=dict(data.get("reuse") or {}),
     )

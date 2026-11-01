@@ -211,6 +211,7 @@ def cmd_run(
     person: PersonQuery | None = None,
     robots_mode: str | None = None,
     robots_on_failure: str | None = None,
+    reuse: bool | None = None,
 ) -> int:
     from kwsearch.discover import registered_names
     from kwsearch.person import anchor_warnings
@@ -271,6 +272,13 @@ def cmd_run(
         print("\n--dry：只渲染 URL，未发任何请求。")
         return 0
 
+    # ---- 同词复用（Phase 3）：必须早于下面那句「计划最多 N 个请求」--------------
+    # 复用发生时一个请求都不会发，先说"计划最多 9 个"再改口是自相矛盾的。
+    # 判定要读库，所以没法更早；但 dry 已经返回了，那条路径不该被拦（它只看计划）。
+    reuse_hit = _reuse_hit(cfg, keyword, mode, db_path, reuse)
+    if reuse_hit:
+        return _print_reused(reuse_hit, keyword, out_dir, want_report)
+
     # 真实运行时只报"将要做什么"，不铺整张表 —— 执行过程的逐通道结果更有用
     print(f"[{mode}] 关键词 = {keyword!r}  变体 {len(variants)} 个  "
           f"计划最多 {total} 个请求  上限 {max_docs or cfg.limits.get('max_docs', 1000)} 条")
@@ -292,11 +300,16 @@ def cmd_run(
             no_filter=no_filter, progress=print, fetch_body=fetch_body,
             stealth=stealth, person=person,
             robots_mode=robots_mode, robots_on_failure=robots_on_failure,
+            reuse=reuse,
         )
     except KeyboardInterrupt:
         # 中断也要能解释：已入库的部分留在库里，报告可以正常生成
         print("\n已中断。已完成的通道数据已落库，可稍后用 report 生成报告。")
         return 130
+
+    # 兜底：交互页面（web）直接调 run_task，不经过上面那次预检
+    if result.reuse:
+        return _print_reused(result.reuse, keyword, out_dir, want_report)
 
     print(_run_summary(result))
 
@@ -306,6 +319,48 @@ def cmd_run(
                              min_body_chars=int(cc.get("min_body_chars") or 200),
                              health=dict(getattr(cfg, "health", None) or {}))
     return 0 if result.kept else 1
+
+
+def _reuse_hit(cfg: AppConfig, keyword: str, mode: str, db_path: str,
+               override: bool | None) -> dict | None:
+    """同词复用判定：TTL 内跑过同一个词就返回那次任务的信息。
+
+    独立读一次库，**不建任务行** —— 复用的语义是"这次没有真的去搜"，
+    在历史里留一条"跑了但没发请求"的记录会让任务列表骗人。
+    """
+    from kwsearch.reuse import ReusePolicy, find_reusable
+    from kwsearch.storage import Repository, init_db
+
+    policy = ReusePolicy.resolve(getattr(cfg, "reuse", None), override)
+    if not policy.enabled:
+        return None
+    path = Path(db_path)
+    if not path.exists():
+        return None
+    conn = init_db(path)
+    try:
+        tasks = Repository(conn).task_history()
+    finally:
+        conn.close()
+    return find_reusable(tasks, keyword=keyword, mode=mode,
+                         now=datetime.now().astimezone(), policy=policy)
+
+
+def _print_reused(hit: dict, keyword: str, out_dir: str, want_report: bool) -> int:  # noqa: ANN001
+    """复用提示。刻意**不重新渲染报告**：报告目录按关键词走，重渲染会覆盖旧文件，
+    而这次没有产生任何新数据 —— 覆盖只会带来风险（比如某次正文抓取失败，
+    把一份好报告换成一份差的），收益为零。
+    """
+    from kwsearch.report import safe_dirname
+
+    print(f"♻ 复用：{hit['age']}前跑过同一个词"
+          f"（任务 {hit['task_id']}，入库 {hit['docs']} 条）")
+    print("   本次未发任何请求 —— 同词 TTL 内重复跑几乎拿不到新内容，"
+          "省下的额度留给别的词。")
+    print("   想强制重跑：加 --refresh（会消耗额度）")
+    if want_report:
+        print(f"   报告仍在：{Path(out_dir).resolve() / safe_dirname(keyword)}")
+    return 0
 
 
 def _run_summary(result) -> str:  # noqa: ANN001
@@ -1072,6 +1127,14 @@ def main(argv: list[str] | None = None) -> int:
                     help="不抓正文（摘要用搜索结果原文，快但信息量小）")
     pr.add_argument("--out", default="report", help="报告输出目录（默认 report/）")
     pr.add_argument("--no-report", action="store_true", help="只入库，不生成报告")
+    # 同词复用的三态开关：不传=听配置，--reuse=本次开启，--refresh=强制重跑。
+    # 做成一开一关而不是 --reuse/--no-reuse：用户脑子里想的是"我要重来一次"，
+    # 那个动作该有独立的名字。
+    g_reuse = pr.add_mutually_exclusive_group()
+    g_reuse.add_argument("--reuse", action="store_true",
+                         help="同词复用：TTL 内跑过就直接用上一轮结果，一个请求都不发")
+    g_reuse.add_argument("--refresh", action="store_true",
+                         help="强制重跑，忽略同词复用（会消耗额度）")
     pr.add_argument("--stealth", action="store_true",
                     help="正文抓取改用 Scrapling 隐身浏览器（可过 Cloudflare 挑战；"
                          "需 pip install 'scrapling[fetchers]' && scrapling install；"
@@ -1213,6 +1276,7 @@ def main(argv: list[str] | None = None) -> int:
                         if args.person else None),
                 robots_mode=robots_mode,
                 robots_on_failure=args.robots_on_failure,
+                reuse=(True if args.reuse else (False if args.refresh else None)),
             )
         if args.cmd == "db":
             return cmd_db(cfg, args.action, args.db, assume_yes=args.yes)

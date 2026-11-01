@@ -841,6 +841,34 @@ class Repository(_WipeMixin):
             filled.append(ch)
         return sorted(filled)
 
+    def task_history(self, limit: int = 50) -> list[dict[str, Any]]:
+        """最近的任务 + 解析后的 stats，供同词复用判定用（reuse.find_reusable）。
+
+        必须**按 started_at 降序**：复用取"最近的那次"，顺序错了会拿到一个更早的
+        任务，然后报告"2 天前跑过"—— 明明 1 小时前才跑过。
+
+        `rowid DESC` 是第二排序键，不是装饰：started_at 只精确到秒，同一秒内连开两个
+        任务（脚本连跑、单测）时间戳完全相同，只按时间排结果是不确定的。task 表仍是
+        普通表（有隐式 rowid），rowid 就是插入顺序，正好当"谁更晚"的裁决。
+
+        stats_json 解析失败按空字典处理：老任务或手改过的行不该让整个复用判断崩掉，
+        代价是那条任务因为"入库 0 条"被判为不值得复用，只是少复用一次而已。
+        """
+        rows = self.conn.execute(
+            "SELECT task_id, keyword, mode, timespan, started_at, finished_at,"
+            " status, truncated, stats_json FROM task"
+            " ORDER BY started_at DESC, rowid DESC LIMIT ?", (limit,)).fetchall()
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            d = dict(r)
+            raw = d.pop("stats_json", None)
+            try:
+                d["stats"] = json.loads(raw) if raw else {}
+            except (TypeError, ValueError):
+                d["stats"] = {}
+            out.append(d)
+        return out
+
     # ------------------------------------------------------------------ stats
 
     def stats(

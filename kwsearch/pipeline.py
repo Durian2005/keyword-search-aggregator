@@ -64,6 +64,7 @@ from kwsearch.health import (
     classify_block,
     plan,
 )
+from kwsearch.reuse import ReusePolicy, find_reusable
 from kwsearch.models import Candidate, ChannelResult, Doc, Mention
 from kwsearch.person import (
     TIER_CN,
@@ -195,6 +196,9 @@ class RunResult:
     person_tiers: dict[str, int] = field(default_factory=dict)
     person_name_missing: int = 0   # 结果里没出现姓名的条数（机构页面/机翻标题），未参与归因
     per_channel: list[ChannelRun] = field(default_factory=list)
+    # 同词复用（Phase 3）：非空表示**本次一个请求都没发**，直接用了这个旧任务的结果。
+    # 装的是 reuse.find_reusable 的返回值（task_id / started_at / docs / age）。
+    reuse: dict | None = None
 
     @property
     def ok(self) -> bool:
@@ -919,6 +923,7 @@ def run_task(
     person: PersonQuery | None = None,
     robots_mode: str | None = None,
     robots_on_failure: str | None = None,
+    reuse: bool | None = None,
 ) -> RunResult:
     """跑一次关键词任务。所有参数显式传入，不读全局状态。
 
@@ -937,6 +942,17 @@ def run_task(
     repo = Repository(conn)
     task_id = ""                  # 哨兵：start_task 自己就失败时没有任务行可标
     try:
+        # ---- 同词复用（Phase 3）：TTL 内跑过就不重复消耗额度 --------------------
+        # 放在 start_task **之前**：复用不是一次任务，建行会在历史里留下一条
+        # "跑了但一个请求都没发"的记录，之后看任务列表会以为那天真的抓过。
+        reuse_policy = ReusePolicy.resolve(cfg.reuse, reuse)
+        if reuse_policy.enabled:
+            hit = find_reusable(
+                repo.task_history(), keyword=keyword, mode=mode,
+                now=datetime.now().astimezone(), policy=reuse_policy)
+            if hit:
+                return RunResult(task_id=hit["task_id"], keyword=keyword,
+                                 mode=mode, status="reused", reuse=hit)
         task_id = repo.start_task(keyword, mode, timespan)
         return _run_task_body(
             cfg, keyword,
