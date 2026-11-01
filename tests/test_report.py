@@ -386,6 +386,37 @@ class TestHealthSection(unittest.TestCase):
         self.assertIn("baidu_html", html)
         self.assertIn("3/6", html)
 
+    def test_expired_cooldown_flags_probe(self) -> None:
+        """冷却已过但没被证实恢复 → 明确写出"下次首发是探针"。
+
+        少了这半句，读者会把下一轮"百度只 10 条"归因成通道退化，
+        而真实原因是我们在探针，只打了一页。
+        """
+        row = self._row("baidu_html",
+                        last_block_at=(self.NOW - timedelta(hours=7)).isoformat(),
+                        block_streak=1)
+        self.assertIn("探针", row["state"])
+        self.assertEqual(row["level"], "ok")
+
+    def test_probe_flag_hidden_when_disabled(self) -> None:
+        state = {"channel": "baidu_html",
+                 "last_block_at": (self.NOW - timedelta(hours=7)).isoformat(),
+                 "block_streak": 1}
+        row = health_view([state], {"probe": {"enabled": False}}, now=self.NOW)[0]
+        self.assertEqual(row["state"], "冷却已过")
+
+    def test_health_alerts_have_human_labels(self) -> None:
+        """两种健康度处置都必须有人话标签，否则报告里会裸露 channel_cooldown。"""
+        data = {**_base_data(), "alerts": [
+            {"channel": "baidu_html", "kind": "channel_cooldown", "detail": "冷却中"},
+            {"channel": "sogou_weixin", "kind": "channel_probe", "detail": "探针"},
+        ]}
+        html = render_html(data)
+        self.assertIn("通道跳过", html)
+        self.assertIn("降级为探针", html)
+        self.assertNotIn("channel_cooldown", html)
+        self.assertNotIn("channel_probe", html)
+
 
 if __name__ == "__main__":
     unittest.main()

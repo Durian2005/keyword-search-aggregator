@@ -1,11 +1,13 @@
 """通道健康度 · 纯函数层。
 
-分两步落地（2026-10-31）：
+分三步落地（2026-10-31）：
     Phase 0 —— pipeline 只写不读：先把"谁被拦过、今天打了几发"记准，
                用一轮真实任务核对无误，再让判定真的拦请求。
     Phase 1 —— decide() 接进 pipeline 的通道循环：冷却中 / 额度用尽就跳过，
                一个请求都不发，并写 channel_cooldown 告警。
-    回滚点很干净：把 decide() 那一段去掉就回到 Phase 0，数据不用动。
+    Phase 2 —— plan() 多出第三态 probe：冷却刚解除时先打一发探针（只打基词、
+               只打一页），拿到真实结果才恢复正常配额，写 channel_probe 告警。
+    回滚点很干净：把 plan() 换回 decide() 就回到 Phase 1，数据不用动。
 
 为什么单独成模块而不是塞进 pipeline：
     冷却 6 小时 / 翻倍 / 封顶 24 小时的逻辑一旦直接写在 run_task 里，
@@ -155,6 +157,33 @@ class CooldownPolicy:
 
 
 @dataclass(slots=True, frozen=True)
+class ProbePolicy:
+    """冷却解除后的探针：先打一发，确认真的通了再恢复全量。
+
+    为什么需要它：额度池见底时是"先缩量再断供"（实测 5→3→1→0），
+    冷却一解除就按满额打，等于又把刚回满的池子一次打空 —— 结果是
+    "一恢复就再挂"，永远拿不到完整数据。
+
+    pages 是探针允许的翻页数。默认 1：翻页对额度池的消耗与换词同阶，
+    探针的目的只是"问一句还能不能打"，不是一个请求。所以不翻页。
+    """
+
+    enabled: bool = True
+    pages: int = 1
+
+    @classmethod
+    def from_mapping(cls, d: Mapping | None) -> ProbePolicy:
+        d = d or {}
+        try:
+            pages = int(d.get("pages", 1))
+        except (TypeError, ValueError):
+            pages = 1
+        # pages < 1 会让"探针"变成"不发请求"，那它就不是探针而是跳过。
+        # 真要跳过有冷却和预算两道闸，不靠这里，所以钳到 1。
+        return cls(enabled=bool(d.get("enabled", True)), pages=max(1, pages))
+
+
+@dataclass(slots=True, frozen=True)
 class HealthPolicy:
     """一个任务里所有与"还能不能打"相关的开关。
 
@@ -165,6 +194,7 @@ class HealthPolicy:
     cooldown: CooldownPolicy = CooldownPolicy()
     quota: Mapping[str, int] = field(default_factory=dict)
     default_quota: int | None = None
+    probe: ProbePolicy = ProbePolicy()
 
     @classmethod
     def from_mapping(cls, d: Mapping | None) -> HealthPolicy:
@@ -188,6 +218,7 @@ class HealthPolicy:
             cooldown=CooldownPolicy.from_mapping(d.get("cooldown")),
             quota=quota,
             default_quota=default_n if (default_n or 0) > 0 else None,
+            probe=ProbePolicy.from_mapping(d.get("probe")),
         )
 
     def quota_for(self, channel: str) -> int | None:
@@ -210,6 +241,58 @@ def decide(h: ChannelHealth, now: datetime,
     if done:
         return True, why
     return False, ""
+
+
+# 三种放行程度。用字符串而不是 Enum：它只在本模块与 pipeline 之间传，
+# 而字符串在日志里直接可读（`skip` / `probe` / `normal`），省一层转换。
+MODE_SKIP = "skip"       # 一个请求都不发
+MODE_PROBE = "probe"     # 只发一发探针
+MODE_NORMAL = "normal"   # 按配置全量
+
+
+def needs_probe(h: ChannelHealth, now: datetime,
+                policy: HealthPolicy | None = None) -> bool:
+    """现在该不该先打一发探针？
+
+    判据是 `block_streak > 0` 且冷却已过 —— 因为 record_channel_ok() 会把 streak
+    清零，所以 streak 大于 0 只可能代表"最后一次事件是被拦、之后还没成功过"，
+    也就是"池子按模型算该回满了，但没被证实"。
+
+    额外挡一道"成功时间晚于被拦时间"：正常流程走不到这里（成功就清零了），
+    但历史回填或手改过的行可能有这种自相矛盾的记录，那种情况按已验证处理，
+    不要把全量任务降级成探针。
+
+    注意它**不判断冷却**：调用方（plan / pipeline）已经先过了 decide()。
+    单独调用时若仍在冷却中，返回 True 也无害 —— 冷却优先，探针不会被发出。
+    """
+    policy = policy or HealthPolicy()
+    if not policy.probe.enabled or h.block_streak <= 0:
+        return False
+    ok, blk = parse_iso(h.last_ok_at), parse_iso(h.last_block_at)
+    if ok and blk and ok >= blk:
+        return False
+    return True
+
+
+def plan(h: ChannelHealth, now: datetime,
+         policy: HealthPolicy | None = None) -> tuple[str, str]:
+    """(mode, 原因)，mode ∈ {skip, probe, normal}。原因空串 = 正常放行。
+
+    这是 pipeline 通道循环唯一该调的函数 —— 它在 decide() 外面只多做一件事：
+    把"冷却刚解除"从"正常"里挑出来，降级成探针。
+
+    顺序仍然重要：冷却 → 预算 → 探针。冷却中就说"还能打几发"是自相矛盾的，
+    预算用尽时说"先打一发探针"同样自相矛盾（那一发也是要花额度的）。
+    """
+    policy = policy or HealthPolicy()
+    skip, why = decide(h, now, policy)
+    if skip:
+        return MODE_SKIP, why
+    if needs_probe(h, now, policy):
+        return MODE_PROBE, (
+            f"冷却已解除（连续被拦 {h.block_streak} 次），"
+            f"本次只打基词 {policy.probe.pages} 页当探针，通了下次才恢复全量")
+    return MODE_NORMAL, ""
 
 
 # ---------------------------------------------------------------------------
@@ -310,14 +393,20 @@ __all__ = [
     "COOLDOWN_BASE_H",
     "COOLDOWN_FACTOR",
     "COOLDOWN_MAX_H",
+    "MODE_NORMAL",
+    "MODE_PROBE",
+    "MODE_SKIP",
     "ChannelHealth",
     "CooldownPolicy",
     "HealthPolicy",
+    "ProbePolicy",
     "classify_block",
     "cooldown_hours",
     "decide",
     "human_delta",
     "local_day",
     "local_day_of_iso",
+    "needs_probe",
     "parse_iso",
+    "plan",
 ]

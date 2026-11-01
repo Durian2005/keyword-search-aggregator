@@ -1,7 +1,7 @@
 """CLI 入口：python -m kwsearch <子命令>
 
     channels        列出所有通道 + 可用性自检（不联网）
-    health          各通道健康度：今日用量 / 上次被拦 / 是否冷却（只读库，不联网）
+    health          各通道健康度：今日用量 / 上次被拦 / 是否冷却 / 下次是否只发探针（只读库，不联网）
     probe URL       单 URL 探针：真实请求一次，打印状态/耗时/大小/预览（S1）
     discover KW     跑一条通道的发现层，打印候选与断言结果；--offline/--expand 调试（S2）
     page [URL...]   真的打开候选链接，检查能不能解析：robots/编码/挑战页/空壳页（S3a）
@@ -95,11 +95,11 @@ def cmd_health(cfg: AppConfig, db_path: str, *, backfill: bool = False) -> int:
     它回答的是"我现在还能不能打"—— 这件事在开跑之前就该知道，
     而不是等任务跑完、在报告末尾发现"今天百度又是 0 条"。
     """
-    from kwsearch.health import ChannelHealth
+    from kwsearch.health import ChannelHealth, HealthPolicy
     from kwsearch.storage import Repository, init_db
 
     path = Path(db_path)
-    print("通道健康度 · 冷却与日预算已生效（Phase 1）")
+    print("通道健康度 · 冷却与日预算已生效，冷却解除后首发为探针（Phase 2）")
     if not path.exists():
         print(f"数据库还不存在：{path.resolve()}")
         print("跑一次 run 之后再来。")
@@ -135,18 +135,23 @@ def cmd_health(cfg: AppConfig, db_path: str, *, backfill: bool = False) -> int:
     # 先按配置顺序列，再补库里存在但配置已禁用的（历史记录不该因为关通道就消失）
     order = [c.id for c in cfg.enabled_channels()]
     order += [cid for cid in stored if cid not in order]
-    rows = [_health_row(cid, stored.get(cid) or ChannelHealth(channel=cid), now)
-            for cid in order]
+    policy = HealthPolicy.from_mapping(cfg.health)
+    rows = [_health_row(cid, stored.get(cid) or ChannelHealth(channel=cid),
+                        now, policy) for cid in order]
     print(_table(rows, ["通道", "今日", "最后成功", "最后被拦", "性质", "连续", "状态"]))
     print("\n提示：「不计冷却」= 失败原因不是对方在拦我们。"
           "network 是本机网络到不了（如 gdelt），relaxed/boilerplate 是内容被降级 —— "
-          "这类等再久也不会好，所以不参与冷却。")
+          "这类等再久也不会好，所以不参与冷却。"
+          "\n「首发探针」= 冷却刚过、还没被证实恢复：下一次任务只打基词 "
+          f"{policy.probe.pages} 页，通了才恢复全量。"
+          "\n（探针开关与页数在 channels.yaml 的 health.probe）")
     return 0
 
 
-def _health_row(cid: str, h, now: datetime) -> list[str]:  # noqa: ANN001
+def _health_row(cid: str, h, now: datetime,  # noqa: ANN001
+                policy: HealthPolicy | None = None) -> list[str]:
     """一行健康度。状态列只给结论，详细措辞留在 health 模块里。"""
-    from kwsearch.health import classify_block, human_delta
+    from kwsearch.health import classify_block, human_delta, needs_probe
 
     ok = (h.last_ok_at or "—")[:16].replace("T", " ")
     blk = (h.last_block_at or "—")[:16].replace("T", " ")
@@ -164,7 +169,10 @@ def _health_row(cid: str, h, now: datetime) -> list[str]:  # noqa: ANN001
         if at is not None and at > now:
             state = f"冷却中（剩余 {human_delta(at - now)}）"
         elif h.block_streak:
-            state = "冷却已过"
+            # 冷却已过但没验证过：下一次会降级成探针，这里提前说清楚，
+            # 免得看到"百度只拿到 10 条"以为是通道退化了。
+            state = ("冷却已过 · 首发探针" if needs_probe(h, now, policy)
+                     else "冷却已过")
         else:
             state = "正常"
 
@@ -1044,7 +1052,7 @@ def main(argv: list[str] | None = None) -> int:
     sub = p.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("channels", help="列出通道并做可用性自检（不联网）")
-    ph = sub.add_parser("health", help="查看各通道健康度记录：今日用量/上次被拦/是否冷却（只读库，不联网）")
+    ph = sub.add_parser("health", help="查看各通道健康度记录：今日用量/上次被拦/是否冷却/下次是否只发探针（只读库，不联网）")
     ph.add_argument("--backfill", action="store_true",
                     help="用历史 query 记录回填（只补还没有记录的通道，不覆盖已有）")
 

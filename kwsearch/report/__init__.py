@@ -81,6 +81,10 @@ _ALERT_CN = {
     "person_name_missing": "人名未出现在页面",
     "person_no_anchor": "人名模式缺锚点",
     "person_org_unmatched": "机构锚点未命中",
+    # 健康度闸的两种处置。它们不是"失败"，而是系统主动收手 —— 标签上必须
+    # 看得出来，否则读者会把"没数据"归因成"站点没有"。
+    "channel_cooldown": "通道跳过（冷却 / 额度用尽）",
+    "channel_probe": "通道降级为探针（冷却刚解除）",
 }
 
 # regex_updated 也算不可信：它是"页面最近被改过"的时间，不是发布时间，
@@ -545,7 +549,8 @@ def health_view(states: Sequence[Mapping[str, Any]],
 
     `now` 可注入 —— 否则"冷却剩余 5h"这种文案每跑一次测试都在变。
     """
-    from kwsearch.health import ChannelHealth, HealthPolicy, classify_block, human_delta
+    from kwsearch.health import (ChannelHealth, HealthPolicy, classify_block,
+                                 human_delta, needs_probe)
 
     policy = HealthPolicy.from_mapping(health_cfg)
     moment = now or datetime.now().astimezone()
@@ -568,7 +573,11 @@ def health_view(states: Sequence[Mapping[str, Any]],
         elif left == 0:
             state, level = "今日额度已用完", "bad"
         elif h.block_streak:
-            state, level = "冷却已过", "ok"
+            # 冷却已过但还没被证实恢复：下一次任务会降级成探针。
+            # 报告里先说清楚，否则读者看到"百度这次只 10 条"会以为通道退化了。
+            state = ("冷却已过 · 下次首发探针" if needs_probe(h, moment, policy)
+                     else "冷却已过")
+            level = "ok"
         else:
             state, level = "正常", "ok"
 
@@ -620,6 +629,9 @@ def _health_section(rows: Sequence[Mapping[str, Any]]) -> str:
   所以被拦之后会按 6h → 12h → 24h 逐级冷却，冷却期内这个通道<b>一个请求都不发</b>。
   「不计冷却」的是网络故障或内容降级（如 GDELT 连不上），这类等再久也不会好，
   所以不算作被风控。「冷却已过」= 曾经连挂、冷却期已结束，现在可以正常请求；
+  若后面还跟着<b>「下次首发探针」</b>，说明它只是按时间算该恢复了、还没被证实 ——
+  下一次任务会先把请求压到<b>基词一页</b>，拿到真实结果才恢复全量（否则刚回满的
+  额度池会被一次打空，于是永远停在「一恢复就挂」）。
   「今日/预算」里没有斜杠的通道不限额。<b>状态按报告生成时刻计算</b>，所以本次
   刚刚被拦的通道会同时出现在「覆盖率自评」里（已发 N 次）和这里（现在冷却中）。</p>
   <div class="panel">
@@ -1082,7 +1094,7 @@ def _alerts(alerts: Sequence[Mapping[str, Any]]) -> str:
                                 "unknown_structure", "parse_fail", "fetch_fail",
                                 "robots_forced"} \
             else ("warn" if kind in {"limit_reached", "dropped", "robots_disallow",
-                                     "gov_blocked",
+                                     "gov_blocked", "channel_cooldown",
                                      "person_org_unmatched", "person_name_missing",
                                      "person_no_anchor"} else "")
         shown = details[:3]

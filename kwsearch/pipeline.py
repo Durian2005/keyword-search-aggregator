@@ -56,7 +56,14 @@ from kwsearch.fetch import FetchError
 from kwsearch.fetch import build_fetcher, default_headers
 from kwsearch.fetch.page import HostThrottle, PagePolicy, fetch_pages
 from kwsearch.fetch.robots import resolve_on_failure, resolve_robots_mode
-from kwsearch.health import ChannelHealth, HealthPolicy, classify_block, decide
+from kwsearch.health import (
+    MODE_PROBE,
+    MODE_SKIP,
+    ChannelHealth,
+    HealthPolicy,
+    classify_block,
+    plan,
+)
 from kwsearch.models import Candidate, ChannelResult, Doc, Mention
 from kwsearch.person import (
     TIER_CN,
@@ -1082,23 +1089,35 @@ def _run_task_body(
             say(f"  ○ {ch.id:18s} 跳过：{reason}")
             continue
 
-        # ---- 健康度闸（Phase 1）：冷却中 / 今日额度用尽 → 一个请求都不发 ----------
-        # 放在"未注册 / 缺 key"之后、真正发请求之前。两者都记 skipped，但语义不同：
-        # 前者是"这条通道根本不可用"（永久），这里是"现在先别打"（临时）——
+        # ---- 健康度闸（Phase 1 + 2）：跳过 / 探针 / 全量 三态 -------------------
+        # 放在"未注册 / 缺 key"之后、真正发请求之前。跳过与"不可用"都记 skipped，
+        # 但语义不同：前者是"这条通道根本不可用"（永久），这里是"现在先别打"（临时）——
         # 报告与告警要能分清，否则读者会以为配置坏了。
         #
         # 这一步也是"越爬越爬不到"的止血点：额度池见底前会先缩量（5→3→1），
         # 继续打只会把池子彻底打空，然后等一整天。宁可不抓，也不要打空。
+        #
+        # Phase 2 的第三态是探针：冷却刚解除时**先把请求压到一发**。
+        # 理由同上 —— 池子刚回满就按满额打，等于原地再打空一次，
+        # 于是永远停在"一恢复就挂"。探针拿到真实结果后 streak 归零，
+        # 下一次任务自动走全量，代价只是恢复的那一轮数据偏少。
         _now = datetime.now().astimezone()
         _health = ChannelHealth.from_mapping(
             repo.get_channel_state(ch.id) or {"channel": ch.id})
-        _skip, _why = decide(_health, _now, health_policy)
-        if _skip:
+        _mode, _why = plan(_health, _now, health_policy)
+        if _mode == MODE_SKIP:
             result.per_channel.append(ChannelRun(ch.id, ch.type, skipped=_why))
             # 不设 run.error：这是主动克制，不是故障。报告里的"状态"列会显示原因。
             repo.add_alert(task_id, ch.id, "channel_cooldown", _why)
             say(f"  ○ {ch.id:18s} 跳过：{_why}")
             continue
+        _probing = _mode == MODE_PROBE
+        if _probing:
+            repo.add_alert(task_id, ch.id, "channel_probe", _why)
+            say(f"  ◌ {ch.id:18s} 探针：{_why}")
+        # 探针允许的翻页数。用它替掉通道配置里的 max_pages 即可，不需要额外开关。
+        _max_pages = (max(1, health_policy.probe.pages) if _probing
+                      else int(ch.paging.max_pages))
 
         # 过滤只对 serp 生效：只有通用搜索引擎会把低频查询"放宽"成高频词。
         # 站点检索和公开 API 的每一条都是服务端认为相关的，再按标题筛会杀掉
@@ -1122,6 +1141,13 @@ def _run_task_body(
             say(f"  ▸ {ch.id} 站内检索：{person.name} site:{dom}（替代裸姓名）")
         else:
             ch_variants = [v for v in variants if v.for_channel(ch.id)]
+        if _probing and len(ch_variants) > 1:
+            # 探针只问一句"还能不能打"：变体全砍到基词。
+            # 取基词而不是"列表第一个"：变体的 channels 限定可能让过滤后第一个
+            # 恰好不是基词，那时拿它当探针就测错了对象。
+            base = next((v for v in ch_variants if v.is_base), ch_variants[0])
+            say(f"     ↳ 探针：变体 {len(ch_variants)} → 1（{base.q}）")
+            ch_variants = [base]
         try:
             # auto_probe 时初始变体只有基词，但 serp 也必须走 _run_serp：
             # plan_hook 要在 expand_channel 内部（拿到过滤后的基词结果）补变体。
@@ -1135,10 +1161,23 @@ def _run_task_body(
             #   site_search —— 翻页与换词都有效 → _run_paged_multi（基词翻页 + 变体各一页）
             #   其它        —— 服务端匹配可靠，换词只拿回重复 → _run_paged
             if ch.type == "serp" and ch.variants and (len(variants) > 1 or auto_probe):
+                # 探针模式下 plan_hook 仍要跑一次（探测本身不发请求，用的是基词这一发
+                # 的结果），但**它追加的变体一律丢弃**：探针只打一发。写回全局
+                # variants 的副作用保留，后面的通道因此还能用变体。
+                _hook = None
+                if auto_probe:
+                    if _probing:
+                        def _hook(cands, _inner=_plan_hook):     # noqa: ANN001
+                            planned = _inner(cands) if _inner else []
+                            if planned:
+                                say(f"     ↳ 探针：{len(planned)} 个变体留到下次任务再打")
+                            return []
+                    else:
+                        _hook = _plan_hook
                 run, cands, logs = _run_serp(
                     ch, ctx, ch_variants,
                     pattern=pattern, zero_gain_streak=zero_gain, sleep=sleep,
-                    plan_hook=_plan_hook if auto_probe else None,
+                    plan_hook=_hook,
                 )
             elif org_site_q:
                 run, cands, logs = _run_serp(
@@ -1146,16 +1185,17 @@ def _run_task_body(
                     pattern=pattern, zero_gain_streak=zero_gain, sleep=sleep,
                 )
             elif (ch.type == "site_search" and ch.variants
-                  and len(ch_variants) > 1 and ch.paging.mode != "none"):
+                  and len(ch_variants) > 1 and ch.paging.mode != "none"
+                  and not _probing):
                 run, cands, logs = _run_paged_multi(
                     ch, ctx, ch_variants, timespan=timespan,
-                    max_pages=int(ch.paging.max_pages),
+                    max_pages=_max_pages,
                     zero_gain_streak=zero_gain, sleep=sleep,
                 )
             else:
                 run, cands, logs = _run_paged(
                     ch, ctx, keyword, timespan=timespan,
-                    max_pages=int(ch.paging.max_pages), sleep=sleep,
+                    max_pages=_max_pages, sleep=sleep,
                 )
                 if ch.type == "serp" and cands and not no_filter:
                     cands, dropped = _screen_single_page(cands, keyword, require)

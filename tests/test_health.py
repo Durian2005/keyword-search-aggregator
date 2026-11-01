@@ -23,9 +23,13 @@ from kwsearch.health import (  # noqa: E402
     COOLDOWN_BASE_H,
     COOLDOWN_FACTOR,
     COOLDOWN_MAX_H,
+    MODE_NORMAL,
+    MODE_PROBE,
+    MODE_SKIP,
     ChannelHealth,
     CooldownPolicy,
     HealthPolicy,
+    ProbePolicy,
     classify_block,
     cooldown_hours,
     decide,
@@ -33,6 +37,7 @@ from kwsearch.health import (  # noqa: E402
     local_day,
     local_day_of_iso,
     parse_iso,
+    plan,
 )
 from kwsearch.storage import (  # noqa: E402
     KEEP_ON_WIPE,
@@ -258,6 +263,93 @@ class TestDecide(unittest.TestCase):
         self.assertTrue(skip)
         self.assertIn("冷却中", why)
         self.assertNotIn("额度", why)
+
+
+class TestPlan(unittest.TestCase):
+    """Phase 2 的三态：skip / probe / normal。
+
+    探针的判据只有一条 —— `block_streak > 0` 且冷却已过。能这么简单是因为
+    record_channel_ok() 会清零 streak：streak 大于 0 就等于"最后一次事件是被拦、
+    之后没成功过"，也就是池子按模型算该回满了、但没被证实。
+    """
+
+    def setUp(self):
+        self.policy = HealthPolicy.from_mapping({
+            "cooldown": {"base_hours": 6, "factor": 2, "max_hours": 24},
+            "quota": {"per_channel": {"x": 6}},
+            "probe": {"enabled": True, "pages": 1},
+        })
+
+    def test_never_blocked_is_normal(self):
+        self.assertEqual(plan(ChannelHealth("x"), NOW, self.policy), (MODE_NORMAL, ""))
+
+    def test_after_success_is_normal(self):
+        """成功会清零 streak —— 恢复之后不该一直当探针打。"""
+        h = ChannelHealth("x", last_block_at=_iso(NOW - timedelta(hours=8)),
+                          last_ok_at=_iso(NOW - timedelta(hours=1)), block_streak=0)
+        self.assertEqual(plan(h, NOW, self.policy)[0], MODE_NORMAL)
+
+    def test_cooldown_passed_unverified_is_probe(self):
+        h = ChannelHealth("x", last_block_at=_iso(NOW - timedelta(hours=7)),
+                          block_streak=1)
+        mode, why = plan(h, NOW, self.policy)
+        self.assertEqual(mode, MODE_PROBE)
+        self.assertIn("探针", why)
+        self.assertIn("1 页", why)
+
+    def test_cooling_wins_over_probe(self):
+        h = ChannelHealth("x", last_block_at=_iso(NOW), block_streak=1)
+        self.assertEqual(plan(h, NOW, self.policy)[0], MODE_SKIP)
+
+    def test_quota_wins_over_probe(self):
+        """预算用尽时说"先打一发探针"是自相矛盾的：那一发也要花额度。"""
+        h = ChannelHealth("x", last_block_at=_iso(NOW - timedelta(hours=7)),
+                          block_streak=1, day="2026-10-31", used_today=6)
+        self.assertEqual(plan(h, NOW, self.policy)[0], MODE_SKIP)
+
+    def test_probe_disabled_is_normal(self):
+        off = HealthPolicy.from_mapping({"probe": {"enabled": False}})
+        h = ChannelHealth("x", last_block_at=_iso(NOW - timedelta(hours=7)),
+                          block_streak=1)
+        self.assertEqual(plan(h, NOW, off)[0], MODE_NORMAL)
+
+    def test_stale_ok_after_block_is_normal(self):
+        """自相矛盾的记录（成功晚于被拦）按已验证处理。
+
+        正常流程走不到这里（成功就清零 streak 了），但历史回填或手改过的行可能有。
+        那种情况把一次全量任务降级成探针，等于白丢一轮数据。
+        注意 streak 只能是 1：streak=2 会让冷却变成 12h，9 小时前那次就还在冷却里，
+        测的就不是这条防线了。
+        """
+        h = ChannelHealth("x", last_block_at=_iso(NOW - timedelta(hours=9)),
+                          last_ok_at=_iso(NOW - timedelta(hours=2)), block_streak=1)
+        self.assertEqual(plan(h, NOW, self.policy)[0], MODE_NORMAL)
+
+    def test_neutral_failure_does_not_trigger_probe(self):
+        """network 类失败不涨 streak，自然也不会触发探针。"""
+        h = ChannelHealth("x", last_block_at=_iso(NOW - timedelta(hours=7)),
+                          last_block_kind="network", block_streak=0)
+        self.assertEqual(plan(h, NOW, self.policy)[0], MODE_NORMAL)
+
+
+class TestProbePolicy(unittest.TestCase):
+    def test_defaults(self):
+        p = HealthPolicy().probe
+        self.assertTrue(p.enabled)
+        self.assertEqual(p.pages, 1)
+
+    def test_pages_clamped_to_one(self):
+        """pages<=0 会让探针变成"一个请求都不发"，那它是跳过而不是探针。"""
+        self.assertEqual(ProbePolicy.from_mapping({"pages": 0}).pages, 1)
+        self.assertEqual(ProbePolicy.from_mapping({"pages": -3}).pages, 1)
+        self.assertEqual(ProbePolicy.from_mapping({"pages": "x"}).pages, 1)
+
+    def test_custom_pages(self):
+        self.assertEqual(ProbePolicy.from_mapping({"pages": 2}).pages, 2)
+
+    def test_missing_section_defaults_on(self):
+        """不写 health.probe 就是开着 —— 少抓一轮数据好过把额度打空。"""
+        self.assertTrue(ProbePolicy.from_mapping(None).enabled)
 
 
 class TestStorage(_DbCase):

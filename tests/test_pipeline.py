@@ -1489,5 +1489,89 @@ health:
         self.assertEqual(self._run_of(r, "fake_single_probe").skipped, "")
 
 
+class TestProbeAfterCooldown(RunCase):
+    """Phase 2：冷却刚解除的那一次只打一发探针，通了才恢复全量。
+
+    为什么单独成类：探针有两种失败方式，都很隐蔽 ——
+      ① 压根没生效 → 额度照样被一次打空，等于白做（queries 会是 5 而不是 1）；
+      ② 永久生效 → 通道永远只拿第一页，而且没人会想到是探针卡住了
+         （第二次跑仍然是 1 发）。两条都在下面有用例盯着。
+    """
+
+    def _seed_stale(self, channel: str, hours: float = 7) -> None:
+        """7 小时前被拦一次：base_hours=6，所以冷却已过、但之后没成功过。
+
+        这一格正是探针该触发的地方 —— 冷却闸放行、但恢复尚未被证实。
+        """
+        conn = init_db(self.db)
+        repo = Repository(conn)
+        when = (datetime.now().astimezone()
+                - timedelta(hours=hours)).isoformat(timespec="seconds")
+        repo.record_channel_block(channel, "challenge", when)
+        conn.commit()
+        conn.close()
+
+    def _queries(self, channel: str, task_id: str | None = None) -> list[dict]:
+        if task_id:
+            return self.rows(
+                "SELECT * FROM query WHERE channel=? AND task_id=?", channel, task_id)
+        return self.rows("SELECT * FROM query WHERE channel=?", channel)
+
+    def _run_of(self, result, channel: str):
+        return next(x for x in result.per_channel if x.channel == channel)
+
+    def test_probe_sends_exactly_one_request(self) -> None:
+        """原配置是 5 发（基词翻 4 页 + 1 个变体各一页），探针只能有 1 发。"""
+        self._seed_stale("fake_paged")
+        r = self.run_kw(self.cfg(_PAGED_CH))
+        self.assertEqual(len(self._queries("fake_paged", r.task_id)), 1)
+
+    def test_probe_is_not_an_error(self) -> None:
+        """主动克制不是故障：不能设 error，也不能记成 skipped。"""
+        self._seed_stale("fake_paged")
+        r = self.run_kw(self.cfg(_PAGED_CH))
+        run = self._run_of(r, "fake_paged")
+        self.assertFalse(run.error)                    # 空串 = 没出错
+        self.assertEqual(run.skipped, "")
+
+    def test_probe_writes_alert(self) -> None:
+        self._seed_stale("fake_paged")
+        r = self.run_kw(self.cfg(_PAGED_CH))
+        alerts = self.rows(
+            "SELECT * FROM alert WHERE task_id=? AND kind='channel_probe'", r.task_id)
+        self.assertEqual(len(alerts), 1)
+        self.assertIn("探针", alerts[0]["detail"])
+
+    def test_second_run_restores_full_volume(self) -> None:
+        """探针成功 → streak 归零 → 下一次任务回到全量。
+
+        这条是"探针不会永久生效"的守门人：少了它，把 _probing 写成常量 True
+        也能让上面三条全绿，而通道其实已经半瘫了。
+        """
+        self._seed_stale("fake_paged")
+        r1 = self.run_kw(self.cfg(_PAGED_CH))
+        self.assertEqual(len(self._queries("fake_paged", r1.task_id)), 1)
+        r2 = self.run_kw(self.cfg(_PAGED_CH))
+        self.assertGreater(len(self._queries("fake_paged", r2.task_id)), 1)
+
+    def test_probe_can_be_disabled(self) -> None:
+        """health.probe.enabled: false → 冷却过了就按原配置全量打。"""
+        health = """
+health:
+  probe:
+    enabled: false
+"""
+        self._seed_stale("fake_paged")
+        r = self.run_kw(self.cfg(_PAGED_CH, health=health))
+        self.assertGreater(len(self._queries("fake_paged", r.task_id)), 1)
+
+    def test_cooling_still_skips_instead_of_probing(self) -> None:
+        """探针不越过冷却：1 小时前被拦（冷却 6h）→ 还是一发不发。"""
+        self._seed_stale("fake_paged", hours=1)
+        r = self.run_kw(self.cfg(_PAGED_CH))
+        self.assertEqual(self._queries("fake_paged", r.task_id), [])
+        self.assertIn("冷却中", self._run_of(r, "fake_paged").skipped)
+
+
 if __name__ == "__main__":
     unittest.main()
