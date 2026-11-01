@@ -10,6 +10,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest import mock
 
@@ -21,7 +22,7 @@ from kwsearch.fetch import BaseFetcher, FetchError, FetchResult  # noqa: E402
 from kwsearch.models import Candidate, ChannelResult  # noqa: E402
 from kwsearch.person import parse_person  # noqa: E402
 from kwsearch.pipeline import run_task  # noqa: E402
-from kwsearch.storage import Repository, connect  # noqa: E402
+from kwsearch.storage import Repository, connect, init_db  # noqa: E402
 
 # --------------------------------------------------------------- 假通道
 
@@ -591,15 +592,20 @@ class RunCase(unittest.TestCase):
     def cfg(self, channels: str, max_docs: int = 20, *,
             drop_zero_hit: bool = True, max_per_domain: int = 2,
             fetch_body: bool = False, crawl: str = "{}",
-            expand: str = _EXPAND_DEFAULT):
+            expand: str = _EXPAND_DEFAULT, health: str = ""):
         p = self.dir / "channels.yaml"
-        p.write_text(_BASE.format(
+        text = _BASE.format(
             channels=channels, max_docs=max_docs,
             drop_zero="true" if drop_zero_hit else "false",
             max_per_domain=max_per_domain,
             fetch_body="true" if fetch_body else "false",
             crawl=crawl, expand=expand,
-        ), encoding="utf-8")
+        )
+        # health 段按需追加在末尾（YAML 顶层键，不影响上面模板的格式化）。
+        # 不放进 _BASE 是为了不给所有既有用例加一个必须传的占位符。
+        if health:
+            text += "\n" + health
+        p.write_text(text, encoding="utf-8")
         return load_config(p)
 
     def run_kw(self, cfg, keyword: str = "红黑树", **kw):
@@ -1338,6 +1344,149 @@ class TestAbnormalExit(RunCase):
         row = self.rows("SELECT status, finished_at FROM task")[0]
         self.assertNotEqual(row["status"], "aborted")
         self.assertIsNotNone(row["finished_at"])
+
+
+def fake_network(keyword: str, offset: int, ctx) -> ChannelResult:  # noqa: ANN001
+    """网络不可达（gdelt 在本机就是这种）：blocked=True，但 kind=network。
+
+    这条用例守的是一个真实踩坑点：如果把 network 也计入"连续被拦"，
+    gdelt 会永久卡在冷却里 —— 而它等再久也不会好，那是本机网络的问题。
+    """
+    return ChannelResult(channel="fake_network", query=keyword, candidates=[],
+                         blocked=True, block_kind="network", detail="fake 连不上")
+
+
+discover._REGISTRY["fake_network"] = fake_network
+
+_NETWORK_CH = """
+  - id: fake_network
+    type: structured_api
+    parser: fake_network
+    url_template: "https://fake.test/nw?q={q}"
+    paging: {mode: none}
+    throttle: {min_interval_s: 0}
+    assertions: {min_items: 0, required_fields: [url, title]}
+"""
+
+
+class TestChannelHealthRecording(RunCase):
+    """Phase 0（2026-10-31）：跑完一个任务，channel_state 必须被写上。
+
+    这一段只验"记账发生了、口径对"，**不验拦截** —— Phase 1 才会拿这张表
+    去 skip 通道。所以这些用例同时是"Phase 0 没有改变发送行为"的证据：
+    三个通道照样各发各的请求，只是多写了几行。
+    """
+
+    def _state(self, ch: str) -> dict:
+        rows = self.rows("SELECT * FROM channel_state WHERE channel=?", ch)
+        self.assertEqual(len(rows), 1, f"{ch} 没有记账")
+        return rows[0]
+
+    def test_success_recorded(self) -> None:
+        self.run_kw(self.cfg(_SINGLE_PROBE_CH))
+        st = self._state("fake_single_probe")
+        self.assertGreaterEqual(st["used_today"], 1)
+        self.assertEqual(st["block_streak"], 0)
+        self.assertIsNotNone(st["last_ok_at"])
+
+    def test_block_recorded(self) -> None:
+        self.run_kw(self.cfg(_BLOCKED_SERP_CH))
+        st = self._state("fake_blocked_serp")
+        self.assertEqual(st["block_streak"], 1)
+        self.assertEqual(st["last_block_kind"], "rate_limit")
+        self.assertIsNotNone(st["last_block_at"])
+
+    def test_network_failure_leaves_trace_without_streak(self) -> None:
+        self.run_kw(self.cfg(_NETWORK_CH))
+        st = self._state("fake_network")
+        self.assertEqual(st["block_streak"], 0)        # 不算被风控
+        self.assertEqual(st["last_block_kind"], "network")
+        self.assertIsNotNone(st["last_block_at"])      # 但"它一直失败"要看得见
+
+
+class TestHealthGate(RunCase):
+    """Phase 1：冷却中 / 额度用尽 → 一个请求都不发。
+
+    这是"越爬越爬不到"的止血点。验证方式不看输出文案，直接看 query 表：
+    被跳过的通道**一行调用记录都不该有**，那才是"真的没发请求"的硬证据。
+    """
+
+    def _seed(self, channel: str, *, block: bool = False,
+              usage: int = 0) -> None:
+        conn = init_db(self.db)
+        repo = Repository(conn)
+        now = datetime.now().astimezone().isoformat(timespec="seconds")
+        if block:
+            repo.record_channel_block(channel, "challenge", now)
+        if usage:
+            repo.add_channel_usage(channel, usage, now)
+        conn.commit()
+        conn.close()
+
+    def _queries(self, channel: str) -> list[dict]:
+        return self.rows("SELECT * FROM query WHERE channel=?", channel)
+
+    def _run_of(self, result, channel: str):
+        return next(x for x in result.per_channel if x.channel == channel)
+
+    def test_cooling_channel_sends_nothing(self) -> None:
+        self._seed("fake_single_probe", block=True)
+        r = self.run_kw(self.cfg(_SINGLE_PROBE_CH))
+        self.assertEqual(self._queries("fake_single_probe"), [])
+        run = self._run_of(r, "fake_single_probe")
+        self.assertIn("冷却中", run.skipped)
+        self.assertFalse(run.error)                    # 主动克制不是故障
+
+    def test_cooling_writes_alert(self) -> None:
+        self._seed("fake_single_probe", block=True)
+        r = self.run_kw(self.cfg(_SINGLE_PROBE_CH))
+        alerts = self.rows(
+            "SELECT * FROM alert WHERE task_id=? AND kind='channel_cooldown'", r.task_id)
+        self.assertEqual(len(alerts), 1)
+        self.assertIn("冷却中", alerts[0]["detail"])
+
+    def test_quota_exhausted_sends_nothing(self) -> None:
+        health = """
+health:
+  quota:
+    per_channel:
+      fake_single_probe: 2
+"""
+        self._seed("fake_single_probe", usage=2)
+        r = self.run_kw(self.cfg(_SINGLE_PROBE_CH, health=health))
+        self.assertEqual(self._queries("fake_single_probe"), [])
+        self.assertIn("额度", self._run_of(r, "fake_single_probe").skipped)
+
+    def test_quota_with_room_still_runs(self) -> None:
+        health = """
+health:
+  quota:
+    per_channel:
+      fake_single_probe: 5
+"""
+        self._seed("fake_single_probe", usage=1)
+        r = self.run_kw(self.cfg(_SINGLE_PROBE_CH, health=health))
+        self.assertGreaterEqual(len(self._queries("fake_single_probe")), 1)
+        self.assertEqual(self._run_of(r, "fake_single_probe").skipped, "")
+
+    def test_no_health_section_means_no_limit(self) -> None:
+        """不配 health 段 = 只管冷却、不限预算（Phase 0 的旧行为要保住）。"""
+        self._seed("fake_single_probe", usage=999)
+        r = self.run_kw(self.cfg(_SINGLE_PROBE_CH))
+        self.assertGreaterEqual(len(self._queries("fake_single_probe")), 1)
+        self.assertEqual(self._run_of(r, "fake_single_probe").skipped, "")
+
+    def test_cooldown_expired_runs_again(self) -> None:
+        """冷却过了就要能继续打 —— 否则一次被拦就永久停摆。"""
+        conn = init_db(self.db)
+        repo = Repository(conn)
+        old = (datetime.now().astimezone() - timedelta(hours=30)).isoformat(timespec="seconds")
+        repo.record_channel_block("fake_single_probe", "challenge", old)
+        conn.commit()
+        conn.close()
+        r = self.run_kw(self.cfg(_SINGLE_PROBE_CH))
+        self.assertGreaterEqual(len(self._queries("fake_single_probe")), 1)
+        self.assertEqual(self._run_of(r, "fake_single_probe").skipped, "")
 
 
 if __name__ == "__main__":

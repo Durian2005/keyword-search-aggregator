@@ -29,6 +29,7 @@ from __future__ import annotations
 import re
 import time
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Callable, Sequence
 
 from kwsearch.aggregate import canonicalize, host_of, relate
@@ -55,6 +56,7 @@ from kwsearch.fetch import FetchError
 from kwsearch.fetch import build_fetcher, default_headers
 from kwsearch.fetch.page import HostThrottle, PagePolicy, fetch_pages
 from kwsearch.fetch.robots import resolve_on_failure, resolve_robots_mode
+from kwsearch.health import ChannelHealth, HealthPolicy, classify_block, decide
 from kwsearch.models import Candidate, ChannelResult, Doc, Mention
 from kwsearch.person import (
     TIER_CN,
@@ -1051,6 +1053,9 @@ def _run_task_body(
     else:
         say(f"[{task_id}] {keyword!r}  mode={mode}  变体 {len(variants)} 个  上限 {cap} 条")
 
+    # 健康度策略全程只解析一次（冷却曲线 + 日预算）。配置缺失时 decide() 走默认值。
+    health_policy = HealthPolicy.from_mapping(cfg.health)
+
     for ch in cfg.enabled_channels():
         if time.perf_counter() > deadline:
             result.truncated = True
@@ -1075,6 +1080,24 @@ def _run_task_body(
         if reason:
             result.per_channel.append(ChannelRun(ch.id, ch.type, skipped=reason))
             say(f"  ○ {ch.id:18s} 跳过：{reason}")
+            continue
+
+        # ---- 健康度闸（Phase 1）：冷却中 / 今日额度用尽 → 一个请求都不发 ----------
+        # 放在"未注册 / 缺 key"之后、真正发请求之前。两者都记 skipped，但语义不同：
+        # 前者是"这条通道根本不可用"（永久），这里是"现在先别打"（临时）——
+        # 报告与告警要能分清，否则读者会以为配置坏了。
+        #
+        # 这一步也是"越爬越爬不到"的止血点：额度池见底前会先缩量（5→3→1），
+        # 继续打只会把池子彻底打空，然后等一整天。宁可不抓，也不要打空。
+        _now = datetime.now().astimezone()
+        _health = ChannelHealth.from_mapping(
+            repo.get_channel_state(ch.id) or {"channel": ch.id})
+        _skip, _why = decide(_health, _now, health_policy)
+        if _skip:
+            result.per_channel.append(ChannelRun(ch.id, ch.type, skipped=_why))
+            # 不设 run.error：这是主动克制，不是故障。报告里的"状态"列会显示原因。
+            repo.add_alert(task_id, ch.id, "channel_cooldown", _why)
+            say(f"  ○ {ch.id:18s} 跳过：{_why}")
             continue
 
         # 过滤只对 serp 生效：只有通用搜索引擎会把低频查询"放宽"成高频词。
@@ -1198,6 +1221,35 @@ def _run_task_body(
         result.per_channel.append(run)
         # 解链属于索引层（只换 URL、不取正文），单独计数，不并入 robots_forced
         result.links_resolved += sum(1 for c in cands if c.extra.get("link_resolved"))
+
+        # ---- 通道健康度记账（Phase 0：只写不读，不改变任何发送行为）-------------
+        # 判定口径全在 kwsearch/health.py。这里只数三样：本次几发、算不算被拦、
+        # 有没有成功。**刻意不读**：记账逻辑本身也可能有 bug，先让它空跑真实任务，
+        # 用 `python -m kwsearch health` 核对无误后，Phase 1 再拿它拦请求。
+        # 回滚成本为零 —— 删掉这一段就完全回到原状。
+        #
+        # 为什么只有部分 block_kind 计入：gdelt 在库里 20 次全是 blocked，
+        # 但 kind=network（本机到不了它）。若把这种算成被风控，它会永久冷却，
+        # 而且等再久也不会好 —— 见 health.BLOCK_NEUTRAL 的说明。
+        _stamp = datetime.now().astimezone().isoformat(timespec="seconds")
+        if run.queries:
+            repo.add_channel_usage(ch.id, run.queries, _stamp)
+        # 优先认"真被风控"的那一条：一个通道里可能既有 412 又有超时，
+        # 后者不该稀释前者。只有全是中性失败时才记中性失败。
+        _kinds = [lg["block_kind"] for lg in logs
+                  if lg["blocked"] and lg["block_kind"]]
+        _blocked_kind = next((k for k in _kinds if classify_block(k) == "cooldown"),
+                             _kinds[0] if _kinds else None)
+        if _blocked_kind:
+            # counts=False 的中性失败（network / relaxed）只留痕、不计冷却，
+            # 也**不能**落到下面的 else 分支被当成成功 —— 那等于把连挂洗白。
+            repo.record_channel_block(ch.id, _blocked_kind, _stamp,
+                                      counts=classify_block(_blocked_kind) == "cooldown")
+        elif run.queries and not run.error:
+            # 发出去了、没被拦、没崩 → 一次成功，把连挂计数清零。
+            # relaxed / boilerplate 不算 blocked，会走到这里，这是有意的：
+            # 它们是内容质量问题，不是拒绝服务。
+            repo.record_channel_ok(ch.id, _stamp)
 
         # 全局去重：跨通道也会重叠（同一篇文章既在 SERP 也在 B站）
         added = 0

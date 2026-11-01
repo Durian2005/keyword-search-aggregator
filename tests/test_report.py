@@ -9,11 +9,18 @@ import json
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from kwsearch.report import render, render_html, safe_dirname  # noqa: E402
+from kwsearch.report import (  # noqa: E402
+    _health_section,
+    health_view,
+    render,
+    render_html,
+    safe_dirname,
+)
 from kwsearch.storage import Repository, init_db  # noqa: E402
 
 
@@ -328,6 +335,56 @@ class TestRenderToDisk(unittest.TestCase):
         with self.assertRaises(KeyError):
             render(conn, "nope", tmp.name)
         conn.close()
+
+
+class TestHealthSection(unittest.TestCase):
+    """通道健康度区块（Phase 1）。
+
+    这块存在的意义是回答"某个通道这次一条都没出，是没结果还是被我们主动跳过了"。
+    所以三个要素缺一不可：今日用量、上次被拦、状态。
+    """
+
+    NOW = datetime(2026, 10, 31, 23, 0, tzinfo=timezone(timedelta(hours=8)))
+
+    def _row(self, channel: str, **kw) -> dict:
+        state = {"channel": channel, **kw}
+        return health_view([state], {"quota": {"per_channel": {channel: 6}}},
+                           now=self.NOW)[0]
+
+    def test_no_records_means_no_section(self) -> None:
+        # 没有任何 channel_state 记录时整节不出现，首屏不该为"还没数据"留位置
+        self.assertNotIn("通道健康度", render_html(_base_data()))
+        self.assertEqual(_health_section([]), "")
+
+    def test_cooling_row(self) -> None:
+        row = self._row("baidu_html", last_block_at=self.NOW.isoformat(),
+                        block_streak=1)
+        self.assertIn("冷却中", row["state"])
+        self.assertIn("6h", row["state"])
+        self.assertEqual(row["level"], "warn")
+
+    def test_quota_exhausted_row(self) -> None:
+        row = self._row("baidu_html", day="2026-10-31", used_today=6)
+        self.assertEqual(row["state"], "今日额度已用完")
+        self.assertEqual(row["level"], "bad")
+        self.assertEqual(row["used"], 6)
+
+    def test_neutral_failure_not_shown_as_normal(self) -> None:
+        """gdelt 恒 network：既不是"正常"，也不该显示成"被冷却"。"""
+        row = self._row("gdelt", last_block_at=self.NOW.isoformat(),
+                        last_block_kind="network", block_streak=0)
+        self.assertIn("不计冷却", row["state"])
+        self.assertEqual(row["streak"], "")       # 这个数字对它没意义
+        self.assertNotEqual(row["level"], "ok")
+
+    def test_section_renders_into_html(self) -> None:
+        data = _base_data()
+        data["channel_health"] = [self._row("baidu_html", day="2026-10-31",
+                                           used_today=3)]
+        html = render_html(data)
+        self.assertIn("通道健康度", html)
+        self.assertIn("baidu_html", html)
+        self.assertIn("3/6", html)
 
 
 if __name__ == "__main__":

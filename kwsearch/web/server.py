@@ -125,10 +125,12 @@ def make_default_runner(cfg: object, db_path: str, out_dir: Path) -> Callable:
             return None
 
         cluster = dict(getattr(cfg, "cluster", None) or {})
+        health = dict(getattr(cfg, "health", None) or {})
         conn = connect(db_path)
         try:
             path = Path(render(conn, result.task_id, out_dir,
-                               min_body_chars=int(cluster.get("min_body_chars") or 200)))
+                               min_body_chars=int(cluster.get("min_body_chars") or 200),
+                               health=health))
         finally:
             conn.close()
         log(f"报告：{path}")
@@ -404,7 +406,7 @@ def serve(
         return 2
 
     url = f"http://{host}:{actual}/"
-    log(f"kwsearch 交互页面 → {url}")
+    log(f"kwsearch 控制台 → {url}")
     log(f"数据库 {Path(db_path).resolve()} · 报告目录 {root}")
     log("Ctrl+C 停止。抓取全程在本机完成，不经过任何第三方。")
     if open_browser:

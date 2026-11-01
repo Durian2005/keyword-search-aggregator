@@ -207,6 +207,29 @@ CREATE TABLE IF NOT EXISTS robots (
 );
 
 -- ----------------------------------------------------------------------------
+-- 通道健康度：跨任务记住"谁最近被拦过、今天已经打了几发"
+-- 为什么必须是表而不是进程内变量：风控是**跨任务**累积的，进程一退就忘
+--   等于每次都当第一次跑（2026-10-23 那一轮 7 连挂就是这么来的）。
+-- ⚠️ 本表**不参与 db clear**：它记的是出口 IP 的状态，不是任务数据。
+--    清掉等于让系统立刻再去撞一次墙。要清得显式（db clear --all）。
+-- ⚠️ 跨天清零不做定时任务：读的时候拿 day 和今天比，不等就当 0
+--    （见 kwsearch/health.py 的 ChannelHealth.used）。
+-- ⚠️ 判定口径与闸门都在 kwsearch/health.py（Phase 1 起 decide() 会真的拦请求）：
+--    只有 challenge/captcha/403/412/rate_limit 才计冷却；
+--    network（如 gdelt 本机到不了）永远不计，否则会被永久封死。
+-- ----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS channel_state (
+    channel         TEXT PRIMARY KEY,
+    last_ok_at      TEXT,
+    last_block_at   TEXT,
+    last_block_kind TEXT,                       -- challenge|http_403|rate_limit|network|...
+    block_streak    INTEGER NOT NULL DEFAULT 0, -- 连续被拦次数（一次成功即清零）
+    day             TEXT,                       -- 最后记账的本地日期 YYYY-MM-DD
+    used_today      INTEGER NOT NULL DEFAULT 0, -- 那一天的请求数
+    note            TEXT
+);
+
+-- ----------------------------------------------------------------------------
 -- 告警：复用 前作 的 alert，kind 换成本项目的语义
 -- ----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS alert (

@@ -110,6 +110,9 @@ class AppConfig:
     limits: dict[str, Any]
     expand: dict[str, Any] = field(default_factory=dict)   # 查询变体矩阵
     cluster: dict[str, Any] = field(default_factory=dict)  # S5 近重复聚簇
+    # 通道健康度策略（冷却曲线 / 每日预算）。空 dict = 用 health.py 的默认值，
+    # 且**不限预算** —— 也就是"只管冷却"。见 kwsearch/health.py 的 HealthPolicy。
+    health: dict[str, Any] = field(default_factory=dict)
 
     def channel(self, cid: str) -> ChannelConfig:
         for c in self.channels:
@@ -202,4 +205,5 @@ def load_config(path: str | os.PathLike[str] | None = None) -> AppConfig:
         limits=dict(data.get("limits") or {}),
         expand=dict(data.get("expand") or {}),
         cluster=dict(data.get("cluster") or {}),
+        health=dict(data.get("health") or {}),
     )

@@ -535,6 +535,105 @@ def _coverage(channels: Sequence[Mapping[str, Any]]) -> str:
 </section>"""
 
 
+def health_view(states: Sequence[Mapping[str, Any]],
+                health_cfg: Mapping[str, Any] | None = None, *,
+                now: datetime | None = None) -> list[dict[str, Any]]:
+    """channel_state 原始行 → 报告要展示的字段。
+
+    判定全部来自 kwsearch/health.py（纯函数）。这里只做三件展示上的事：
+    时间戳截成"月-日 时:分"、状态翻成人话、给一个颜色级别。
+
+    `now` 可注入 —— 否则"冷却剩余 5h"这种文案每跑一次测试都在变。
+    """
+    from kwsearch.health import ChannelHealth, HealthPolicy, classify_block, human_delta
+
+    policy = HealthPolicy.from_mapping(health_cfg)
+    moment = now or datetime.now().astimezone()
+    rows: list[dict[str, Any]] = []
+    for d in states:
+        h = ChannelHealth.from_mapping(d)
+        quota = policy.quota_for(h.channel)
+        used = h.used(moment)
+        left = h.quota_left(moment, quota)
+        at = h.allowed_at(moment, policy.cooldown)
+        cooling = at is not None and at > moment
+        # "不计冷却"的失败（network / relaxed）既不能显示成"正常"，
+        # 也不该显示 streak —— 那个数字对它没有意义（它永远不会冷却）。
+        neutral = bool(h.last_block_kind) and classify_block(h.last_block_kind) != "cooldown"
+
+        if cooling and at is not None:
+            state, level = f"冷却中 · 剩 {human_delta(at - moment)}", "warn"
+        elif neutral:
+            state, level = f"{h.last_block_kind}（不计冷却）", ""
+        elif left == 0:
+            state, level = "今日额度已用完", "bad"
+        elif h.block_streak:
+            state, level = "冷却已过", "ok"
+        else:
+            state, level = "正常", "ok"
+
+        rows.append({
+            "channel": h.channel,
+            "used": used,
+            "quota": quota,
+            "last_ok": (h.last_ok_at or "")[:16].replace("T", " "),
+            "last_block": (h.last_block_at or "")[:16].replace("T", " "),
+            "kind": h.last_block_kind or "",
+            "streak": "" if neutral else h.block_streak,
+            "state": state,
+            "level": level,
+        })
+    return rows
+
+
+def _health_section(rows: Sequence[Mapping[str, Any]]) -> str:
+    """通道健康度。没有任何记录时整节不渲染 —— 首屏不该为"还没积累数据"留位置。
+
+    为什么报告里要有这一块：结果少的时候，读者要能分清三种情况 ——
+    词太冷门（真没内容）、被拦了（覆盖率那节会说）、**被主动跳过了**（这一节）。
+    少了第三种，"今天百度 0 条"会看起来像"百度搜不到这个词"。
+    """
+    if not rows:
+        return ""
+    body: list[str] = []
+    for r in rows:
+        quota = r.get("quota")
+        budget = f"/{quota}" if quota else ""
+        kind = r.get("kind") or ""
+        kind_html = f' <span class="tag">{_esc(kind)}</span>' if kind else ""
+        level = str(r.get("level") or "")
+        cls = f"tag {level}" if level else "tag"
+        body.append(
+            "<tr>"
+            f'<td><code>{_esc(r.get("channel"))}</code></td>'
+            f'<td class="num">{_num(r.get("used"))}{budget}</td>'
+            f'<td class="dim">{_esc(r.get("last_ok") or "—")}</td>'
+            f'<td class="dim">{_esc(r.get("last_block") or "—")}{kind_html}</td>'
+            f'<td><span class="{cls}">{_esc(r.get("state"))}</span></td>'
+            "</tr>"
+        )
+    return f"""
+<section>
+  <h2>通道健康度<span class="sub">跨任务记录：这些通道现在还能不能打</span></h2>
+  <p class="hint">这块记的是<b>出口 IP 的状态</b>，不是本次任务的结果。百度不是频控而是
+  <b>额度池</b>（同一天连打几发就会从「5 条」掉到「1 条」再断供，隔天回来才满血），
+  所以被拦之后会按 6h → 12h → 24h 逐级冷却，冷却期内这个通道<b>一个请求都不发</b>。
+  「不计冷却」的是网络故障或内容降级（如 GDELT 连不上），这类等再久也不会好，
+  所以不算作被风控。「冷却已过」= 曾经连挂、冷却期已结束，现在可以正常请求；
+  「今日/预算」里没有斜杠的通道不限额。<b>状态按报告生成时刻计算</b>，所以本次
+  刚刚被拦的通道会同时出现在「覆盖率自评」里（已发 N 次）和这里（现在冷却中）。</p>
+  <div class="panel">
+    <table>
+      <thead><tr>
+        <th>通道</th><th class="num">今日/预算</th>
+        <th>上次成功</th><th>上次被拦</th><th>状态</th>
+      </tr></thead>
+      <tbody>{''.join(body)}</tbody>
+    </table>
+  </div>
+</section>"""
+
+
 _ROBOTS_MODE_CN = {
     "obey": "obey · 遵守 robots.txt（Disallow 即拒抓）",
     "record": "record · 查 robots 但不拦（⚠ 无视 Disallow 强制抓取）",
@@ -1074,6 +1173,7 @@ def render_html(data: Mapping[str, Any]) -> str:
 {_banners(task, totals, channels)}
 {_overview(totals, task)}
 {_coverage(channels)}
+{_health_section(data.get("channel_health") or [])}
 {_robots(tstats)}
 {_queries(queries)}
 {_domains(domains, max_per_domain)}
@@ -1090,7 +1190,8 @@ def render_html(data: Mapping[str, Any]) -> str:
 
 
 def render(conn, task_id: str, out_dir: str | Path = "report",  # noqa: ANN001
-           *, write_json: bool = True, min_body_chars: int = 200) -> str:
+           *, write_json: bool = True, min_body_chars: int = 200,
+           health: Mapping[str, Any] | None = None) -> str:
     """把一个任务渲染成 report/<关键词>/index.html，返回绝对路径。
 
     同一个关键词跑多次会覆盖 index.html —— 这是有意的：报告目录要能双击就开，
@@ -1098,10 +1199,15 @@ def render(conn, task_id: str, out_dir: str | Path = "report",  # noqa: ANN001
 
     `min_body_chars` 只影响"未参与归并"那几行文案的分档（正文过短 / 待补算指纹），
     默认值与 channels.yaml 里 cluster.min_body_chars 保持一致。
+
+    `health` 是 channels.yaml 的 health 段（冷却参数 + 日预算）。传 None 也能渲染，
+    只是"预算"一栏会显示成不限 —— 报告不该因为少传一个参数就报错。
     """
     repo = Repository(conn)
     data = repo.stats(task_id, doc_limit=DOC_RENDER_LIMIT,
                       min_body_chars=min_body_chars)
+    # 健康度在这里就翻成展示行：render_html 只做排版，不该知道"冷却"是什么规则。
+    data["channel_health"] = health_view(data.get("channel_health") or [], health)
 
     folder = Path(out_dir) / safe_dirname(str(data["task"].get("keyword") or ""))
     folder.mkdir(parents=True, exist_ok=True)

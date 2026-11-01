@@ -16,11 +16,18 @@ import json
 import logging
 import sqlite3
 import uuid
+from datetime import timedelta
 from pathlib import Path
 from typing import Any, Iterable
 
 from kwsearch.aggregate import from_signed64, host_of, to_signed64
 from kwsearch.aggregate.cluster import DEFAULT_MIN_BODY
+from kwsearch.health import (
+    COOLDOWN_MAX_H,
+    classify_block,
+    local_day_of_iso,
+    parse_iso,
+)
 from kwsearch.models import Candidate, Doc, Mention, utcnow_iso
 
 logger = logging.getLogger(__name__)
@@ -109,6 +116,12 @@ _WIPE_ORDER: tuple[str, ...] = (
     "doc", "task",
     "robots",           # 礼貌缓存，不是用户数据，但留着会让人以为"没清干净"
 )
+
+# 清空时刻意**保留**的表（2026-10-31）。
+# channel_state 记的是出口 IP 的健康度，不是任务数据：清了它，下一次任务会
+# 立刻对刚封过我们的通道再打一遍，等于用用户的数据做赌注。
+# 想连它一起清属于另一个动作（"--all"），语义不同，不要混进 wipe()。
+KEEP_ON_WIPE: tuple[str, ...] = ("channel_state",)
 
 
 def table_counts(conn: sqlite3.Connection) -> dict[str, int]:
@@ -616,6 +629,218 @@ class Repository(_WipeMixin):
             (task_id, channel, kind, detail, utcnow_iso()),
         )
 
+    # ------------------------------------------------------------ channel state
+    # Phase 0（2026-10-31）：**只记录，不参与任何发送决策**。
+    # 判定逻辑全在 kwsearch/health.py（纯函数、时钟可注入），这里只管读写一行 ——
+    # 两边分层清楚：storage 不认识"冷却"这个概念，只认识"上次被拦是什么时候"。
+    # 返回 dict 而非 Row：调用方自己包成 ChannelHealth，存储层不依赖判定层。
+
+    def get_channel_state(self, channel: str) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            "SELECT * FROM channel_state WHERE channel=?", (channel,)).fetchone()
+        return dict(row) if row else None
+
+    def all_channel_states(self) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            "SELECT * FROM channel_state ORDER BY channel").fetchall()
+        return [dict(r) for r in rows]
+
+    def record_channel_ok(self, channel: str, when: str) -> None:
+        """一次成功 → block_streak 清零。
+
+        失败累积必须能被成功打断，否则连挂两次之后就永远回不到正常。
+        当日用量**不复位**：同一任务里成功与被拦会交替出现，复位会把账搅乱。
+        """
+        self.conn.execute(
+            "INSERT INTO channel_state(channel, last_ok_at, block_streak, day, used_today)"
+            " VALUES (?,?,0,?,0)"
+            " ON CONFLICT(channel) DO UPDATE SET"
+            "   last_ok_at=excluded.last_ok_at, block_streak=0",
+            (channel, when, local_day_of_iso(when)),
+        )
+
+    def record_channel_block(self, channel: str, kind: str | None, when: str,
+                             *, counts: bool = True) -> int:
+        """记一次失败，返回累计后的 streak。
+
+        counts 决定这次失败算不算"被风控"：
+          True  —— 对方明确拒绝（challenge / 403 / 412 / rate_limit），streak +1
+          False —— 网络故障 / 内容降级（network / relaxed …），**只记时间和原因**，
+                   streak 原地不动。这类失败等再久也不会好，把它算进冷却只会
+                   让通道被永久封死；但完全不留痕又会让人以为那条通道好用。
+
+        注意 False 时既不能 +1 也不能归零：归零等于把"之前连挂 3 次"洗白了。
+
+        `channel_state.block_streak+1` 必须带表名限定：不带的话 SQLite 会优先
+        解析成 excluded 的列，结果是每次都被写成 1，streak 永远涨不上去。
+        """
+        step = "channel_state.block_streak+1" if counts else "channel_state.block_streak"
+        self.conn.execute(
+            "INSERT INTO channel_state(channel, last_block_at, last_block_kind, block_streak)"
+            " VALUES (?,?,?,?)"
+            " ON CONFLICT(channel) DO UPDATE SET"
+            "   last_block_at=excluded.last_block_at,"
+            "   last_block_kind=excluded.last_block_kind,"
+            f"   block_streak={step}",
+            (channel, when, kind, 1 if counts else 0),
+        )
+        row = self.conn.execute(
+            "SELECT block_streak FROM channel_state WHERE channel=?", (channel,)).fetchone()
+        return int(row[0]) if row else (1 if counts else 0)
+
+    def add_channel_usage(self, channel: str, n: int, when: str) -> int:
+        """把 n 次请求记进当日用量，返回记账后的值。跨天第一笔从 0 起算。
+
+        跨天判断写成 SQL 的 CASE 而不是先读后写：两条语句之间可能插进别的任务
+        （交互页面还开着的时候），先读后写会丢掉中间那笔。
+
+        ⚠️ 读取侧（ChannelHealth.used）也有一份"不是今天就算 0"的判断，
+        两处口径必须一致：读取侧决定"现在还剩多少"，写入侧决定"明天从几开始"。
+        """
+        if n <= 0:
+            return 0
+        day = local_day_of_iso(when)
+        self.conn.execute(
+            "INSERT INTO channel_state(channel, day, used_today) VALUES (?,?,?)"
+            " ON CONFLICT(channel) DO UPDATE SET"
+            "   used_today=CASE WHEN channel_state.day=excluded.day"
+            "                   THEN channel_state.used_today+excluded.used_today"
+            "                   ELSE excluded.used_today END,"
+            "   day=excluded.day",
+            (channel, day, n),
+        )
+        row = self.conn.execute(
+            "SELECT used_today FROM channel_state WHERE channel=?", (channel,)).fetchone()
+        return int(row[0]) if row else n
+
+    def backfill_channel_state(self) -> list[str]:
+        """用 query 表的历史回填 channel_state，返回回填了哪些通道。
+
+        为什么需要：channel_state 是 2026-10-31 才加的，在此之前几十次任务的
+        "谁被拦过、今天打了几发"全散在 query 表里。不回填的话，Phase 0 上线当天
+        每个通道都是"无记录"，等于把已有的证据扔掉重新学一遍。
+
+        口径（和 Phase 0 之后的实时记账保持同一套）：
+          - **按任务聚合、不按页**：一个任务翻了 3 页全被拦，那是"一次事件"，
+            不是三次。冷却按事件计，不是按请求计。
+          - streak = 从最近的任务往前数，连续多少个任务里出现过被拦。
+          - last_ok_at = 最后一次"有成功调用"的任务时间。
+          - used_today 只统计今天的调用；跨天判断在读取侧还会再校验一次。
+
+        只补空白、不覆盖已有值 —— 实时记账（任务 / 探针）写进去的永远比历史汇总新；
+        但两边的"最后一次"各取更晚的那个，免得历史里更早的记录被当成不存在。
+        可反复执行，结果幂等。
+        """
+        # 每通道 × 每任务的**最后一次调用**。
+        # 不按 created_at 取最后一条：同一任务的多条 query 是在通道结束时批量写入的，
+        # 时间戳会落在同一秒，按时间排会把"前两页成功、第三页被拦"排成"先拦后成功"。
+        # seq 是通道内的调用序号（翻页 / 变体都在递增），才是可靠顺序。
+        rows = self.conn.execute(
+            "SELECT q.channel, q.created_at AS at, q.blocked AS blocked,"
+            "       q.block_kind AS kind"
+            " FROM query q"
+            " JOIN task t ON t.task_id = q.task_id"
+            " JOIN (SELECT channel, task_id, MAX(seq) AS mx FROM query"
+            "       GROUP BY channel, task_id) m"
+            "   ON q.channel = m.channel AND q.task_id = m.task_id AND q.seq = m.mx"
+            " ORDER BY q.channel, t.started_at DESC").fetchall()
+
+        ok_at = {r["channel"]: r["at"] for r in self.conn.execute(
+            "SELECT channel, MAX(created_at) AS at FROM query"
+            " WHERE blocked=0 GROUP BY channel")}
+
+        agg: dict[str, dict[str, Any]] = {}
+        for r in rows:
+            ch = r["channel"]
+            d = agg.setdefault(ch, {"streak": 0, "closed": False,
+                                    "last_block_at": None, "kind": None,
+                                    "last_ok_at": ok_at.get(ch)})
+            if d["closed"]:
+                continue
+            if not r["blocked"]:
+                d["closed"] = True                   # 以成功收尾的任务 = 连续段到此为止
+                continue
+            # 不算被拦的失败（network / relaxed / boilerplate）不参与连续计数，
+            # 但**仍然记下它是何时、因为什么失败**：gdelt 一直 network 这件事
+            # 本身就是有效信息，丢掉它用户会以为那条通道好用。
+            # 安全前提：streak 保持 0，health.cooling() 见 streak<=0 直接判不冷却。
+            if classify_block(r["kind"]) != "cooldown":
+                if d["last_block_at"] is None:
+                    d["last_block_at"] = r["at"]
+                    d["kind"] = r["kind"]
+                d["closed"] = True
+                continue
+            # 跨天重置：两次被拦间隔超过冷却上限，说明中间已经自然恢复过了。
+            # 少了这一条，B站会算成"连续 20 次"（10-23 到 10-28 每天挂一次），
+            # 冷却直接封顶，而它其实每天都恢复过。
+            if d["streak"] and d["last_block_at"]:
+                prev, seg = parse_iso(d["last_block_at"]), parse_iso(r["at"])
+                if prev and seg and (prev - seg) > timedelta(hours=COOLDOWN_MAX_H):
+                    d["closed"] = True
+                    continue
+            d["streak"] += 1
+            if d["last_block_at"] is None:       # 最近的那次
+                d["last_block_at"] = r["at"]
+                d["kind"] = r["kind"]
+
+        today = local_day_of_iso(utcnow_iso())
+        used = {r["channel"]: int(r["n"]) for r in self.conn.execute(
+            "SELECT channel, COUNT(*) AS n FROM query"
+            " WHERE substr(created_at, 1, 10)=? GROUP BY channel", (today,))}
+
+        def _later(a: str | None, b: str | None) -> str | None:
+            """两个 ISO 时刻里较晚的那个。解析不了就信现有的 a。"""
+            if not a:
+                return b
+            if not b:
+                return a
+            da, db_ = parse_iso(a), parse_iso(b)
+            if da and db_:
+                return a if da >= db_ else b
+            return a
+
+        filled: list[str] = []
+        for ch, d in agg.items():
+            # 合并而不是覆盖：实时记账（任务 / 探针）写进去的比历史汇总新，
+            # 但历史里有它没有的更早记录。两边各取各的"更晚一次"。
+            cur = self.get_channel_state(ch) or {}
+            ok_at = _later(cur.get("last_ok_at"), d["last_ok_at"])
+            blk_at = _later(cur.get("last_block_at"), d["last_block_at"])
+            kind = cur.get("last_block_kind") or d["kind"]
+
+            # streak 用"谁更新听谁的"，不能取 max：
+            # 库里的旧值可能是上一次用错口径算出来的（比如按任务数累计成 20），
+            # 取 max 会让错误值永远盖住正确值。只有库里记的"最后一次被拦"
+            # 确实比回填算出来的晚，才说明那是我没见过的实时事件。
+            cur_blk = parse_iso(cur.get("last_block_at"))
+            new_blk = parse_iso(blk_at)
+            fresh = bool(cur_blk) and (new_blk is None or cur_blk > new_blk)
+            streak = int(cur.get("block_streak") or 0) if fresh else int(d["streak"])
+
+            # 成功发生在最后一次被拦**之后** → 连挂已经断了，streak 必须归零。
+            # 必须是严格晚于：同一任务里"前两页成功、第三页被拦"的两条记录时间戳
+            # 会落在同一秒（批量写入），用 >= 会把这种情况误判成"成功在后"。
+            if ok_at and blk_at:
+                o, b = parse_iso(ok_at), parse_iso(blk_at)
+                if o and b and o > b:
+                    streak = 0
+
+            self.conn.execute(
+                "INSERT INTO channel_state(channel, last_ok_at, last_block_at,"
+                " last_block_kind, block_streak, day, used_today)"
+                " VALUES (?,?,?,?,?,?,?)"
+                " ON CONFLICT(channel) DO UPDATE SET"
+                "   last_ok_at=excluded.last_ok_at,"
+                "   last_block_at=excluded.last_block_at,"
+                "   last_block_kind=excluded.last_block_kind,"
+                "   block_streak=excluded.block_streak",
+                # day / used_today 刻意不更新：当日用量由 add_channel_usage 维护，
+                # 回填算的是"旧账"，覆盖它会让今天的预算凭空变化。
+                (ch, ok_at, blk_at, kind, streak, today, used.get(ch, 0)),
+            )
+            filled.append(ch)
+        return sorted(filled)
+
     # ------------------------------------------------------------------ stats
 
     def stats(
@@ -792,6 +1017,10 @@ class Repository(_WipeMixin):
             "queries": queries,
             "clusters": clusters,
             "person_cards": person_cards,
+            # 通道健康度（跨任务状态，不是本任务的统计）。报告要用它解释
+            # "为什么某个通道这次一条都没出" —— 是没结果，还是被主动跳过了。
+            "channel_health": [dict(r) for r in self.conn.execute(
+                "SELECT * FROM channel_state ORDER BY channel")],
         }
 
 
@@ -802,5 +1031,5 @@ def recent_tasks(conn: sqlite3.Connection, limit: int = 10) -> list[sqlite3.Row]
         " FROM task ORDER BY started_at DESC LIMIT ?", (limit,)))
 
 
-__all__ = ["Repository", "connect", "init_db", "recent_tasks",
+__all__ = ["KEEP_ON_WIPE", "Repository", "connect", "init_db", "recent_tasks",
            "table_counts", "SCHEMA_PATH"]

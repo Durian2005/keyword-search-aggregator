@@ -1,6 +1,7 @@
 """CLI 入口：python -m kwsearch <子命令>
 
     channels        列出所有通道 + 可用性自检（不联网）
+    health          各通道健康度：今日用量 / 上次被拦 / 是否冷却（只读库，不联网）
     probe URL       单 URL 探针：真实请求一次，打印状态/耗时/大小/预览（S1）
     discover KW     跑一条通道的发现层，打印候选与断言结果；--offline/--expand 调试（S2）
     page [URL...]   真的打开候选链接，检查能不能解析：robots/编码/挑战页/空壳页（S3a）
@@ -22,6 +23,7 @@ import logging
 import sys
 import time
 import unicodedata
+from datetime import datetime
 from pathlib import Path
 
 from kwsearch import __version__
@@ -84,6 +86,91 @@ def cmd_channels(cfg: AppConfig) -> int:
     print(_table(rows, ["id", "类型", "启用", "parser", "翻页", "间隔", "状态"]))
     print("\n提示：'未实现' = parser 已注册但函数体还是 NotImplementedError（M1 待写）")
     return 0
+
+
+def cmd_health(cfg: AppConfig, db_path: str, *, backfill: bool = False) -> int:
+    """通道健康度一览（只读库，不联网）。
+
+    为什么不塞进 report：报告是"一次任务"的视图，而健康度是**跨任务**的状态。
+    它回答的是"我现在还能不能打"—— 这件事在开跑之前就该知道，
+    而不是等任务跑完、在报告末尾发现"今天百度又是 0 条"。
+    """
+    from kwsearch.health import ChannelHealth
+    from kwsearch.storage import Repository, init_db
+
+    path = Path(db_path)
+    print("通道健康度 · 冷却与日预算已生效（Phase 1）")
+    if not path.exists():
+        print(f"数据库还不存在：{path.resolve()}")
+        print("跑一次 run 之后再来。")
+        return 0
+
+    conn = init_db(path)
+    repo = Repository(conn)
+    filled = repo.backfill_channel_state() if backfill else []
+    # storage 层的方法一律不自己 commit（全项目一致）。这里必须显式提交，
+    # 否则 conn.close() 时 sqlite3 会把未提交事务回滚 —— 现象是"刚才明明看到了
+    # 回填结果，再查就没了"，而且只在换连接后才暴露。
+    if backfill:
+        conn.commit()
+    stored = {d["channel"]: ChannelHealth.from_mapping(d)
+              for d in repo.all_channel_states()}
+    conn.close()
+
+    now = datetime.now().astimezone()
+    print(f"库 {path.resolve()}")
+    print(f"现在 {now.strftime('%Y-%m-%d %H:%M')}\n")
+
+    if backfill:
+        if filled:
+            print(f"已从历史 query 记录回填 {len(filled)} 个通道：{', '.join(filled)}\n")
+        else:
+            print("回填：没有需要补的通道（都已经有记录了）\n")
+
+    if not stored:
+        print("还没有任何记录。跑一次 run 之后，这里会逐通道显示用量与被拦情况。")
+        print("（库里已有历史任务的话，加 --backfill 可以立刻把过去的记录汇总进来）")
+        return 0
+
+    # 先按配置顺序列，再补库里存在但配置已禁用的（历史记录不该因为关通道就消失）
+    order = [c.id for c in cfg.enabled_channels()]
+    order += [cid for cid in stored if cid not in order]
+    rows = [_health_row(cid, stored.get(cid) or ChannelHealth(channel=cid), now)
+            for cid in order]
+    print(_table(rows, ["通道", "今日", "最后成功", "最后被拦", "性质", "连续", "状态"]))
+    print("\n提示：「不计冷却」= 失败原因不是对方在拦我们。"
+          "network 是本机网络到不了（如 gdelt），relaxed/boilerplate 是内容被降级 —— "
+          "这类等再久也不会好，所以不参与冷却。")
+    return 0
+
+
+def _health_row(cid: str, h, now: datetime) -> list[str]:  # noqa: ANN001
+    """一行健康度。状态列只给结论，详细措辞留在 health 模块里。"""
+    from kwsearch.health import classify_block, human_delta
+
+    ok = (h.last_ok_at or "—")[:16].replace("T", " ")
+    blk = (h.last_block_at or "—")[:16].replace("T", " ")
+    kind = h.last_block_kind or "—"
+    neutral = bool(h.last_block_kind) and classify_block(h.last_block_kind) != "cooldown"
+
+    if not h.last_block_at and not h.last_ok_at:
+        state = "无记录"
+    elif neutral:
+        # 失败原因不是对方在拦我们（network 本机到不了 / relaxed 内容被降级），
+        # 这类等再久也不会好，所以不参与冷却 —— 但必须显示出来，不能当"正常"。
+        state = "不计冷却"
+    else:
+        at = h.allowed_at(now)
+        if at is not None and at > now:
+            state = f"冷却中（剩余 {human_delta(at - now)}）"
+        elif h.block_streak:
+            state = "冷却已过"
+        else:
+            state = "正常"
+
+    # 不计冷却的失败不该显示"连续 N 次"：那个数字意味着"要冷却多久"，对它是无意义的
+    streak = "—" if neutral else str(h.block_streak)
+    return [cid, f"{h.used(now)} 发", ok, blk, kind, streak, state]
 
 
 def _is_stub(parser_name: str) -> bool:
@@ -208,7 +295,8 @@ def cmd_run(
     if want_report and result.kept:
         cc = dict(getattr(cfg, "cluster", None) or {})
         return _write_report(db_path, result.task_id, out_dir,
-                             min_body_chars=int(cc.get("min_body_chars") or 200))
+                             min_body_chars=int(cc.get("min_body_chars") or 200),
+                             health=dict(getattr(cfg, "health", None) or {}))
     return 0 if result.kept else 1
 
 
@@ -253,13 +341,15 @@ def _run_summary(result) -> str:  # noqa: ANN001
 
 
 def _write_report(db_path: str, task_id: str, out_dir: str,
-                  *, min_body_chars: int = 200) -> int:
+                  *, min_body_chars: int = 200,
+                  health: dict | None = None) -> int:
     from kwsearch.report import render
     from kwsearch.storage import connect
 
     conn = connect(db_path)
     try:
-        path = render(conn, task_id, out_dir, min_body_chars=min_body_chars)
+        path = render(conn, task_id, out_dir, min_body_chars=min_body_chars,
+                      health=health)
     except KeyError as e:
         print(f"✗ {e}", file=sys.stderr)
         return 2
@@ -298,7 +388,8 @@ def cmd_report(cfg: AppConfig, task_id: str | None, out_dir: str, db_path: str) 
         try:
             cc = dict(getattr(cfg, "cluster", None) or {})
             path = render(conn, task_id, out_dir,
-                          min_body_chars=int(cc.get("min_body_chars") or 200))
+                          min_body_chars=int(cc.get("min_body_chars") or 200),
+                          health=dict(getattr(cfg, "health", None) or {}))
         except KeyError as e:
             print(f"✗ {e}", file=sys.stderr)
             return 2
@@ -874,7 +965,7 @@ def cmd_discover(
 
 
 def cmd_db(cfg: AppConfig, action: str, db_path: str, assume_yes: bool = False) -> int:
-    from kwsearch.storage import Repository, init_db, recent_tasks
+    from kwsearch.storage import KEEP_ON_WIPE, Repository, init_db, recent_tasks
 
     if action == "init":
         conn = init_db(db_path)
@@ -916,6 +1007,10 @@ def cmd_db(cfg: AppConfig, action: str, db_path: str, assume_yes: bool = False) 
         if n:
             print(f"  {t:14s} {n:>6d} 行")
     print(f"合计 {total} 行。报告 HTML 文件不受影响，仍在报告目录里。")
+    # "不清"也要说出来：用户看到"清空"却还有一张表有数据，会以为没清干净。
+    print(f"保留不清：{', '.join(KEEP_ON_WIPE)}"
+          f" —— 记的是出口 IP 的健康度（谁封过我们），不是任务数据；"
+          f"清掉会让下次任务立刻再撞一次墙。")
     sys.stdout.flush()   # 管道里 stdout 是块缓冲，不让"将删什么"排在闸门提示后面
     if not assume_yes:
         print("未加 --yes，什么也没删。确认请执行: db clear --yes", file=sys.stderr)
@@ -949,6 +1044,9 @@ def main(argv: list[str] | None = None) -> int:
     sub = p.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("channels", help="列出通道并做可用性自检（不联网）")
+    ph = sub.add_parser("health", help="查看各通道健康度记录：今日用量/上次被拦/是否冷却（只读库，不联网）")
+    ph.add_argument("--backfill", action="store_true",
+                    help="用历史 query 记录回填（只补还没有记录的通道，不覆盖已有）")
 
     pr = sub.add_parser("run", help="执行一次关键词搜索，并生成 HTML 报告")
     pr.add_argument("keyword")
@@ -1092,6 +1190,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.cmd == "channels":
             return cmd_channels(cfg)
+        if args.cmd == "health":
+            return cmd_health(cfg, args.db, backfill=args.backfill)
         if args.cmd == "run":
             robots_mode = "off" if args.no_robots else args.robots_mode
             return cmd_run(
