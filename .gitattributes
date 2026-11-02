@@ -1,0 +1,50 @@
+# ============================================================================
+#  行尾统一（2026-11-02）
+# ============================================================================
+#
+# 为什么要有这个文件：
+#
+# 仓库曾经是混合行尾 —— 74 个跟踪文件里 68 个 LF、6 个 CRLF
+# （__main__.py / bing.py / bilibili.py / gdelt.py / searxng.py / test_bing.py）。
+# 这不是历史包袱那么简单：Windows 上任何用 Path.write_text() 改文件的脚本
+# 都会把它写成 CRLF，于是 git diff 把「改了 3 行」显示成「整文件重写」。
+#
+# 这个坑踩过两次：
+#   1. kwsearch/storage/schema.sql —— 显示改了 467 行，实际只有 23 行
+#   2. tests/fixtures/so360_*.html —— 生成的 fixture 带 CRLF，测试照旧通过
+# 两次都是靠 `git diff --stat --ignore-cr-at-eol` 对比才发现的。这条命令本该
+# 是诊断手段，不该变成每次提交前的例行检查。
+#
+# 为什么不用 core.autocrlf：
+#
+# 本机的 core.autocrlf 是 local=false、global(PortableGit)=true 的混合状态，
+# 也就是说结论取决于「在哪个仓库、用哪份 config」。换台机器、删掉 .git/config、
+# 或者别人 clone 下来，检出行为就会变。写进 .gitattributes 才对所有克隆生效，
+# 而且优先级高于 core.autocrlf。
+#
+# 仓库内一律 LF，工作区也一律 LF（eol=lf）。理由：这个项目在 Linux CI 和
+# Windows 上都要跑，LF 在两边都能正常工作，而让工作区保持和仓库一致，
+# 「文件里实际是什么字节」就永远只有一种答案 —— 排查问题时不用先问「你那行尾是啥」。
+# ----------------------------------------------------------------------------
+
+* text=auto eol=lf
+
+# Windows 批处理必须是 CRLF：cmd.exe 解析 LF 结尾的 if/goto 块会出错。
+# 当前仓库没有跟踪的 .bat（启动器含本机路径，被 .gitignore 挡在外面），
+# 这几条是给以后新增的脚本留的 —— 规则存在的成本是零，漏掉的成本是排查半天。
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# 二进制：显式标出来。text=auto 靠「前 8000 字节里有没有 NUL」探测，
+# 对已压缩格式够用，但显式声明能保证探测器失效时也不会被当文本改写。
+*.db    binary
+*.sqlite binary
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.ico   binary
+*.woff  binary
+*.woff2 binary
+*.zip   binary
