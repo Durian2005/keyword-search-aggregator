@@ -295,9 +295,10 @@ python -m kwsearch run "张军" --person --org "某某大学计算机学院" \
 | 搜狗微信 | site_search | ✅ 启用 | 微信公众号文章；发布时间在 `timeConvert(unix秒)`，显式 UTC+8。链接是 `link?url=<token>` 中转链且 token 每次请求都轮换，所以另给一个「公众号+标题+日期」的业务键做跨跑批去重（否则同一篇每次跑批都算新发现）；同时在同会话内解链换成永久 `mp.weixin.qq.com` 地址（见上文「去重」一节）。⚠️ `mp.weixin.qq.com/robots.txt` 是 `Disallow: /`，obey 档下只能拿标题与摘要，要正文得用 `--robots-mode record` |
 | B 站搜索 | site_search | ✅ 启用 | 20 条/页；`Referer` 必须带 `https://search.bilibili.com/`；412 是滚动配额，被拦即停 |
 | GDELT | structured_api | ✅ 启用 | 请求间隔 ≥5s；中文短语覆盖极低；标题常是机翻 |
+| 360 搜索 | serp | ✅ 启用 | 一页只有 4~7 条（不是 Bing 的 10），所以 `assertions.min_items` 是 3 而不是 5；**真实地址白送**（`<a data-mdurl>`），不需要还原请求。⚠️ 第 2 页的结果块全是 `richsum` 不是 `normal`，解析器不能按 `data-result-type` 筛，否则整页丢弃并误报"改版"。实测翻页有效，但 serp 类型走变体不翻页，`max_pages` 实际用不上（见 YAML 注释） |
 | Bing RSS | serp | ⏸ 停用 | `site:` 无效 |
 | SearXNG | serp | ⏸ 停用 | 需要自建实例 |
-| 360 / 搜狗 | serp | ⏸ 停用 | 页面可达，但结果块选择器未验证稳定、跳转链需额外还原 |
+| 搜狗网页 | serp | ⏸ 停用 | 2026-11-02 实测：200 可达、一页 10 条、翻页有效，但**每条都是 `/link?url=` 中转，真实地址要额外发一次请求**才拿得到（中转页是 JS 跳转）。照抓 10 条 = 10 发请求，成本是 360 的两倍，且与搜狗微信同域会共用风控打分 —— 所以先不做，解析器未写 |
 
 新增一个通道 = 在 YAML 加一段 + 在 `discover/` 注册一个 parser，主流程零改动。
 

@@ -35,6 +35,7 @@ _IMPL_MODULES = [
     "kwsearch.discover.gdelt",
     "kwsearch.discover.searxng",
     "kwsearch.discover.sogou_weixin",
+    "kwsearch.discover.so360",
 ]
 
 
