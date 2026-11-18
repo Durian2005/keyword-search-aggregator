@@ -82,10 +82,11 @@ cd keyword-search-aggregator
 
 python -m venv .venv
 # Windows: .venv\Scripts\activate    macOS/Linux: source .venv/bin/activate
-pip install -r requirements.txt
+pip install -e .        # 装包后获得 kwsearch 命令（要求 Python ≥ 3.10）
 
-python -m kwsearch channels          # 列出通道并自检（不联网）
-python -m kwsearch run "红黑树"       # 完整跑一次，顺手生成报告
+kwsearch channels                   # 列出通道并自检（不联网）
+kwsearch run "红黑树"                # 完整跑一次，顺手生成报告
+# 不想装包也可以：pip install -r requirements.txt + python -m kwsearch ...
 ```
 
 跑完看 `report/红黑树/index.html`。
@@ -322,6 +323,9 @@ python -m kwsearch run "张军" --person --org "某某大学计算机学院" \
 ```bash
 python -m unittest discover -s tests
 ```
+
+每次推送与 PR 由 GitHub Actions 自动跑 **lint（ruff）+ 全量测试**（`.github/workflows/ci.yml`）：
+ubuntu 上跑 Python 3.10–3.13 主矩阵，Windows × 3.13 兜底（项目在 Windows 上开发使用）。
 
 766 个用例，包含降级判定与兜底页判定的真实样本回归、任务中断的异常收尾（aborted 状态、连接必关）、跨跑批业务键去重与中转链升级（解链后旧死链就地改成永久链接）、GBK 站解码、robots 失败语义与三档绕过（record/off/失败放行、Request-rate）、robots 分层口径（索引层解链不算强制抓取）、政府站红线双保险、SimHash 阈值边界、正文模板剥离、人名锚点定档与时间线、报告转义等。样本里的人名与机构名已替换为中性占位，标题结构与判定结果不变。
 

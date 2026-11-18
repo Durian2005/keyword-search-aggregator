@@ -1,0 +1,86 @@
+# ============================================================
+#  keyword-search-aggregator · 打包与工程配置
+#
+#  设计要点：
+#  - version 单一来源是 kwsearch/__init__.py 的 __version__，不在这里重复写。
+#  - requires-python >= 3.10：代码用 `str | None` 联合类型语法（PEP 604），
+#    3.9 及以下会在导入时直接崩，必须挡在安装阶段。
+#  - HTTP 客户端 curl_cffi / httpx 放主依赖（采集层按优先级自动挑，
+#    装一个即可跑通，装多个则用优先级最高的那个）。
+#  - scrapling 是重档可选项（真实浏览器指纹），不装完全不受影响。
+# ============================================================
+
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+
+[project]
+name = "keyword-search-aggregator"
+description = "多搜索引擎关键词聚合采集：7 通道发现 → 正文抓取 → 打分聚簇 → HTML 报告"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [{ name = "Durian2005" }]
+keywords = ["search", "scraper", "aggregator", "crawler"]
+classifiers = [
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    "PyYAML>=6.0",
+    "curl_cffi>=0.7",
+    "httpx>=0.27",
+]
+dynamic = ["version"]
+
+[project.optional-dependencies]
+# 隐身抓取档：可过 Cloudflare Turnstile 挑战。装完还要跑 `scrapling install`。
+scrapling = ["scrapling[fetchers]>=0.3"]
+
+[project.scripts]
+kwsearch = "kwsearch.__main__:main"
+
+[tool.hatch.version]
+path = "kwsearch/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["kwsearch"]
+
+# ============================================================
+#  ruff · lint + format
+#  原则：CI 门禁必须零告警，所以只开「真问题」规则；
+#  项目刻意使用的模式（延迟导入、渐进标注）显式放行而不是绕过检查。
+# ============================================================
+[tool.ruff]
+target-version = "py310"
+line-length = 100          # 中文注释行普遍偏长，88 会对全库误报
+extend-exclude = [".workbuddy", "report", "bodies"]
+
+[tool.ruff.lint]
+select = [
+    "E4", "E7", "E9",      # pycodestyle 真错误（不含 E402/E501，见 ignore）
+    "F",                   # pyflakes：未定义名/未用导入/未用变量
+    "W",                   # 空白卫生
+    "I",                   # import 排序
+    "UP",                  # 过时语法升级（3.10+）
+    "B",                   # bugbear 常见坑
+    "SIM",                 # 可简化的分支
+    "C4",                  # 更 Pythonic 的集合/推导式写法
+    "RUF100",              # noqa 指令的有效性（防 noqa 失效烂掉）
+]
+ignore = [
+    "E402",                # 模块顶部之外 import 是刻意的：CLI 延迟导入 + 测试 sys.path 前置
+    "A002",                # 覆写父类签名时参数必须同名（如 BaseHTTPRequestHandler.log_message(format)）
+    "SIM108",              # 三元替换 if/else：现状分支更易读
+]
+
+[tool.ruff.lint.per-file-ignores]
+# 测试里的「赋值不用」多为 spy/副作用断言的前置调用，删了会改变行为
+"tests/*" = ["F841"]
+
+[tool.ruff.format]
+# 与 .gitattributes 的 LF 规则一致
+line-ending = "lf"
