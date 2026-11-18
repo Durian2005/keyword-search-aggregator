@@ -16,7 +16,9 @@ Bing 对"人名 + 任何第二个词"会静默降级成第一个字的结果
 机构全称常常一个字都不出现，没有这条证据，官网上的正确人物只能判「疑似」）。
 
 判定用三层锚点：
-  1) 强锚点（机构）：标题/摘要里出现用户给的机构，或页面位于该机构官网域
+  1) 强锚点（机构）：标题里出现用户给的机构，或页面位于该机构官网域，
+     或（有正文时）机构名与姓名在正文中相距 ≤80 字 —— 见 ORG_NEAR_CHARS。
+     只在页脚/导航里远远出现的机构名不算，标为"仅远处提及"。
   2) 弱锚点（方向 / 身份）：网络安全、教授、博导 …… 只能说明"像这个人"
   3) 负锚点：演员/歌手、招聘、判决书 —— 同名不同人的常见来源
 
@@ -81,6 +83,28 @@ UNMATCHED_LABEL = "未匹配机构"
 _W = 3      # 强锚点权重
 _W_WEAK = 1
 _W_NEG = 2
+
+# ── 机构×姓名的邻近约束（2026-11-18，人名模式对应性第二轮）─────────────
+#
+# 病因：`org_hits` 只判"机构名在这段文本里出现过"，不判它和姓名有没有关系。
+# 正文里机构名最常见的两处位置恰恰与本人无关：
+#   · 页脚/版权区「版权所有 © 某某大学」——每页都有
+#   · 导航/相关链接「[某某大学计算机学院] [师资队伍] [招生]」
+# 一条"张军教授做客我校讲座"的新闻，正文提到主办方"某某大学"，姓名和机构
+# 都在页面上，却分属两件事 —— 旧逻辑照样判「很可能」，还会把机构算进卡片。
+#
+# 约束：有正文时，机构名必须与姓名在 **ORG_NEAR_CHARS 字以内**共现才算强锚点；
+# 只在远处出现 → 记入 `far_orgs`，不升级档位、不计分，证据行标注"仅远处提及"。
+# 标题命中不受此限 —— 标题本身就是"这页在讲谁"的宣告，
+# 「张军 - 某某大学计算机学院」这种标题里两者天然相邻。
+#
+# 为什么是 80 字：一个中文句号左右的跨度。同一句「张军，某某大学计算机学院教授」
+# 约 15 字；跨一个短句（"……。据某某大学介绍"）约 40-60 字；再远就是另一件事了。
+ORG_NEAR_CHARS = 80
+
+# 正文短于这个长度不做邻近判定：导航页/摘要页的"正文"本来就是一堆链接文字，
+# 距离统计没有意义，退回标题+摘要的旧逻辑更诚实。
+MIN_BODY_FOR_NEAR = 100
 
 # 机构名末尾是"大学"时，紧跟"生"的多半是"大学生"而不是这所大学：
 # "北京大学生就业指导中心"里的"北京大学"是假命中。只护这一种形态 ——
@@ -204,6 +228,36 @@ def _plus(anchor: str, text: str) -> bool:
     return bool(a) and a in _norm(text)
 
 
+def _positions(hay: str, needle: str) -> list[int]:
+    """needle 在 hay 中所有出现位置（允许重叠，便于"北京大学"这类短串连排）。"""
+    out: list[int] = []
+    if not needle:
+        return out
+    start = 0
+    while True:
+        i = hay.find(needle, start)
+        if i < 0:
+            return out
+        out.append(i)
+        start = i + 1
+
+
+def name_org_distance(name: str, org: str, text: str) -> int | None:
+    """姓名与机构名在文本中的最近字符距离（归一化后、去空白）。
+
+    任一未出现返回 None。距离按"一次姓名的出现位置"到"一次机构的出现位置"
+    的绝对差算；取全局最小 —— 正文里姓名常在标题区、作者行、正文各出现一次，
+    只要任一处与机构名挨着，就算这条证据成立。
+    """
+    n, o, t = _norm(name), _norm(org), _norm(text)
+    if not n or not o or not t:
+        return None
+    name_at, org_at = _positions(t, n), _positions(t, o)
+    if not name_at or not org_at:
+        return None
+    return min(abs(a - b) for a in name_at for b in org_at)
+
+
 @dataclass(frozen=True, slots=True)
 class PersonQuery:
     """一次人名任务的输入。orgs/fields/roles 只用于结果归因，绝不拼进查询。"""
@@ -303,6 +357,9 @@ class Judgment:
     name_present: bool = True   # 页面上有没有这个人名；False = 机构页面，不是这个人的证据
     primary_org: str | None = None
     also_orgs: tuple[str, ...] = ()
+    # 正文里提到、但离姓名太远（> ORG_NEAR_CHARS）的机构：不参与定档，
+    # 只进证据行供人核对。与 also_orgs（也命中、只是不是主机构）语义不同。
+    far_orgs: tuple[str, ...] = ()
 
 
 def _pick_primary(
@@ -310,18 +367,21 @@ def _pick_primary(
     orgs: tuple[str, ...],
     t_hits: dict[str, int],
     s_hits: dict[str, int],
+    near: dict[str, int] | None = None,
 ) -> str | None:
     """多机构命中时选一个"主机构"。
 
-    优先序：标题里出现过 → 出现次数多的 → 用户给的顺序在前。
+    优先序：标题里出现过 → 姓名附近共现次数多 → 出现次数多的 → 用户给的顺序在前。
     标题优先，是因为标题描述的是"这个页面在讲谁"；摘要里出现机构常常只是
     页面底部的院系导航。用户顺序兜底，保证同一批输入结果可复现。
     """
     if not orgs:
         return None
     order = {o: i for i, o in enumerate(person.orgs)}
+    near = near or {}
     return min(orgs, key=lambda o: (
-        0 if t_hits.get(o) else 1, -t_hits.get(o, 0), -s_hits.get(o, 0), order.get(o, 0),
+        0 if t_hits.get(o) else 1, -near.get(o, 0),
+        -t_hits.get(o, 0), -s_hits.get(o, 0), order.get(o, 0),
     ))
 
 
@@ -331,6 +391,7 @@ def judge(
     person: PersonQuery,
     *,
     domain_orgs: Sequence[str] = (),
+    body: str | None = None,
 ) -> Judgment:
     """给一条候选定档。纯字符串匹配 —— 不做实体消歧，也不猜。
 
@@ -339,15 +400,52 @@ def judge(
     计算机学院官网上张军教授的主页永远只能判「疑似」。
     域名证据与文本证据同权（都算强锚点），但卡片里会标注（官网域名），
     看的人能分清这条机构命中是"页面写了校名"还是"页面就在该校网站上"。
+
+    body：已抓到的正文全文（可空）。给了且够长时，机构证据改用**邻近约束**：
+    机构名必须与姓名相距 ≤ ORG_NEAR_CHARS 字才算强锚点，否则只记
+    "仅远处提及"——页脚版权、导航链接里的校名不再把人抬进「很可能」。
+    标题命中不受此限（标题即主旨）。body 为空时行为与旧版完全一致。
     """
     text = f"{title} {snippet}"
     name_present = mentions_name(person.name, title, snippet)
 
     t_hits = {o: org_hits(o, title) for o in person.orgs}
     s_hits = {o: org_hits(o, snippet) for o in person.orgs}
+    near: dict[str, int] = {}
+    far_orgs: tuple[str, ...] = ()
+
+    body_text = body or ""
+    use_body = len(body_text) >= MIN_BODY_FOR_NEAR
+    if use_body:
+        b_hits = {o: org_hits(o, body_text) for o in person.orgs}
+        far: list[str] = []
+        for o in person.orgs:
+            if t_hits[o]:
+                # 标题里姓名与机构同现，是"这页在讲谁"的直接宣告，不受距离约束
+                near[o] = t_hits[o]
+            elif b_hits[o]:
+                d = name_org_distance(person.name, o, body_text)
+                if d is not None and d <= ORG_NEAR_CHARS:
+                    near[o] = b_hits[o]
+                else:
+                    far.append(o)      # 提到了，但离这个人太远 —— 只留痕不升级
+            elif s_hits[o]:
+                # 正文里没有、摘要里有：摘要可能就是导航/面包屑，按"仅远处提及"处理
+                far.append(o)
+        far_orgs = tuple(far)
+        # 姓名不在标题/摘要里但正文里有时，仍视为出现过（正文是更强的证据）
+        name_present = name_present or mentions_name(person.name, body_text)
+
     dom_set = tuple(o for o in domain_orgs if o in person.orgs)
-    orgs = tuple(o for o in person.orgs if t_hits[o] or s_hits[o] or o in dom_set)
-    weak = tuple(a for a in person.weak_anchors if _plus(a, text))
+    if use_body:
+        orgs = tuple(o for o in person.orgs
+                     if o in near or o in dom_set)
+    else:
+        orgs = tuple(o for o in person.orgs if t_hits[o] or s_hits[o] or o in dom_set)
+    weak = tuple(a for a in person.weak_anchors if _plus(a, text)
+                 or (use_body and _plus(a, body_text)))
+    # 负锚点刻意只看标题/摘要：正文页脚普遍挂着「招聘」「加入我们」，
+    # 拿正文判否决会把大量正确页面打成"同名不相关"。
     negatives = tuple(
         kind for kind, words in NEGATIVE_HINTS.items()
         if any(_plus(w, text) for w in words)
@@ -368,16 +466,18 @@ def judge(
     else:
         tier = TIER_UNRELATED
 
-    primary = _pick_primary(person, orgs, t_hits, s_hits)
+    primary = _pick_primary(person, orgs, t_hits, s_hits, near)
     # 只靠域名命中的机构在证据行里标注出来：文本没写校名，是"站在人家网站上"算的数
-    dom_only = tuple(o for o in dom_set if not (t_hits[o] or s_hits[o]))
+    dom_only = tuple(o for o in dom_set if not (t_hits[o] or near.get(o)))
     matches = (tuple(f"{o}（官网域名）" if o in dom_only else o for o in orgs)
+               + tuple(f"{o}（仅远处提及）" for o in far_orgs)
                + weak)
     return Judgment(
         tier=tier, matches=matches, orgs=orgs, weak=weak,
         negatives=negatives, score=max(0, score), name_present=name_present,
         primary_org=primary,
         also_orgs=tuple(o for o in orgs if o != primary),
+        far_orgs=far_orgs,
     )
 
 

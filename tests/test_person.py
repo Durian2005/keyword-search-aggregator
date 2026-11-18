@@ -352,5 +352,77 @@ class TestJudgeDomainEvidence(unittest.TestCase):
         self.assertEqual(j.tier, TIER_UNRELATED)
 
 
+class TestJudgeNearWindow(unittest.TestCase):
+    P_ORG_ONLY = parse_person("张军", ["某某大学计算机学院"])   # 无弱锚点：档位只反映机构证据
+
+    """正文邻近约束：机构名必须离姓名够近才算强锚点。
+
+    病因（真实页面的典型结构）：页脚「版权所有 © 某某大学」和导航
+    「[某某大学计算机学院] [师资队伍]」离正文里的姓名有几百字，
+    旧逻辑照样把人抬进「很可能」，卡片还会按这些假命中分组。
+    """
+
+    def test_org_near_name_in_body_is_strong(self) -> None:
+        body = ("2026 年 10 月 12 日，某某大学计算机学院教授张军做客我校讲座，"
+                "就网络安全人才培养作专题报告。" + "会议由研究生院主办。" * 5)
+        j = judge("学术讲座在我校举行", "校内新闻", self.P_ORG_ONLY, body=body)
+        self.assertEqual(j.tier, TIER_LIKELY)
+        self.assertEqual(j.orgs, ("某某大学计算机学院",))
+        self.assertEqual(j.far_orgs, ())
+
+    def test_org_far_from_name_is_not_strong(self) -> None:
+        # 机构只在很远的段落出现（约 400 字之后），姓名在开头
+        filler = "本次讲座围绕人才培养展开讨论，与会师生反响热烈。" * 15
+        body = ("李四副教授作了报告，重点介绍攻防演练平台建设。" + filler
+                + "本次活动由某某大学计算机学院协办。")
+        j = judge("学术讲座在我校举行", "校内新闻", self.P_ORG_ONLY, body=body)
+        self.assertEqual(j.orgs, ())
+        self.assertEqual(j.far_orgs, ("某某大学计算机学院",))
+        self.assertEqual(j.tier, TIER_UNRELATED)
+        self.assertTrue(any("仅远处提及" in m for m in j.matches),
+                        "远处提及必须标出来，否则证据行会骗人")
+
+    def test_no_body_keeps_legacy_behavior(self) -> None:
+        # 不传正文 = 旧行为：摘要里出现机构就算强锚点
+        j = judge("张军", "某某大学计算机学院师资队伍", self.P_ORG_ONLY)
+        self.assertEqual(j.tier, TIER_LIKELY)
+        self.assertEqual(j.far_orgs, ())
+
+    def test_short_body_falls_back_to_legacy(self) -> None:
+        # 正文太短（< MIN_BODY_FOR_NEAR）：导航页的"正文"本来就是链接文字，不做距离判定
+        j = judge("张军", "某某大学计算机学院师资队伍", self.P_ORG_ONLY,
+                  body="张军 某某大学计算机学院")
+        self.assertEqual(j.tier, TIER_LIKELY)
+
+    def test_title_hit_ignores_distance(self) -> None:
+        # 标题里姓名与机构同现 = 页面主旨的宣告，正文里机构再远也认
+        filler = "这里是与议题无关的正文内容，仅用于拉开距离。" * 15
+        j = judge("张军-某某大学计算机学院", "简介", self.P_ORG_ONLY,
+                  body="张军长期从事故障诊断研究。" + filler)
+        self.assertEqual(j.orgs, ("某某大学计算机学院",))
+        self.assertEqual(j.tier, TIER_LIKELY)
+
+    def test_name_only_in_body_is_attributable(self) -> None:
+        # 摘要被截断、姓名只出现在正文里：仍然算"这个人出现在页面上"
+        body = "某某大学计算机学院教授张军" + "长期从事故障诊断与容错计算研究。" * 8
+        j = judge("学术报告通知", "详见正文", P, body=body)
+        self.assertTrue(j.name_present)
+        self.assertEqual(j.orgs, ("某某大学计算机学院",))
+
+    def test_primary_org_prefers_nearest(self) -> None:
+        # 两个机构都命中：正文里与姓名更近的那个当主机构
+        p2 = parse_person("张军", ["某某大学计算机学院", "某某研究院"], ["网络安全"], [])
+        body = ("张军教授，某某研究院首席科学家，长期从事网络安全研究。" + "x" * 120
+                + "本页由某某大学计算机学院网站技术支持。")
+        j = judge("张军 简介", "", p2, body=body)
+        self.assertEqual(j.primary_org, "某某研究院")
+
+    def test_body_weak_anchor_counts(self) -> None:
+        # 弱锚点可以在正文里找到（摘要只有一句话时靠正文补证据）
+        body = "某某大学计算机学院教授张军" + "，" + "主要研究网络安全。" * 10
+        j = judge("教师简介", "详情", P, body=body)
+        self.assertEqual(j.tier, TIER_CONFIRMED)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

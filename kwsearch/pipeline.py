@@ -1537,8 +1537,13 @@ def _run_task_body(
                 o for o, d in org_domains.items()
                 if d and d == registered_domain(domain or host_of(doc.url_raw))
             )
+            # 正文全文只活在 enriched 里（不落库）。把它交给 judge 做邻近约束：
+            # 页脚版权/导航里的校名离姓名几百字，不该把人抬进「很可能」。
+            # 低置信正文（整页兜底）不用 —— 那本来就是导航混正文。
+            ent = enriched.get(doc.url_canon or doc.url_raw) if enriched else None
+            body = ent.text if (ent is not None and ent.confidence != "low") else ""
             person_items.append((doc, judge(doc.title, doc.summary, person,
-                                            domain_orgs=dom_orgs)))
+                                            domain_orgs=dom_orgs, body=body)))
         per_domain[domain] = per_domain.get(domain, 0) + 1
         result.kept += 1
 
