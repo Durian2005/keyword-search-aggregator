@@ -1,0 +1,24 @@
+# ============================================================
+#  kwsearch · 运行时依赖锁定（由 pip freeze 生成）
+#
+#  用途：复现「测试全绿」的那套版本。requirements.txt 里的 >= 放开下限，
+#  但 curl_cffi 这类带 TLS 指纹的库一旦改参数，7 个通道的伪装会一起失效 ——
+#  升级依赖时必须先在本地跑完 766 个测试再更新本文件。
+#
+#  重新生成：
+#    pip freeze | grep -v keyword-search-aggregator | grep -v '^-e' > requirements.lock
+#  （务必确认输出里没有本机绝对路径；editable 安装行必须剔除）
+#
+#  注意：本文件只锁**运行时**依赖。开发工具（ruff）见 pyproject.toml 的 dev extra。
+# ============================================================
+anyio==4.15.1
+certifi==2026.10.19
+cffi==2.1.1
+curl_cffi==0.16.3
+h11==0.16.0
+httpcore==1.0.9
+httpx==0.28.1
+idna==3.20
+pycparser==3.11
+PyYAML==6.0.3
+typing_extensions==4.16.0

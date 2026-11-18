@@ -39,6 +39,8 @@ dynamic = ["version"]
 [project.optional-dependencies]
 # 隐身抓取档：可过 Cloudflare Turnstile 挑战。装完还要跑 `scrapling install`。
 scrapling = ["scrapling[fetchers]>=0.3"]
+# 开发/CI 工具：ruff 同时承担 lint 与 CI 门禁
+dev = ["ruff>=0.7"]
 
 [project.scripts]
 kwsearch = "kwsearch.__main__:main"
