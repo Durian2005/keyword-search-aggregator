@@ -64,6 +64,10 @@ def connect(db_path: str | Path) -> sqlite3.Connection:
     # 报 "database is locked"。等 5 秒再失败，本地单人工具足够宽容，
     # 又不至于把一个真死锁挂成无限等待。
     conn.execute("PRAGMA busy_timeout = 5000")
+    # WAL：交互页面的任务线程写库时，HTTP 线程读库不再被排他锁挡住
+    # （默认 rollback journal 下读写互斥，页面轮询会间歇性卡顿）。
+    # 内存库（:memory:，测试用）不支持 WAL，PRAGMA 会静默保持原模式，不报错。
+    conn.execute("PRAGMA journal_mode = WAL")
     return conn
 
 
