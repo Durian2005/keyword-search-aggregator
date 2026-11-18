@@ -11,18 +11,18 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from kwsearch.config import ChannelConfig, PagingConfig  # noqa: E402
-from kwsearch.discover import get_channel, get_parser  # noqa: E402
-from kwsearch.discover.base import ChannelContext  # noqa: E402
-from kwsearch.discover.sogou_weixin import (  # noqa: E402
+from kwsearch.config import ChannelConfig, PagingConfig
+from kwsearch.discover import get_channel, get_parser
+from kwsearch.discover.base import ChannelContext
+from kwsearch.discover.sogou_weixin import (
     _RESOLVE_CACHE,
     ResolvePolicy,
     join_relay_fragments,
     parse_serp,
     resolve_candidates,
 )
-from kwsearch.fetch import FetchResult, RetryPolicy  # noqa: E402
-from kwsearch.models import Candidate  # noqa: E402
+from kwsearch.fetch import FetchResult, RetryPolicy
+from kwsearch.models import Candidate
 
 
 def _article(n: int, title: str, snippet: str, account: str,

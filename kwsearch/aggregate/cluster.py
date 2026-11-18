@@ -41,8 +41,8 @@ import hashlib
 import math
 import re
 import unicodedata
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
-from typing import Iterable, Sequence
 
 # 这些 time_source 的 published_at 不参与"谁更早"的排序：
 #   regex_updated  站点构建时间（VitePress/Hugo 页脚"最近更新"，全站同一个值）

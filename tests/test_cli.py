@@ -15,9 +15,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from kwsearch.__main__ import main  # noqa: E402
-from kwsearch.models import Doc, Mention  # noqa: E402
-from kwsearch.storage import Repository, init_db  # noqa: E402
+from kwsearch.__main__ import main
+from kwsearch.models import Doc, Mention
+from kwsearch.storage import Repository, init_db
 
 _DRY_CFG = """
 version: 1
@@ -113,7 +113,7 @@ class TestPageCommand(CliCase):
         class _Fake:
             name = "fake"
 
-            def fetch(self, url, headers, timeout=20):  # noqa: ANN001
+            def fetch(self, url, headers, timeout=20):
                 item = mapping.get(url)
                 if item is None:
                     raise AssertionError(f"未准备的 URL: {url}")

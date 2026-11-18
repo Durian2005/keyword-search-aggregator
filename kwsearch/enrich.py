@@ -20,9 +20,8 @@
 from __future__ import annotations
 
 import time
-from collections.abc import Collection, Sequence
+from collections.abc import Callable, Collection, Sequence
 from dataclasses import dataclass, field
-from typing import Callable
 
 from kwsearch.aggregate.cluster import DEFAULT_MIN_BODY, simhash64
 from kwsearch.config import AppConfig
@@ -222,7 +221,7 @@ def enrich(
                 # 不传 fetched_at：schema 明确要求 fallback 时 published_at 必须为 NULL。
                 # 抓取时间在 doc.first_seen 里已经有了，塞进 published_at 只会污染时间线。
             )
-        except Exception as e:  # noqa: BLE001 —— 抽取器坏在一条页面上不该炸掉整批
+        except Exception as e:
             report.failed[F_EXTRACT] = report.failed.get(F_EXTRACT, 0) + 1
             say(f"  ! 抽取失败 {page.host}: {type(e).__name__}: {e}")
             continue

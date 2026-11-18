@@ -5,8 +5,8 @@ CLI 部分复用 test_cli.py 的 CliCase 模式（重定向 stdout/stderr 调 ma
 """
 from __future__ import annotations
 
-import io
 import contextlib
+import io
 import sys
 import tempfile
 import unittest
@@ -14,9 +14,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from kwsearch.__main__ import main  # noqa: E402
-from kwsearch.models import Doc, Mention  # noqa: E402
-from kwsearch.storage import (  # noqa: E402
+from kwsearch.__main__ import main
+from kwsearch.models import Doc, Mention
+from kwsearch.storage import (
     Repository,
     connect,
     init_db,

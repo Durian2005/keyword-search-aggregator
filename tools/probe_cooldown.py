@@ -33,8 +33,8 @@ ROOT = Path(__file__).resolve().parent.parent   # tools/ 的上一层才是项�
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from kwsearch.config import load_config          # noqa: E402
-from kwsearch.fetch import build_fetcher, default_headers  # noqa: E402
+from kwsearch.config import load_config
+from kwsearch.fetch import build_fetcher, default_headers
 
 TZ = timezone(timedelta(hours=8))
 
@@ -65,7 +65,7 @@ def judge(cid: str, res) -> tuple[str, dict]:
     if cid == "bilibili_search":
         try:
             d = json.loads(body)
-        except Exception:  # noqa: BLE001
+        except Exception:
             info["kind"] = "unknown_format"
             return "unparsed", info
         code = d.get("code")
@@ -112,7 +112,7 @@ def main() -> int:
         t0 = time.time()
         try:
             res = fetcher.fetch(url, headers, timeout=int(cfg.defaults.get("timeout", 20)))
-        except Exception as e:  # noqa: BLE001 —— 网络异常也要留痕，否则"没数据"会被误读
+        except Exception as e:
             print(f"[{i}] 请求异常 {type(e).__name__}: {e}")
             fetcher.close()
             return 2

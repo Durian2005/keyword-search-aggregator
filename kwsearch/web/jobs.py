@@ -20,8 +20,8 @@ import re
 import threading
 import time
 import uuid
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Callable, Mapping, Sequence
 
 # Windows 文件名保留字符 + 路径分隔符：关键词会变成 report/<关键词>/ 的目录名，
 # 这些字符要么建不出目录（<>:"|?*），要么直接穿越（/ \）。
@@ -50,7 +50,7 @@ class RunPayload:
     expand: int | None = None
 
     @classmethod
-    def from_mapping(cls, data: Mapping[str, object]) -> "RunPayload":
+    def from_mapping(cls, data: Mapping[str, object]) -> RunPayload:
         """解析 /api/run 的 JSON body。任何不合法都抛 ValueError（→ HTTP 400）。"""
         if not isinstance(data, Mapping):
             raise ValueError("请求体必须是 JSON 对象")
@@ -185,7 +185,7 @@ class JobRegistry:
         try:
             job.report_url = self._runner(payload, log)
             job.status = "done"
-        except BaseException as e:  # noqa: BLE001 —— 后台线程里任何异常都要变成 error 状态
+        except BaseException as e:
             # KeyboardInterrupt 也走这里：Ctrl+C 打在主线程上，但 runner 里若被
             # 打断同样要留下痕迹，不能让人看到一个永远 running 的作业。
             job.error = f"{type(e).__name__}: {e}"

@@ -27,9 +27,9 @@
 """
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Mapping
 
 COOLDOWN_BASE_H = 6.0          # 首次被拦冷却
 COOLDOWN_FACTOR = 2.0          # 连续被拦的倍数
@@ -119,7 +119,7 @@ def classify_block(kind: str | None) -> str:
     return "cooldown" if k in BLOCK_COOLDOWN else "neutral"
 
 
-def cooldown_hours(streak: int, policy: "CooldownPolicy | None" = None) -> float:
+def cooldown_hours(streak: int, policy: CooldownPolicy | None = None) -> float:
     """连续被拦 streak 次之后的冷却时长。streak<=0 表示不冷却。
 
     1 → 6h  2 → 12h  3 → 24h  4+ → 24h（封顶）
@@ -269,7 +269,7 @@ def needs_probe(h: ChannelHealth, now: datetime,
     if not policy.probe.enabled or h.block_streak <= 0:
         return False
     ok, blk = parse_iso(h.last_ok_at), parse_iso(h.last_block_at)
-    if ok and blk and ok >= blk:
+    if ok and blk and ok >= blk:  # noqa: SIM103 —— 恢复晚于被拦才算可信，显式写清时序语义
         return False
     return True
 

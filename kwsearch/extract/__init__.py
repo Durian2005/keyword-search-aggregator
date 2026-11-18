@@ -28,7 +28,7 @@ from kwsearch.extract.body import (
     extract_title,
 )
 from kwsearch.extract.dates import DateResult, normalize_date, pick_date
-from kwsearch.fetch.page import (  # noqa: F401 —— 再导出，保持调用方名字稳定
+from kwsearch.fetch.page import (
     ChallengeVerdict,
     is_challenge,
     page_text,
@@ -43,7 +43,7 @@ def extract_doc(
     url_canon: str,
     html: str,
     content_type: str = "",
-    cfg=None,  # noqa: ANN001 —— AppConfig 或 extract 段的 dict，两种都接受
+    cfg=None,
     *,
     url_raw: str = "",
     channel: str = "",

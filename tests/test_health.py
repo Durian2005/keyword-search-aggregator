@@ -8,8 +8,8 @@
 """
 from __future__ import annotations
 
-import io
 import contextlib
+import io
 import sys
 import tempfile
 import unittest
@@ -18,8 +18,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from kwsearch.__main__ import main  # noqa: E402
-from kwsearch.health import (  # noqa: E402
+from kwsearch.__main__ import main
+from kwsearch.health import (
     COOLDOWN_BASE_H,
     COOLDOWN_FACTOR,
     COOLDOWN_MAX_H,
@@ -39,7 +39,7 @@ from kwsearch.health import (  # noqa: E402
     parse_iso,
     plan,
 )
-from kwsearch.storage import (  # noqa: E402
+from kwsearch.storage import (
     KEEP_ON_WIPE,
     Repository,
     init_db,

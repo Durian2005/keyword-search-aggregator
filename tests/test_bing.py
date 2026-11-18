@@ -16,16 +16,16 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from kwsearch.config import load_config  # noqa: E402
-from kwsearch.discover.base import ChannelContext, check_assertions  # noqa: E402
-from kwsearch.aggregate import host_of  # noqa: E402
-from kwsearch.discover.bing import (  # noqa: E402
+from kwsearch.aggregate import host_of
+from kwsearch.config import load_config
+from kwsearch.discover.base import check_assertions
+from kwsearch.discover.bing import (
     absolute,
     parse_date_hint,
     parse_serp,
     unwrap_redirect,
 )
-from kwsearch.models import Candidate, ChannelResult  # noqa: E402
+from kwsearch.models import Candidate, ChannelResult
 
 _HREF = "https://example.com/p/1"
 

@@ -16,9 +16,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from kwsearch.discover.bilibili import PAGE_SIZE, parse_result  # noqa: E402
-from kwsearch.discover.gdelt import parse_articles, parse_seendate  # noqa: E402
-from kwsearch.htmlx import strip_tags  # noqa: E402
+from kwsearch.discover.bilibili import PAGE_SIZE, parse_result
+from kwsearch.discover.gdelt import parse_articles, parse_seendate
+from kwsearch.htmlx import strip_tags
 
 GDELT_BODY = json.dumps({
     "articles": [

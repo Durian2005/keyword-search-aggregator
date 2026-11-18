@@ -20,9 +20,9 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
-from typing import Iterator, Sequence
 
 from kwsearch.htmlx import Node, find_all, parse_html
 
@@ -266,7 +266,7 @@ def pick_date(
             if serp_hint and (norm := normalize_date(serp_hint)):
                 return DateResult(norm, "serp", serp_hint)
 
-        elif src == "fallback":
+        elif src == "fallback":  # noqa: SIM102 —— 各 src 分支同构对齐，合并会破坏对称
             if fetched_at:
                 return DateResult(normalize_date(fetched_at) or fetched_at, "fallback", fetched_at)
 

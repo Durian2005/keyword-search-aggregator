@@ -31,9 +31,9 @@ import hashlib
 import logging
 import re
 import time
-from dataclasses import dataclass, field
+from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Callable
 from urllib.parse import urljoin
 
 from kwsearch.discover import register
@@ -151,7 +151,7 @@ class ResolvePolicy:
     stop_after_fail: int = 2  # 连续失败几条就收手
 
     @classmethod
-    def from_mapping(cls, raw: dict | None) -> "ResolvePolicy":
+    def from_mapping(cls, raw: dict | None) -> ResolvePolicy:
         raw = raw or {}
         return cls(
             enabled=bool(raw.get("enabled", False)),
@@ -277,7 +277,7 @@ def _resolve_one(fetcher: BaseFetcher, relay_url: str,
     """解一条。任何异常都算失败 —— 解链是"锦上添花"，不该让整页结果作废。"""
     try:
         res = fetcher.fetch(relay_url, headers, timeout)
-    except Exception as e:  # noqa: BLE001 —— 含 FetchError / 连接错误
+    except Exception as e:
         logger.debug("搜狗中转链解链异常 %s: %s", relay_url[:80], e)
         return None
     if res.status != 200:

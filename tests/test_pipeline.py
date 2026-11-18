@@ -16,13 +16,13 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from kwsearch import discover  # noqa: E402
-from kwsearch.config import load_config  # noqa: E402
-from kwsearch.fetch import BaseFetcher, FetchError, FetchResult  # noqa: E402
-from kwsearch.models import Candidate, ChannelResult  # noqa: E402
-from kwsearch.person import parse_person  # noqa: E402
-from kwsearch.pipeline import run_task  # noqa: E402
-from kwsearch.storage import Repository, connect, init_db  # noqa: E402
+from kwsearch import discover
+from kwsearch.config import load_config
+from kwsearch.fetch import BaseFetcher, FetchError, FetchResult
+from kwsearch.models import Candidate, ChannelResult
+from kwsearch.person import parse_person
+from kwsearch.pipeline import run_task
+from kwsearch.storage import Repository, connect, init_db
 
 # --------------------------------------------------------------- 假通道
 
@@ -50,23 +50,23 @@ def _mk(items, channel: str, keyword: str) -> ChannelResult:
                          raw_count=len(cands))
 
 
-def fake_serp(keyword: str, offset: int, ctx) -> ChannelResult:  # noqa: ANN001
+def fake_serp(keyword: str, offset: int, ctx) -> ChannelResult:
     """基词返回 5 条；变体只返回前 2 条（模拟"变体拿不到新东西"）。"""
     items = _SERP_ITEMS if keyword.strip() == "红黑树" else _SERP_ITEMS[:2]
     return _mk(items, "fake_serp", keyword)
 
 
-def fake_blocked(keyword: str, offset: int, ctx) -> ChannelResult:  # noqa: ANN001
+def fake_blocked(keyword: str, offset: int, ctx) -> ChannelResult:
     return ChannelResult(channel="fake_blocked", query=keyword, candidates=[],
                          blocked=True, block_kind="rate_limit", detail="fake 412")
 
 
-def fake_paged(keyword: str, offset: int, ctx) -> ChannelResult:  # noqa: ANN001
+def fake_paged(keyword: str, offset: int, ctx) -> ChannelResult:
     """每页都返回同一批 —— 用来验证"翻页退化自动停"。"""
     return _mk(_SERP_ITEMS[:3], "fake_paged", keyword)
 
 
-def fake_zero(keyword: str, offset: int, ctx) -> ChannelResult:  # noqa: ANN001
+def fake_zero(keyword: str, offset: int, ctx) -> ChannelResult:
     """站点检索的兜底推荐：有一条标题摘要都不含关键词。"""
     return _mk([
         ("https://z.example.com/1", "红黑树 教程", "红黑树入门", "z.example.com"),
@@ -74,7 +74,7 @@ def fake_zero(keyword: str, offset: int, ctx) -> ChannelResult:  # noqa: ANN001
     ], "fake_zero", keyword)
 
 
-def fake_compound(keyword: str, offset: int, ctx) -> ChannelResult:  # noqa: ANN001
+def fake_compound(keyword: str, offset: int, ctx) -> ChannelResult:
     """复合词场景：标题只出现词元（降准），不出现整串（央行降准）。
 
     2026-10-18 实测回归：零命中丢弃若用 relate 的整串口径，
@@ -86,7 +86,7 @@ def fake_compound(keyword: str, offset: int, ctx) -> ChannelResult:  # noqa: ANN
     ], "fake_compound", keyword)
 
 
-def fake_single(keyword: str, offset: int, ctx) -> ChannelResult:  # noqa: ANN001
+def fake_single(keyword: str, offset: int, ctx) -> ChannelResult:
     """单次配额通道（channels.yaml 里 variants: false）：只该收到基词一次。"""
     return _mk(_SERP_ITEMS[:2], "fake_single", keyword)
 
@@ -97,7 +97,7 @@ def fake_single(keyword: str, offset: int, ctx) -> ChannelResult:  # noqa: ANN00
 _SITE_CALLS = {"n": 0}
 
 
-def fake_site_multi(keyword: str, offset: int, ctx) -> ChannelResult:  # noqa: ANN001
+def fake_site_multi(keyword: str, offset: int, ctx) -> ChannelResult:
     """站内检索：基词翻满页、变体各只打第一页 —— 每次调用返回一条互不重复的条目。"""
     _SITE_CALLS["n"] += 1
     n = _SITE_CALLS["n"]
@@ -107,7 +107,7 @@ def fake_site_multi(keyword: str, offset: int, ctx) -> ChannelResult:  # noqa: A
     ], "fake_site_multi", keyword)
 
 
-def fake_site_relaxed(keyword: str, offset: int, ctx) -> ChannelResult:  # noqa: ANN001
+def fake_site_relaxed(keyword: str, offset: int, ctx) -> ChannelResult:
     """只有「红黑树 原理」这一个变体被降级，其余正常。
 
     验的是"降级只停当前变体" —— 所以必须有一个降级、一个不降级，
@@ -124,7 +124,7 @@ def fake_site_relaxed(keyword: str, offset: int, ctx) -> ChannelResult:  # noqa:
     ], "fake_site_relaxed", keyword)
 
 
-def fake_site_blocked(keyword: str, offset: int, ctx) -> ChannelResult:  # noqa: ANN001
+def fake_site_blocked(keyword: str, offset: int, ctx) -> ChannelResult:
     """基词第 2 页被拦：验"被拦全局停、连变体都不再打"。"""
     if offset >= 2:
         return ChannelResult(channel="fake_site_blocked", query=keyword, candidates=[],
@@ -146,7 +146,7 @@ discover._REGISTRY["fake_site_blocked"] = fake_site_blocked
 _ROTATE = {"n": 0}
 
 
-def fake_rotating(keyword: str, offset: int, ctx) -> ChannelResult:  # noqa: ANN001
+def fake_rotating(keyword: str, offset: int, ctx) -> ChannelResult:
     _ROTATE["n"] += 1
     tok = _ROTATE["n"]
     return ChannelResult(channel="fake_rotating", query=keyword, candidates=[
@@ -172,7 +172,7 @@ discover._REGISTRY["fake_compound"] = fake_compound
 discover._REGISTRY["fake_single"] = fake_single
 
 
-def fake_person(keyword: str, offset: int, ctx) -> ChannelResult:  # noqa: ANN001
+def fake_person(keyword: str, offset: int, ctx) -> ChannelResult:
     """人名模式：三条命中不同锚点的结果 + 一条同名不同人（歌手）。"""
     return _mk([
         ("https://u1.example.edu.cn/1", "张军-甲大学计算机学院 教授 网络安全方向",
@@ -184,7 +184,7 @@ def fake_person(keyword: str, offset: int, ctx) -> ChannelResult:  # noqa: ANN00
     ], "fake_person", keyword)
 
 
-def fake_person_noname(keyword: str, offset: int, ctx) -> ChannelResult:  # noqa: ANN001
+def fake_person_noname(keyword: str, offset: int, ctx) -> ChannelResult:
     """站内检索把"机构页面"也带回来了：机构对得上，但整页没有这个人名。"""
     return _mk([
         ("https://v1.example.edu.cn/1", "张军-甲大学计算机学院 教授",
@@ -194,7 +194,7 @@ def fake_person_noname(keyword: str, offset: int, ctx) -> ChannelResult:  # noqa
     ], "fake_person_noname", keyword)
 
 
-def fake_baidu_person(keyword: str, offset: int, ctx) -> ChannelResult:  # noqa: ANN001
+def fake_baidu_person(keyword: str, offset: int, ctx) -> ChannelResult:
     """百度（单人单次配额）：人名模式下只该收到「姓名 site:域」这一发。
 
     返回的是**只有站内检索才捞得到**的目标人物深页 —— 裸姓名池里没有它
@@ -206,7 +206,7 @@ def fake_baidu_person(keyword: str, offset: int, ctx) -> ChannelResult:  # noqa:
     ], "baidu_html", keyword)
 
 
-def fake_namesake(keyword: str, offset: int, ctx) -> ChannelResult:  # noqa: ANN001
+def fake_namesake(keyword: str, offset: int, ctx) -> ChannelResult:
     """同名者：页面有姓名、没有机构锚点，域名也归不到任何机构（平台域/无关域）。"""
     return _mk([
         ("https://ent.example.com/1", "张军（歌手）_百科", "流行歌手，代表作……",
@@ -221,7 +221,7 @@ discover._REGISTRY["fake_baidu_person"] = fake_baidu_person
 discover._REGISTRY["fake_namesake"] = fake_namesake
 
 
-def fake_listpage(keyword: str, offset: int, ctx) -> ChannelResult:  # noqa: ANN001
+def fake_listpage(keyword: str, offset: int, ctx) -> ChannelResult:
     """返回一个栏目列表页 + 一条普通文章候选。
 
     列表页仿计算机学院官网同款形态（/xsjs/list38.htm），页内锚文本里
@@ -236,7 +236,7 @@ def fake_listpage(keyword: str, offset: int, ctx) -> ChannelResult:  # noqa: ANN
     ], "fake_listpage", keyword)
 
 
-def fake_listpage_dead(keyword: str, offset: int, ctx) -> ChannelResult:  # noqa: ANN001
+def fake_listpage_dead(keyword: str, offset: int, ctx) -> ChannelResult:
     """列表页摘要含关键词（所以能进池），但页内锚文本没有一个含关键词：
     这才是「解析不出文章」的场景 —— 丢弃并说明原因。"""
     return _mk([
@@ -467,7 +467,7 @@ _ROTATING_CH = """
 _RELAY = {"url": "https://weixin.sogou.com/link?url=TOK1"}
 
 
-def fake_relay_link(keyword: str, offset: int, ctx) -> ChannelResult:  # noqa: ANN001
+def fake_relay_link(keyword: str, offset: int, ctx) -> ChannelResult:
     """第一次跑给中转链，第二次跑（解链成功）给 mp 永久链接，业务键不变。"""
     return ChannelResult(channel="fake_relay_link", query=keyword, candidates=[
         Candidate(
@@ -1276,9 +1276,9 @@ class TestAbnormalExit(RunCase):
         spy = _ConnSpy(real_init(self.db))          # 顺手把表建好，再包一层
         P.init_db = lambda _path: spy
         try:
-            with mock.patch.object(P, "Sanitizer", side_effect=exc):
-                with self.assertRaises(type(exc)):
-                    self.run_kw(self.cfg(_SERP_CH))
+            with mock.patch.object(P, "Sanitizer", side_effect=exc), \
+                    self.assertRaises(type(exc)):
+                self.run_kw(self.cfg(_SERP_CH))
         finally:
             P.init_db = real_init
         return spy
@@ -1349,7 +1349,7 @@ class TestAbnormalExit(RunCase):
         self.assertIsNotNone(row["finished_at"])
 
 
-def fake_network(keyword: str, offset: int, ctx) -> ChannelResult:  # noqa: ANN001
+def fake_network(keyword: str, offset: int, ctx) -> ChannelResult:
     """网络不可达（gdelt 在本机就是这种）：blocked=True，但 kind=network。
 
     这条用例守的是一个真实踩坑点：如果把 network 也计入"连续被拦"，

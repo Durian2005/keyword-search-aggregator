@@ -16,7 +16,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from kwsearch.aggregate.cluster import (  # noqa: E402
+from kwsearch.aggregate.cluster import (
     ClusterInput,
     cluster_docs,
     from_signed64,
@@ -297,7 +297,7 @@ class TestClusterStorage(unittest.TestCase):
         self.conn.close()
         self.tmp.cleanup()
 
-    def repo(self):  # noqa: ANN201
+    def repo(self):
         from kwsearch.storage import Repository
 
         return Repository(self.conn)
@@ -462,7 +462,7 @@ class _FakeFetcher:
         self.pages = pages
         self.calls: list[str] = []
 
-    def fetch(self, url: str, headers: dict[str, str], timeout: int = 20):  # noqa: ANN201
+    def fetch(self, url: str, headers: dict[str, str], timeout: int = 20):
         v = self.pages.get(url)
         self.calls.append(url)
         if v is None:
@@ -473,7 +473,7 @@ class _FakeFetcher:
                          final_url=url, content_bytes=len(raw), fetcher=self.name)
 
 
-def fake_serp_cluster(keyword: str, offset: int, ctx):  # noqa: ANN001
+def fake_serp_cluster(keyword: str, offset: int, ctx):
     from kwsearch.models import Candidate, ChannelResult
 
     cands = [
@@ -539,7 +539,7 @@ class TestPipelineWiring(unittest.TestCase):
     def tearDown(self) -> None:
         self.tmp.cleanup()
 
-    def run_pipe(self, enabled: str = "true", *, tail: str = ""):  # noqa: ANN201
+    def run_pipe(self, enabled: str = "true", *, tail: str = ""):
         from kwsearch.config import load_config
         from kwsearch.pipeline import run_task
 

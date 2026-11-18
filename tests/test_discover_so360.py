@@ -17,8 +17,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from kwsearch.discover import get_channel  # noqa: E402
-from kwsearch.discover.so360 import parse_serp  # noqa: E402
+from kwsearch.discover import get_channel
+from kwsearch.discover.so360 import parse_serp
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 

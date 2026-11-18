@@ -21,13 +21,13 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from kwsearch.web.jobs import (  # noqa: E402
+from kwsearch.web.jobs import (
     MAX_LOG_LINES,
     JobRegistry,
     RunPayload,
     format_result_lines,
 )
-from kwsearch.web.server import WebContext, _safe_static, build_handler  # noqa: E402
+from kwsearch.web.server import WebContext, _safe_static, build_handler
 
 _CFG = """
 version: 1

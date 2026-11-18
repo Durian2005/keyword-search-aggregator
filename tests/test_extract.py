@@ -11,7 +11,6 @@ import unittest
 
 from kwsearch.extract import extract_doc
 from kwsearch.extract.body import (
-    Article,
     best_container,
     collect_text,
     core_chars,
@@ -21,7 +20,6 @@ from kwsearch.extract.body import (
     trim_boilerplate,
 )
 from kwsearch.extract.dates import (
-    DateResult,
     context_kind,
     jsonld_dates,
     meta_dates,
@@ -31,7 +29,6 @@ from kwsearch.extract.dates import (
     regex_dates_tagged,
 )
 from kwsearch.htmlx import parse_html
-
 
 # ---------------------------------------------------------------------------
 #  样本

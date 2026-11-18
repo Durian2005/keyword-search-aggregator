@@ -13,13 +13,13 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from kwsearch.reuse import (  # noqa: E402
+from kwsearch.reuse import (
     MIN_DOCS,
     TTL_HOURS,
     ReusePolicy,
     find_reusable,
 )
-from kwsearch.storage import Repository, init_db  # noqa: E402
+from kwsearch.storage import Repository, init_db
 
 NOW = datetime(2026, 11, 1, 9, 0, tzinfo=timezone(timedelta(hours=8)))
 

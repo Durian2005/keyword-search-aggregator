@@ -14,8 +14,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from kwsearch.extract.listpage import article_links  # noqa: E402
-from kwsearch.sanitize import is_list_url  # noqa: E402
+from kwsearch.extract.listpage import article_links
+from kwsearch.sanitize import is_list_url
 
 # 栏目列表页样本：结构仿计算机学院官网（/xsjs/list38.htm 同款形态）——
 # 相对链接、日期路径、两条锚文本含关键词、一条不含、一条链向另一个列表页。

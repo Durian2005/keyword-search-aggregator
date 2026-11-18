@@ -16,9 +16,10 @@ import json
 import logging
 import sqlite3
 import uuid
+from collections.abc import Iterable
 from datetime import timedelta
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 from kwsearch.aggregate import from_signed64, host_of, to_signed64
 from kwsearch.aggregate.cluster import DEFAULT_MIN_BODY
@@ -166,7 +167,7 @@ class _WipeMixin:
             for t in _WIPE_ORDER:
                 self.conn.execute(f"DELETE FROM {t}")
             # sqlite_sequence 是 SQLite 内部表，只在有 AUTOINCREMENT 列时才存在
-            try:
+            try:  # noqa: SIM105 —— 无 AUTOINCREMENT 列时该表不存在，属预期
                 self.conn.execute("DELETE FROM sqlite_sequence")
             except sqlite3.OperationalError:
                 pass

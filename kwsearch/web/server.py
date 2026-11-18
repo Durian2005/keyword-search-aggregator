@@ -20,10 +20,10 @@ import json
 import re
 import urllib.parse
 import webbrowser
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Callable, Mapping
 
 from kwsearch import __version__
 from kwsearch.web.jobs import JobRegistry, RunPayload, format_result_lines
@@ -218,7 +218,7 @@ def build_handler(ctx: WebContext) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
         server_version = f"kwsearch-web/{__version__}"
 
-        def log_message(self, format: str, *args: object) -> None:  # noqa: A002
+        def log_message(self, format: str, *args: object) -> None:
             pass  # 默认实现会把每个请求甩到 stderr，和爬虫日志混在一起
 
         # ---- 基础回复 ----
@@ -240,7 +240,7 @@ def build_handler(ctx: WebContext) -> type[BaseHTTPRequestHandler]:
             self._json({"error": msg}, 404)
 
         # ---- 路由 ----
-        def do_GET(self) -> None:  # noqa: N802
+        def do_GET(self) -> None:
             path = urllib.parse.unquote(self.path.split("?", 1)[0])
             try:
                 if path in ("/", "/index.html"):
@@ -256,10 +256,10 @@ def build_handler(ctx: WebContext) -> type[BaseHTTPRequestHandler]:
                 self._not_found()
             except (BrokenPipeError, ConnectionResetError):
                 pass  # 用户关页面 / 中断轮询，不是错误
-            except Exception as e:  # noqa: BLE001
+            except Exception as e:
                 self._json({"error": f"{type(e).__name__}: {e}"}, 500)
 
-        def do_POST(self) -> None:  # noqa: N802
+        def do_POST(self) -> None:
             path = urllib.parse.unquote(self.path.split("?", 1)[0])
             try:
                 if path not in ("/api/run", "/api/wipe"):
@@ -283,7 +283,7 @@ def build_handler(ctx: WebContext) -> type[BaseHTTPRequestHandler]:
                 self._json(job.json(), 202)
             except (BrokenPipeError, ConnectionResetError):
                 pass
-            except Exception as e:  # noqa: BLE001
+            except Exception as e:
                 self._json({"error": f"{type(e).__name__}: {e}"}, 500)
 
         # ---- 各路由实现 ----
@@ -427,7 +427,7 @@ def serve(
     if open_browser:
         try:
             webbrowser.open(url)
-        except Exception:  # noqa: BLE001 —— 没有默认浏览器的容器里不该因此起不来
+        except Exception:
             log("（没能自动打开浏览器，请手动访问上面的地址）")
 
     try:

@@ -29,8 +29,9 @@ from __future__ import annotations
 import logging
 import time
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any
 
 from kwsearch.fetch.ca import ca_bundle_arg
 from kwsearch.fetch.stealth import (
@@ -112,11 +113,11 @@ def default_headers(defaults: dict[str, Any] | None = None) -> dict[str, str]:
     }
 
 
-def _safe_text(resp) -> str:  # noqa: ANN001
+def _safe_text(resp) -> str:
     """拿文本，编码异常时退化到带替换的解码，不让一个坏字节炸掉整条链路。"""
     try:
         return resp.text
-    except Exception:  # noqa: BLE001 —— UnicodeDecodeError / LookupError 等
+    except Exception:
         raw = getattr(resp, "content", b"") or b""
         return raw.decode("utf-8", errors="replace")
 
@@ -128,7 +129,7 @@ class BaseFetcher(ABC):
     def fetch(self, url: str, headers: dict[str, str], timeout: int = 20) -> FetchResult:
         raise NotImplementedError
 
-    def close(self) -> None:
+    def close(self) -> None:  # noqa: B027 —— 子类可选实现，默认无操作是契约的一部分
         """释放抓取器持有的资源（浏览器会话等）。默认无操作。
 
         fetch_pages 批末统一调用 —— 加默认实现而不是 getattr 探测，
@@ -136,7 +137,7 @@ class BaseFetcher(ABC):
         """
 
     @property
-    def robots_fetcher(self) -> "BaseFetcher":
+    def robots_fetcher(self) -> BaseFetcher:
         """robots.txt 用哪个抓取器取。默认自己。
 
         重档（隐身浏览器）覆盖它返回轻量档：为一行 robots 规则启动一次
@@ -169,7 +170,7 @@ class CurlCffiFetcher(BaseFetcher):
         self._verify = ca_bundle_arg()
         self._session = None
 
-    def _ensure_session(self):  # noqa: ANN202 —— 返回 curl_cffi 的 Session，延迟导入
+    def _ensure_session(self):
         if self._session is None:
             self._session = self._req.Session(impersonate=self._impersonate)
         return self._session
@@ -180,7 +181,7 @@ class CurlCffiFetcher(BaseFetcher):
             return
         try:
             sess.close()
-        except Exception:  # noqa: BLE001 —— 关闭失败不该影响任务收尾
+        except Exception:
             logger.debug("curl_cffi session 关闭异常", exc_info=True)
 
     def fetch(self, url: str, headers: dict[str, str], timeout: int = 20) -> FetchResult:

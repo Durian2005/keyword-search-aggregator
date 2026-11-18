@@ -17,8 +17,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from kwsearch.discover.bing import parse_serp  # noqa: E402
-from kwsearch.discover.quality import (  # noqa: E402
+from kwsearch.discover.bing import parse_serp
+from kwsearch.discover.quality import (
     bigrams,
     check_boilerplate,
     check_relaxed,
@@ -26,8 +26,8 @@ from kwsearch.discover.quality import (  # noqa: E402
     needles_of,
     query_segments,
 )
-from kwsearch.models import Candidate  # noqa: E402
-from kwsearch.pipeline import _screen_single_page, _term_pattern  # noqa: E402
+from kwsearch.models import Candidate
+from kwsearch.pipeline import _screen_single_page, _term_pattern
 
 # --------------------------------------------------------------- 真实样本
 

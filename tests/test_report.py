@@ -14,14 +14,14 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from kwsearch.report import (  # noqa: E402
+from kwsearch.report import (
     _health_section,
     health_view,
     render,
     render_html,
     safe_dirname,
 )
-from kwsearch.storage import Repository, init_db  # noqa: E402
+from kwsearch.storage import Repository, init_db
 
 
 def _base_data() -> dict:

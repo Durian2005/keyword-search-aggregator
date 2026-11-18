@@ -17,8 +17,9 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from typing import Callable, Pattern, Sequence
+from re import Pattern
 
 from kwsearch.aggregate import canonicalize, host_of
 from kwsearch.discover.base import ChannelContext

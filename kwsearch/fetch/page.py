@@ -19,24 +19,24 @@ from __future__ import annotations
 import logging
 import re
 import time
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from typing import Callable, Sequence
 from urllib.parse import urlsplit
 
 from kwsearch.config import AppConfig
-from kwsearch.fetch.encoding import decode_html
-from kwsearch.fetch.robots import (
-    RobotsCache,
-    RobotsVerdict,
-    resolve_on_failure,
-    resolve_robots_mode,
-)
 from kwsearch.fetch import (
     BaseFetcher,
     FetchError,
     RetryPolicy,
     default_headers,
     fetch_with_retry,
+)
+from kwsearch.fetch.encoding import decode_html
+from kwsearch.fetch.robots import (
+    RobotsCache,
+    RobotsVerdict,
+    resolve_on_failure,
+    resolve_robots_mode,
 )
 from kwsearch.htmlx import normalize, parse_html, strip_tags
 from kwsearch.sanitize import DEFAULT_BLOCK_HOST_SUFFIXES, is_blocked_host
@@ -380,7 +380,7 @@ def fetch_page(
         kind = classify_error(e)
         logger.debug("抓取失败 [%s] %s: %s", kind, url, e)
         return done(kind, str(e))
-    except Exception as e:  # noqa: BLE001 —— 单条链接的意外不该炸掉整批
+    except Exception as e:
         logger.warning("抓取异常 %s: %s", url, e)
         return done(F_CONN, str(e))
 
@@ -566,7 +566,7 @@ def fetch_pages(
     if callable(closer):
         try:
             closer()
-        except Exception as e:  # noqa: BLE001 —— 收尾失败不该抹掉已经抓到的结果
+        except Exception as e:
             logger.warning("抓取器收尾失败: %s", e)
 
     # robots 统计随批带出去：调用方（enrich / CLI / 报告）不接触缓存对象本身

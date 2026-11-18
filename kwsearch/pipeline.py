@@ -28,9 +28,9 @@ from __future__ import annotations
 
 import re
 import time
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Callable, Sequence
 
 from kwsearch.aggregate import canonicalize, host_of, relate
 from kwsearch.aggregate.cluster import (
@@ -49,11 +49,10 @@ from kwsearch.discover.base import (
     page_signature,
 )
 from kwsearch.discover.quality import keep_related, needles_of
-from kwsearch.enrich import EnrichReport, Enriched, enrich
+from kwsearch.enrich import Enriched, EnrichReport, enrich
 from kwsearch.expand import expand_channel
 from kwsearch.extract.listpage import article_links
-from kwsearch.fetch import FetchError
-from kwsearch.fetch import build_fetcher, default_headers
+from kwsearch.fetch import FetchError, build_fetcher, default_headers
 from kwsearch.fetch.page import HostThrottle, PagePolicy, fetch_pages
 from kwsearch.fetch.robots import resolve_on_failure, resolve_robots_mode
 from kwsearch.health import (
@@ -64,7 +63,6 @@ from kwsearch.health import (
     classify_block,
     plan,
 )
-from kwsearch.reuse import ReusePolicy, find_reusable
 from kwsearch.models import Candidate, ChannelResult, Doc, Mention
 from kwsearch.person import (
     TIER_CN,
@@ -74,11 +72,11 @@ from kwsearch.person import (
     build_cards,
     judge,
     org_search_domains,
-    person_site_queries,
     registered_domain,
     summarize,
 )
 from kwsearch.query import QueryVariant, expand_queries, probe_profile
+from kwsearch.reuse import ReusePolicy, find_reusable
 from kwsearch.sanitize import Sanitizer, is_blocked_host, is_list_url
 from kwsearch.storage import Repository, init_db
 
@@ -229,7 +227,7 @@ def _is_dead_relay(url: str) -> bool:
     return "weixin.sogou.com/link?url=" in (url or "")
 
 
-def _term_pattern(keyword: str) -> "re.Pattern[str] | None":
+def _term_pattern(keyword: str) -> re.Pattern[str] | None:
     """关键词过滤用的正则：**词元 OR**，不是整串包含。
 
     为什么不能整串：多词查询的整串（"红黑树 左旋 右旋"）永远不可能出现在任何
@@ -592,7 +590,7 @@ def _enrich_stage(
     say: Progress,
     sleep: Callable[[float], None],
     deadline: float,
-    fetcher=None,  # noqa: ANN001 —— 只在测试里注入假实现，生产走 build_fetcher
+    fetcher=None,
     fetch_body: bool | None = None,
     stealth: bool | dict | None = None,
     robots_mode: str | None = None,
@@ -647,7 +645,7 @@ def _enrich_stage(
             robots_mode=robots_mode,
             robots_on_failure=robots_on_failure,
         )
-    except Exception as e:                                   # noqa: BLE001
+    except Exception as e:
         # 抓正文整体起不来（网络全断 / fetcher 装不上）不该让任务失败：
         # 已经拿到的 SERP 结果仍然有价值，照常入库，只记账。
         repo.add_alert(task_id, None, "fetch_fail",
@@ -817,7 +815,7 @@ def _resolve_list_pages(
     say: Progress,
     sleep: Callable[[float], None],
     deadline: float,
-    fetcher=None,  # noqa: ANN001 —— 只在测试里注入假实现，生产走 build_fetcher
+    fetcher=None,
     fetch_body: bool | None = None,
     stealth: bool | dict | None = None,
     robots_mode: str | None = None,
@@ -865,7 +863,7 @@ def _resolve_list_pages(
             throttle=HostThrottle(qps, sleep=sleep),
             close_fetcher=own_fetcher,
         )
-    except Exception as e:                                   # noqa: BLE001
+    except Exception as e:
         # 解析起不来不该让任务失败：列表页维持原样会被 check_url 丢弃，照常出报告
         repo.add_alert(task_id, None, "fetch_fail",
                        f"列表页解析未执行：{type(e).__name__}: {e}")
@@ -917,7 +915,7 @@ def run_task(
     no_filter: bool = False,
     progress: Progress | None = None,
     sleep: Callable[[float], None] = time.sleep,
-    fetcher=None,  # noqa: ANN001 —— 单测注入假实现；生产不传，由 build_fetcher 挑
+    fetcher=None,
     fetch_body: bool | None = None,
     stealth: bool | dict | None = None,
     person: PersonQuery | None = None,
@@ -979,7 +977,7 @@ def _run_task_body(
     *,
     mode: str,
     timespan: str | None,
-    conn,                          # noqa: ANN001 —— sqlite3.Connection，不为一行注解引顶层 import
+    conn,
     repo: Repository,
     task_id: str,
     max_docs: int | None,
@@ -988,7 +986,7 @@ def _run_task_body(
     no_filter: bool,
     progress: Progress | None,
     sleep: Callable[[float], None],
-    fetcher,                       # noqa: ANN001
+    fetcher,
     fetch_body: bool | None,
     stealth: bool | dict | None,
     person: PersonQuery | None,
@@ -1183,7 +1181,7 @@ def _run_task_body(
                 _hook = None
                 if auto_probe:
                     if _probing:
-                        def _hook(cands, _inner=_plan_hook):     # noqa: ANN001
+                        def _hook(cands, _inner=_plan_hook):
                             planned = _inner(cands) if _inner else []
                             if planned:
                                 say(f"     ↳ 探针：{len(planned)} 个变体留到下次任务再打")
@@ -1223,7 +1221,7 @@ def _run_task_body(
             cands, logs = [], []
             repo.add_alert(task_id, ch.id, "blocked" if e.kind == "blocked" else "fetch_fail",
                            f"{e.kind}: {e}")
-        except Exception as e:                                   # noqa: BLE001
+        except Exception as e:
             # 通道代码有 bug 也不能拖垮整个任务：留证据、继续下一条
             run = ChannelRun(ch.id, ch.type, error=f"{type(e).__name__}: {e}")
             cands, logs = [], []
@@ -1432,7 +1430,7 @@ def _run_task_body(
     cap_per_domain = sanitizer.max_per_domain
     person_items: list[tuple[Doc, Judgment]] = []
     kept_urls: list[str] = []
-    for score, c, mention in scored:
+    for _score, c, mention in scored:
         if result.kept >= cap:
             result.truncated = True
             repo.add_alert(task_id, None, "limit_reached",
@@ -1678,11 +1676,11 @@ def _field_problems(cands: list[Candidate], ch: ChannelConfig) -> list[str]:
     """必填字段体检。不做 min_items —— 条目少可能是被 require 过滤掉了，
     那不算解析失败（解析失败由 empty_result / unknown_structure 负责）。"""
     problems: list[str] = []
-    for field in ch.assertions.required_fields:
-        attr = "url_raw" if field == "url" else field
+    for fname in ch.assertions.required_fields:
+        attr = "url_raw" if fname == "url" else fname
         missing = sum(1 for c in cands if not getattr(c, attr, None))
         if missing:
-            problems.append(f"{missing}/{len(cands)} 条缺 {field}")
+            problems.append(f"{missing}/{len(cands)} 条缺 {fname}")
     return problems
 
 

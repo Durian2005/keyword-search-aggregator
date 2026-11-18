@@ -102,5 +102,5 @@ class Channel(Protocol):
 
     id: str
 
-    def __call__(self, keyword: str, offset: int, ctx: ChannelContext) -> ChannelResult:  # noqa: ANN001
+    def __call__(self, keyword: str, offset: int, ctx: ChannelContext) -> ChannelResult:
         ...

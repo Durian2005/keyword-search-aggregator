@@ -12,7 +12,7 @@
 from __future__ import annotations
 
 import re
-from typing import Callable, Sequence
+from collections.abc import Callable, Sequence
 from urllib.parse import urldefrag, urljoin
 
 from kwsearch.htmlx import iter_nodes, parse_html, text

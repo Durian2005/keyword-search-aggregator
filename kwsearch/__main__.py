@@ -25,10 +25,14 @@ import time
 import unicodedata
 from datetime import datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from kwsearch import __version__
 from kwsearch.config import AppConfig, ConfigError, load_config
 from kwsearch.person import PersonQuery, parse_person
+
+if TYPE_CHECKING:  # 只用于类型标注（_health_row），运行时延迟导入避免拖慢 CLI
+    from kwsearch.health import HealthPolicy
 
 DB_DEFAULT = "kwsearch.db"
 
@@ -148,7 +152,7 @@ def cmd_health(cfg: AppConfig, db_path: str, *, backfill: bool = False) -> int:
     return 0
 
 
-def _health_row(cid: str, h, now: datetime,  # noqa: ANN001
+def _health_row(cid: str, h, now: datetime,
                 policy: HealthPolicy | None = None) -> list[str]:
     """一行健康度。状态列只给结论，详细措辞留在 health 模块里。"""
     from kwsearch.health import classify_block, human_delta, needs_probe
@@ -346,7 +350,7 @@ def _reuse_hit(cfg: AppConfig, keyword: str, mode: str, db_path: str,
                          now=datetime.now().astimezone(), policy=policy)
 
 
-def _print_reused(hit: dict, keyword: str, out_dir: str, want_report: bool) -> int:  # noqa: ANN001
+def _print_reused(hit: dict, keyword: str, out_dir: str, want_report: bool) -> int:
     """复用提示。刻意**不重新渲染报告**：报告目录按关键词走，重渲染会覆盖旧文件，
     而这次没有产生任何新数据 —— 覆盖只会带来风险（比如某次正文抓取失败，
     把一份好报告换成一份差的），收益为零。
@@ -363,7 +367,7 @@ def _print_reused(hit: dict, keyword: str, out_dir: str, want_report: bool) -> i
     return 0
 
 
-def _run_summary(result) -> str:  # noqa: ANN001
+def _run_summary(result) -> str:
     """把 RunResult 压成一张能扫的收尾表。"""
     rows = [
         [r.channel, r.type or "-",
@@ -718,7 +722,6 @@ def cmd_extract(
     from kwsearch.extract import extract_article, pick_date
     from kwsearch.fetch import build_fetcher, default_headers
     from kwsearch.fetch.page import PagePolicy, fetch_pages
-    from kwsearch.models import utcnow_iso
 
     targets, err = _resolve_targets(db_path, urls, task, limit)
     if err:
@@ -1090,7 +1093,7 @@ def main(argv: list[str] | None = None) -> int:
     # Windows 控制台默认可能是 GBK，中文/emoji 会在 print 时直接抛 UnicodeEncodeError。
     # 改成 utf-8 + replace，宁可显示成问号也不要整个命令崩掉。
     for stream in (sys.stdout, sys.stderr):
-        try:
+        try:  # noqa: SIM105 —— 显式列出可忽略异常，suppress 反而埋掉意图
             stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
         except (AttributeError, ValueError):
             pass

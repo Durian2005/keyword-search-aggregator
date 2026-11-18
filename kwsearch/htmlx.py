@@ -109,7 +109,7 @@ def parse_html(html: str) -> Node:
     try:
         builder.feed(html)
         builder.close()
-    except Exception:  # noqa: BLE001 —— 极端畸形页面：返回已解析的部分，好过整个任务挂掉
+    except Exception:
         pass
     return builder.root
 

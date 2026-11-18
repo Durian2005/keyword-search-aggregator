@@ -12,15 +12,15 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from kwsearch.config import load_config  # noqa: E402
-from kwsearch.fetch import FetchError, FetchResult  # noqa: E402
-from kwsearch.fetch.page import F_GOV, PagePolicy, fetch_pages  # noqa: E402
-from kwsearch.fetch.robots import (  # noqa: E402
+from kwsearch.config import load_config
+from kwsearch.fetch import FetchError, FetchResult
+from kwsearch.fetch.page import F_GOV, PagePolicy, fetch_pages
+from kwsearch.fetch.robots import (
     RobotsCache,
     resolve_on_failure,
     resolve_robots_mode,
 )
-from kwsearch.sanitize import (  # noqa: E402
+from kwsearch.sanitize import (
     DEFAULT_BLOCK_HOST_SUFFIXES,
     Sanitizer,
     is_blocked_host,

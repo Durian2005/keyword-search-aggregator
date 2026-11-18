@@ -21,9 +21,10 @@ robots 拦正文，任务几乎不可能"全绿"），所以不能拿 status == 
 """
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Any, Mapping, Sequence
+from typing import Any
 
 from kwsearch.health import human_delta, parse_iso
 from kwsearch.query import query_key

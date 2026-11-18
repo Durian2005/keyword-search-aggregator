@@ -1,0 +1,52 @@
+# ============================================================
+#  CI · 每次推送 / PR 自动跑 lint + 全量测试
+#
+#  设计说明：
+#  - 测试入口必须是 `python -m unittest discover -s tests`，不能加 `-t .`
+#    （tests/ 没有 __init__.py）。装包后 kwsearch 可直接 import，无需 PYTHONPATH。
+#  - 单测绝不发真实网络请求（fixture 驱动），CI 沙箱里可放心跑；
+#    唯一的网络行为是 test_web 自起的 127.0.0.1 本地服务，GitHub Actions 允许。
+#  - ubuntu × 4 个 Python 版本做主矩阵；windows-latest × 3.13 兜底
+#    （项目在 Windows 上开发使用，路径/编码的平台差异必须有闸）。
+# ============================================================
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install ruff
+        run: pip install ruff
+      - name: Lint
+        run: python -m ruff check kwsearch tests tools
+
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+        include:
+          - os: windows-latest
+            python-version: "3.13"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - name: Install package
+        run: pip install -e .
+      - name: Run tests
+        run: python -m unittest discover -s tests

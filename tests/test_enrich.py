@@ -16,11 +16,11 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from kwsearch import discover  # noqa: E402
-from kwsearch.config import load_config  # noqa: E402
-from kwsearch.enrich import enrich  # noqa: E402
-from kwsearch.fetch import BaseFetcher, FetchError, FetchResult  # noqa: E402
-from kwsearch.models import Candidate, ChannelResult  # noqa: E402
+from kwsearch import discover
+from kwsearch.config import load_config
+from kwsearch.enrich import enrich
+from kwsearch.fetch import BaseFetcher, FetchError, FetchResult
+from kwsearch.models import Candidate, ChannelResult
 
 
 # --------------------------------------------------------------- 假 fetcher
@@ -257,7 +257,7 @@ _ART = """<html><head><title>{title} - 站点</title></head><body>
 </body></html>"""
 
 
-def fake_serp_enrich(keyword: str, offset: int, ctx):  # noqa: ANN001
+def fake_serp_enrich(keyword: str, offset: int, ctx):
     cands = [
         Candidate(url_raw=url, title=t, snippet=s, channel="fake_serp_enrich", rank=i + 1,
                   published_hint=hint,

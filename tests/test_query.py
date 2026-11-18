@@ -12,13 +12,13 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from kwsearch.aggregate import canonicalize, host_of  # noqa: E402
-from kwsearch.config import ChannelConfig, PagingConfig  # noqa: E402
-from kwsearch.discover.base import ChannelContext  # noqa: E402
-from kwsearch.expand import domain_distribution, expand_channel  # noqa: E402
-from kwsearch.fetch import RetryPolicy  # noqa: E402
-from kwsearch.models import Candidate, ChannelResult  # noqa: E402
-from kwsearch.query import expand_queries, probe_profile, query_key  # noqa: E402
+from kwsearch.aggregate import canonicalize, host_of
+from kwsearch.config import ChannelConfig, PagingConfig
+from kwsearch.discover.base import ChannelContext
+from kwsearch.expand import domain_distribution, expand_channel
+from kwsearch.fetch import RetryPolicy
+from kwsearch.models import Candidate, ChannelResult
+from kwsearch.query import expand_queries, probe_profile, query_key
 
 SPEC = {
     "enabled": True,

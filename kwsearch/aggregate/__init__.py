@@ -38,10 +38,10 @@ from kwsearch.aggregate.cluster import (
     ClusterMember,
     ClusterReport,
     cluster_docs,
-    from_signed64,
+    from_signed64,  # noqa: F401 —— re-export，供 S5 调用方经聚合层导入
     hamming64,
     simhash64,
-    to_signed64,
+    to_signed64,  # noqa: F401 —— 同上
 )
 from kwsearch.models import Mention
 

@@ -66,7 +66,7 @@ def _res(body: str, *, status: int = 200, ct: str = "text/html; charset=utf-8",
 
 
 def _policy(**kw) -> PagePolicy:
-    base = dict(
+    base = dict(  # noqa: C408 —— 关键字形式比字面量对齐这份长参数表更易读
         timeout=5, per_domain_qps=1000, max_per_domain=99,
         min_body_chars=200, challenge_keywords=("安全验证", "请输入验证码"),
         robots_mode="off", retry=RetryPolicy(max_attempts=1),
@@ -178,26 +178,26 @@ class TestEncoding(unittest.TestCase):
         self.assertEqual(d.encoding, "gb18030")
 
     def test_header_wins_over_meta(self) -> None:
-        raw = '<html><head><meta charset="gbk"></head><body>标题</body></html>'.encode("utf-8")
+        raw = '<html><head><meta charset="gbk"></head><body>标题</body></html>'.encode()
         d = decode_html(raw, "text/html; charset=utf-8")
         self.assertTrue(d.ok)
         self.assertIn("标题", d.text)
         self.assertEqual(d.source, "header")
 
     def test_utf8_without_declaration(self) -> None:
-        raw = "<html><body>没有声明编码的中文</body></html>".encode("utf-8")
+        raw = "<html><body>没有声明编码的中文</body></html>".encode()
         d = decode_html(raw, "")
         self.assertTrue(d.ok)
         self.assertEqual(d.source, "utf-8")
 
     def test_gb18030_must_not_swallow_utf8(self) -> None:
         # utf-8 页面若能"成功"按 gb18030 解，会得到乱码却不报错 —— 顺序保证不会
-        raw = "<html><body>红黑树</body></html>".encode("utf-8")
+        raw = "<html><body>红黑树</body></html>".encode()
         d = decode_html(raw, "")
         self.assertIn("红黑树", d.text)
 
     def test_bom(self) -> None:
-        raw = b"\xef\xbb\xbf" + "<p>带 BOM</p>".encode("utf-8")
+        raw = b"\xef\xbb\xbf" + "<p>带 BOM</p>".encode()
         d = decode_html(raw, "")
         self.assertEqual(d.source, "bom")
         self.assertIn("带 BOM", d.text)

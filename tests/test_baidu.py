@@ -12,8 +12,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from kwsearch.discover import get_channel, get_parser  # noqa: E402
-from kwsearch.discover.baidu import parse_serp  # noqa: E402
+from kwsearch.discover import get_channel, get_parser
+from kwsearch.discover.baidu import parse_serp
 
 
 def _result(mu: str, tpl: str, title: str, snippet: str = "",

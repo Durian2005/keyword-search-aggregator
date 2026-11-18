@@ -63,7 +63,7 @@ class StealthConfig:
     timeout_ms: int | None = 60_000        # 单页导航超时；None = 引擎默认
 
     @classmethod
-    def from_mapping(cls, d: dict[str, Any] | None) -> "StealthConfig":
+    def from_mapping(cls, d: dict[str, Any] | None) -> StealthConfig:
         """从 channels.yaml 的 defaults.stealth 读。未知键忽略（如 enabled）。
 
         timeout_ms 语义：**缺键** = 用类默认 60000（懒配置不必写全）；
@@ -159,13 +159,13 @@ class StealthFetcher:
             if callable(closer):
                 try:
                     closer()
-                except Exception as e:  # noqa: BLE001 —— 收尾失败不影响主流程
+                except Exception as e:
                     logger.warning("关闭 robots 轻量抓取器失败: %s", e)
         if session is None:
             return
         try:
             session.close()
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             logger.warning("关闭隐身浏览器会话失败: %s", e)
 
     # -- BaseFetcher 契约 ----------------------------------------------------

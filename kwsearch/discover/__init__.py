@@ -17,7 +17,7 @@ parse 函数签名统一为（离线复跑用，不碰网络、不读配置）�
 from __future__ import annotations
 
 import importlib
-from typing import Callable
+from collections.abc import Callable
 
 from kwsearch.models import ChannelResult
 

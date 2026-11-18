@@ -29,8 +29,8 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from kwsearch.config import load_config  # noqa: E402
-from kwsearch.fetch import (  # noqa: E402
+from kwsearch.config import load_config
+from kwsearch.fetch import (
     RetryPolicy,
     build_fetcher,
     default_headers,
@@ -98,12 +98,12 @@ def main() -> int:
         url = ch.build_url(a.keyword, page)
         try:
             res = fetch_with_retry(fetcher, url, headers, policy, 20)
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             print(f"  第 {page} 页失败：{type(e).__name__}: {e}")
             continue
         html = res.body or ""
         blocks = slice_blocks(html, tag, cls)
-        kept = [b for b in (_SCRIPT_RE.sub("", x) for x in blocks)]
+        kept = [_SCRIPT_RE.sub("", x) for x in blocks]
         kept = [_STYLE_RE.sub("", x) for x in kept]
         slim = (
             "<!doctype html><html><head><meta charset=\"utf-8\">"

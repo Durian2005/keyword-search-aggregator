@@ -24,7 +24,8 @@
 from __future__ import annotations
 
 import re
-from typing import Any, Callable, Mapping
+from collections.abc import Callable, Mapping
+from typing import Any
 from urllib.parse import urlsplit
 
 # 每类 PII 的遮罩函数。保留多少位是权衡过的：

@@ -35,8 +35,9 @@ from __future__ import annotations
 import logging
 import re
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any
 from urllib.parse import urlsplit
 from urllib.robotparser import RobotFileParser
 
@@ -264,7 +265,7 @@ class RobotsCache:
         robots_url = key + _ROBOTS_PATH
         try:
             res = self._fetch_robots(robots_url)
-        except Exception as e:  # 网络错误 / 超时 / TLS 失败（已重试过）
+        except Exception as e:
             logger.warning("robots 不可达（%s）：%s → %s", robots_url, e, self._fail_label())
             return _Entry(deny_all=True, note=f"fetch error: {e}", robots_url=robots_url)
 
@@ -301,7 +302,7 @@ class RobotsCache:
         for attempt in range(_ROBOTS_ATTEMPTS):
             try:
                 return self._do_fetch(robots_url)
-            except Exception as e:  # noqa: BLE001 —— 网络层错误类型太杂，统一兜住重试
+            except Exception as e:
                 last = e
                 if attempt < _ROBOTS_ATTEMPTS - 1:
                     time.sleep(_ROBOTS_BACKOFF_S[attempt])

@@ -49,8 +49,9 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import Any, Sequence
+from typing import Any
 
 from kwsearch.aggregate import host_of
 
@@ -108,7 +109,7 @@ _TWO_LEVEL_SUFFIXES = frozenset({
 # 平台域不进 site: 范围：site:qq.com 等于全站扫描，既无礼也无意义。
 # 机构新闻常发在门户/公众号上，但那不是"该机构的站点"，圈进来只会掺入同名者。
 _PLATFORM_DOMAINS = frozenset({
-    "qq.com", "baidu.com", "sogou.com", "zhihu.com", "jianshu.com", "jianshu.io",
+    "qq.com", "baidu.com", "sogou.com", "zhihu.com", "jianshu.io",
     "csdn.net", "163.com", "sohu.com", "sina.com.cn", "sina.cn", "toutiao.com",
     "bilibili.com", "iqiyi.com", "youku.com", "douban.com", "juejin.cn",
     "aliyun.com", "oschina.net", "cnblogs.com", "51cto.com", "jianshu.com",
@@ -469,7 +470,7 @@ def build_cards(
 
 def summarize(cards: Sequence[CandidateCard]) -> dict[str, int]:
     """各档卡片数，给 CLI 与报告的概览用。"""
-    out = {tier: 0 for tier in TIER_RANK}
+    out = dict.fromkeys(TIER_RANK, 0)
     for c in cards:
         if c.label == UNMATCHED_LABEL:
             continue
